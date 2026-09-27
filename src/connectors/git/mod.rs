@@ -31,7 +31,10 @@
 //! mints a NEW source fact naming the previous target; every earlier
 //! observation keeps its exact bytes, its exact identity, and its place in the
 //! ledger. The branch "view" is simply the newest observation, and it advances
-//! only when new observation evidence arrives (EVENT-01, REPLAY-01).
+//! only when new observation evidence arrives (EVENT-01, REPLAY-01). A log
+//! opened with [`GitRefObservationLogV1::resuming`] names the target an
+//! earlier log last observed on its first observation, so a worker that
+//! keeps one log per tick still records every move of the ref.
 //!
 //! # Layout
 //!
@@ -65,7 +68,10 @@
 //!   back-dated.
 //! * **EVENT-01 / REPLAY-01** — a re-scan reproduces byte-identical facts, so
 //!   the ledger classifies it as an exact replay; a force push produces a new
-//!   observation rather than a mutation of the old one.
+//!   observation rather than a mutation of the old one; a walk excludes the
+//!   previous receipt's revision, so a rewrite yields the rewritten commits
+//!   as new facts while the commits no longer reachable stay in the ledger as
+//!   history.
 //! * **EVID-05** — no private raw artifact is ever emitted: the private plane
 //!   would need its own key, retention, and publication boundary, which this
 //!   connector does not have. Since redaction profile 3 the drain also

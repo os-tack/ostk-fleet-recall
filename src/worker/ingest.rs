@@ -24,8 +24,8 @@ use crate::connectors::ci::{
 };
 use crate::connectors::git::{
     GitConnectorBindingV1, GitCoverageBindingV1, GitDrainContextV1, GitFactV1, GitIngressClocksV1,
-    GitRefObservationLogV1, GitRepositoryReader, GitScanRequestV1, GitTreeScanModeV1,
-    drain_git_facts, git_coverage_observation,
+    GitObjectId, GitRefObservationLogV1, GitRepositoryReader, GitScanRequestV1, GitScanResult,
+    GitScanV1, GitTreeScanModeV1, drain_git_facts, git_coverage_observation,
 };
 use crate::connectors::transcript::{
     CockroachTranscriptOutboxRepository, MAX_REPORTED_UNKNOWN_KINDS, MAX_TRANSCRIPT_BYTES,
@@ -102,8 +102,10 @@ const TRANSCRIPT_COUNTERS: [&str; 10] = [
     "replayed",
     "receipts",
 ];
-const GIT_COUNTERS: [&str; 8] = [
+const GIT_COUNTERS: [&str; 10] = [
     "commits_walked",
+    "full_walks",
+    "ref_rewritten",
     "facts",
     "facts_redacted",
     "fields_withheld",
@@ -242,6 +244,47 @@ fn count_collection(
 
 fn count(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// One ref walked past its previous receipt.
+struct GitWalkV1 {
+    /// What the walk read.
+    scan: GitScanV1,
+    /// The revision the walk excluded: the previous receipt's, when the
+    /// repository still has it. `None` is a full walk from the root.
+    boundary: Option<GitObjectId>,
+    /// Whether the boundary is no longer an ancestor of the scan's target:
+    /// history was rewritten past it.
+    rewritten: bool,
+}
+
+/// Walk `request`'s ref past `previous`, the revision of the ref's latest
+/// receipt, if any.
+///
+/// A `previous` the repository no longer has (pruned after a rewrite, say)
+/// cannot be excluded, so the walk is a full one. The rewrite check runs
+/// against the scan's own target, since the ref may have moved between the
+/// caller's first read and the walk.
+fn walk_git_ref(
+    reader: &GitRepositoryReader,
+    mut request: GitScanRequestV1,
+    previous: Option<GitObjectId>,
+) -> GitScanResult<GitWalkV1> {
+    let boundary = match previous {
+        Some(revision) if reader.has_commit(&revision)? => Some(revision),
+        _ => None,
+    };
+    request.exclude = boundary.iter().cloned().collect();
+    let scan = reader.scan(&request)?;
+    let rewritten = match &boundary {
+        Some(revision) => !reader.is_ancestor(revision, &scan.target)?,
+        None => false,
+    };
+    Ok(GitWalkV1 {
+        scan,
+        boundary,
+        rewritten,
+    })
 }
 
 /// `error` cut to what migration 0030 stores, on a character boundary.
@@ -961,7 +1004,19 @@ impl Ingest<'_> {
     }
 
     /// Observe one ref when its target moved since the instance's latest
-    /// receipt, and admit the history behind it.
+    /// receipt, and admit the commits past the receipt's revision.
+    ///
+    /// The walk is the whole history when the instance has no receipt or the
+    /// repository no longer has the recorded revision (a full walk, counted as
+    /// `full_walks`). After a history rewrite the recorded revision is no
+    /// longer an ancestor of the target: the walk yields the rewritten
+    /// commits down to the merge base, the move is recorded on the
+    /// observation's `previous_target`, and the tick counts `ref_rewritten`;
+    /// the commits no longer reachable stay in the ledger as history.
+    ///
+    /// A tick that drained but failed before its receipt self-heals: the next
+    /// walk still excludes the older revision, and the commits it walks again
+    /// replay.
     #[allow(clippy::too_many_lines)] // one linear read -> scan -> drain -> receipt pipeline
     async fn ingest_git(
         &self,
@@ -992,24 +1047,38 @@ impl Ingest<'_> {
             .latest_receipt_for_instance(instance)
             .await
             .map_err(describe)?;
-        if latest.is_some_and(|receipt| receipt.scope.revision.as_bytes() == target.as_bytes()) {
+        if latest
+            .as_ref()
+            .is_some_and(|receipt| receipt.scope.revision.as_bytes() == target.as_bytes())
+        {
             return Ok(WorkerSourceOutcomeV1::Unchanged);
         }
+        // The receipt's revision is the exclusion boundary; a malformed one
+        // fails closed rather than walking from the root as if it were absent.
+        let previous = latest
+            .map(|receipt| GitObjectId::from_bytes(receipt.scope.revision.as_bytes()))
+            .transpose()
+            .map_err(describe)?;
 
         let request = GitScanRequestV1 {
             ref_name,
             max_commits: source.max_commits,
             max_facts: source.max_facts,
             tree_mode: GitTreeScanModeV1::CommitsOnly,
+            exclude: Vec::new(),
         };
-        let scan = {
+        let walk = {
             let reader = reader.clone();
-            tokio::task::spawn_blocking(move || reader.scan(&request))
+            let previous = previous.clone();
+            tokio::task::spawn_blocking(move || walk_git_ref(&reader, request, previous))
                 .await
-                .map_err(|_| "the git scan did not finish".to_owned())?
+                .map_err(|_| "the git walk did not finish".to_owned())?
                 .map_err(describe)?
         };
+        let scan = walk.scan;
         add(counters, "commits_walked", count(scan.commits.len()));
+        add(counters, "full_walks", u64::from(walk.boundary.is_none()));
+        add(counters, "ref_rewritten", u64::from(walk.rewritten));
         let binding = GitConnectorBindingV1::resolve(
             active,
             source.connector_principal.clone(),
@@ -1019,12 +1088,15 @@ impl Ingest<'_> {
         .map_err(describe)?;
 
         // The scan's own target is the one observed: the ref may have moved
-        // between the first read and the walk.
+        // between the first read and the walk. The observation resumes from
+        // the receipt's revision even when the walk could not exclude it (a
+        // pruned boundary): the previous observation did point there.
         let now = server_instant(self.pool).await?;
-        let mut log = GitRefObservationLogV1::new(
+        let mut log = GitRefObservationLogV1::resuming(
             reader.repository().clone(),
             scan.ref_name.clone(),
             instance.clone(),
+            previous,
         )
         .map_err(describe)?;
         log.observe(scan.target.clone(), now.clone(), OBSERVATIONS_PER_TICK)
@@ -1063,7 +1135,9 @@ impl Ingest<'_> {
 
         // One observation of one ref: the domain's target and the observed
         // range are both [1, 2), so the receipt claims exactly the observation
-        // it binds.
+        // it binds. The receipt's `scope.revision` is the next tick's
+        // exclusion boundary; its `source_count` and `source_digest` cover the
+        // commits past this tick's boundary plus this observation.
         let one = SequenceIntervalV1::new(1, 2).map_err(describe)?;
         let observation = git_coverage_observation(
             &GitCoverageBindingV1 {

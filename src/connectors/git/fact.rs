@@ -96,6 +96,15 @@ impl GitObjectId {
         Ok(Self(bytes))
     }
 
+    /// Accept raw object-id bytes: 20 (SHA-1) or 32 (SHA-256), the form a
+    /// coverage receipt's `scope.revision` carries.
+    pub fn from_bytes(bytes: &[u8]) -> GitFactResult<Self> {
+        if !matches!(bytes.len(), 20 | 32) {
+            return Err(GitFactError::ObjectId(hex::encode(bytes)));
+        }
+        Ok(Self(bytes.to_vec()))
+    }
+
     /// Raw object-id bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
@@ -455,7 +464,7 @@ pub struct GitRefObservationFactV1 {
     pub ref_name: GitRefName,
     /// Object the ref pointed at when observed.
     pub target: GitObjectId,
-    /// Strictly increasing observation counter for this repository and ref.
+    /// Strictly increasing observation counter within one observation log.
     pub observation_seq: u64,
     /// When the observation was taken.
     pub observed_at: CanonicalTimestamp,
@@ -622,11 +631,20 @@ impl GitFactV1 {
 /// be edited through this type. The default-branch *view* is therefore whatever
 /// the newest observation says, and it advances only when new observation
 /// evidence arrives.
+///
+/// A log may be opened [`resuming`](Self::resuming) from a target an earlier
+/// log observed: the worker keeps a one-entry log per tick and resumes from
+/// the ref's latest coverage receipt, so the first observation of each tick
+/// still names the target the previous tick saw. `observation_seq` counts
+/// within one log and so starts at 1 in every tick; identity stays unique
+/// across logs because it closes over `observed_at`, which is fresh each
+/// tick. `previous_target` is payload only, so seeding it changes no identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitRefObservationLogV1 {
     repository: GitRepositoryIdV1,
     ref_name: GitRefName,
     observer: ContractId,
+    resumed_from: Option<GitObjectId>,
     observations: Vec<GitRefObservationFactV1>,
 }
 
@@ -637,11 +655,23 @@ impl GitRefObservationLogV1 {
         ref_name: GitRefName,
         observer: ContractId,
     ) -> GitFactResult<Self> {
+        Self::resuming(repository, ref_name, observer, None)
+    }
+
+    /// Open an empty log whose first observation names `previous_target`,
+    /// the target an earlier log last observed, as its previous target.
+    pub fn resuming(
+        repository: GitRepositoryIdV1,
+        ref_name: GitRefName,
+        observer: ContractId,
+        previous_target: Option<GitObjectId>,
+    ) -> GitFactResult<Self> {
         repository.validate()?;
         Ok(Self {
             repository,
             ref_name,
             observer,
+            resumed_from: previous_target,
             observations: Vec::new(),
         })
     }
@@ -670,6 +700,11 @@ impl GitRefObservationLogV1 {
         let observation_seq = u64::try_from(self.observations.len())
             .map_err(|_| GitFactError::Schema("ref observation log is full"))?
             + 1;
+        let previous_target = self
+            .observations
+            .last()
+            .map(|last| last.target.clone())
+            .or_else(|| self.resumed_from.clone());
         let fact = GitRefObservationFactV1 {
             schema_version: GIT_FACT_SCHEMA_VERSION,
             repository: self.repository.clone(),
@@ -677,7 +712,7 @@ impl GitRefObservationLogV1 {
             target,
             observation_seq,
             observed_at,
-            previous_target: self.observations.last().map(|last| last.target.clone()),
+            previous_target,
             observer: self.observer.clone(),
         };
         fact.validate()?;
@@ -953,6 +988,79 @@ mod tests {
             second_fact.immutable_revision().unwrap(),
             "but each is its own immutable observation"
         );
+    }
+
+    #[test]
+    fn a_resumed_log_names_the_prior_target_on_its_first_observation() {
+        let ref_name = GitRefName::parse("refs/heads/main").unwrap();
+        let observer = ContractId::new("connector.git.instance-1").unwrap();
+        let at = stamp("2026-08-15T12:05:00.000000000Z");
+        let mut resumed = GitRefObservationLogV1::resuming(
+            repository(),
+            ref_name.clone(),
+            observer.clone(),
+            Some(oid(0xaa)),
+        )
+        .unwrap();
+        let observation = resumed.observe(oid(0xbb), at.clone(), 1).unwrap().clone();
+        assert_eq!(observation.observation_seq, 1);
+        assert_eq!(observation.previous_target, Some(oid(0xaa)));
+
+        // The same reading through a fresh log: identical identity, since the
+        // previous target is payload only, but a different payload.
+        let mut fresh = GitRefObservationLogV1::new(repository(), ref_name, observer).unwrap();
+        let unseeded = fresh.observe(oid(0xbb), at, 1).unwrap().clone();
+        assert_eq!(unseeded.previous_target, None);
+        let seeded_fact = GitFactV1::RefObservation(observation);
+        let unseeded_fact = GitFactV1::RefObservation(unseeded);
+        assert_eq!(
+            seeded_fact.immutable_revision().unwrap(),
+            unseeded_fact.immutable_revision().unwrap()
+        );
+        assert_eq!(
+            seeded_fact.logical_event_key().unwrap(),
+            unseeded_fact.logical_event_key().unwrap()
+        );
+        assert_ne!(
+            seeded_fact.canonical_payload().unwrap(),
+            unseeded_fact.canonical_payload().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_resumed_log_prefers_its_own_last_observation_after_the_first() {
+        let mut log = GitRefObservationLogV1::resuming(
+            repository(),
+            GitRefName::parse("refs/heads/main").unwrap(),
+            ContractId::new("connector.git.instance-1").unwrap(),
+            Some(oid(0xaa)),
+        )
+        .unwrap();
+        log.observe(oid(0xbb), stamp("2026-08-15T12:00:00.000000000Z"), 8)
+            .unwrap();
+        log.observe(oid(0xcc), stamp("2026-08-15T12:05:00.000000000Z"), 8)
+            .unwrap();
+        let second = &log.observations()[1];
+        assert_eq!(second.observation_seq, 2);
+        assert_eq!(second.previous_target, Some(oid(0xbb)));
+    }
+
+    #[test]
+    fn an_object_id_is_built_from_raw_bytes_of_either_digest_width() {
+        assert_eq!(GitObjectId::from_bytes(&[0xaa; 20]).unwrap(), oid(0xaa));
+        assert_eq!(
+            GitObjectId::from_bytes(&[0xab; 32]).unwrap().to_hex(),
+            "ab".repeat(32)
+        );
+        for width in [0, 19, 21, 31, 33] {
+            assert!(
+                matches!(
+                    GitObjectId::from_bytes(&vec![0xaa; width]),
+                    Err(GitFactError::ObjectId(_))
+                ),
+                "{width}"
+            );
+        }
     }
 
     #[test]

@@ -731,6 +731,7 @@ fn scan_request(ref_name: &str) -> GitScanRequestV1 {
         max_commits: 64,
         max_facts: 512,
         tree_mode: GitTreeScanModeV1::ChangedPaths,
+        exclude: Vec::new(),
     }
 }
 
@@ -829,6 +830,127 @@ fn a_walk_that_would_exceed_its_commit_bound_fails_closed() {
             .collect::<Vec<_>>(),
         vec![history.first_commit.clone(), history.renamed_commit],
         "and it walks oldest first"
+    );
+}
+
+#[test]
+fn an_incremental_walk_yields_only_commits_past_the_boundary() {
+    let repository = ScratchRepository::init("incremental");
+    let history = build_history(&repository);
+    let reader = repository.reader();
+    let first = GitObjectId::parse_hex(&history.first_commit).unwrap();
+    let renamed = GitObjectId::parse_hex(&history.renamed_commit).unwrap();
+
+    // Excluding the root leaves the rename: one commit and its one blob
+    // source, where the full walk renders four facts.
+    let scan = reader
+        .scan(&GitScanRequestV1 {
+            exclude: vec![first.clone()],
+            ..scan_request("refs/heads/main")
+        })
+        .expect("an incremental walk must succeed");
+    assert_eq!(scan.commits, vec![renamed.clone()]);
+    assert_eq!(scan.facts.len(), 2, "{:?}", scan.facts);
+    assert_eq!(scan.target, renamed);
+
+    // The commit bound applies to the commits actually walked, so a bound
+    // the full history would exceed fits the incremental walk.
+    let bounded = reader
+        .scan(&GitScanRequestV1 {
+            exclude: vec![first.clone()],
+            max_commits: 1,
+            ..scan_request("refs/heads/main")
+        })
+        .expect("the bound counts walked commits only");
+    assert_eq!(bounded.commits, vec![renamed.clone()]);
+
+    // Excluding the tip itself walks nothing.
+    let nothing = reader
+        .scan(&GitScanRequestV1 {
+            exclude: vec![renamed.clone()],
+            ..scan_request("refs/heads/main")
+        })
+        .expect("an empty walk is still a walk");
+    assert!(nothing.commits.is_empty());
+    assert!(nothing.facts.is_empty());
+
+    assert!(reader.has_commit(&first).unwrap());
+    assert!(reader.is_ancestor(&first, &renamed).unwrap());
+}
+
+#[test]
+fn a_rebase_walk_yields_the_rewritten_commits_only() {
+    let repository = ScratchRepository::init("rebase");
+    let history = build_history(&repository);
+    let reader = repository.reader();
+    let first = GitObjectId::parse_hex(&history.first_commit).unwrap();
+    let renamed = GitObjectId::parse_hex(&history.renamed_commit).unwrap();
+
+    // Reword the tip: the same tree on the same parent under a new message,
+    // and move main to it. The old tip is unreachable but not pruned.
+    let peeled = format!("{}^{{tree}}", history.renamed_commit);
+    let tree = repository.git(&["rev-parse", &peeled], None);
+    let rewritten = repository.commit(
+        &tree,
+        Some(&history.first_commit),
+        "rename readme, reworded",
+    );
+    repository.update_ref("refs/heads/main", &rewritten);
+    let rewritten = GitObjectId::parse_hex(&rewritten).unwrap();
+    assert_ne!(rewritten, renamed);
+
+    let scan = reader
+        .scan(&GitScanRequestV1 {
+            exclude: vec![renamed.clone()],
+            ..scan_request("refs/heads/main")
+        })
+        .expect("a walk past a rewritten boundary must succeed");
+    assert_eq!(
+        scan.commits,
+        vec![rewritten.clone()],
+        "only the rewritten commit is new: the root is behind the old tip"
+    );
+    assert_eq!(scan.target, rewritten);
+
+    assert!(!reader.is_ancestor(&renamed, &rewritten).unwrap());
+    assert!(reader.is_ancestor(&first, &rewritten).unwrap());
+    assert!(reader.has_commit(&renamed).unwrap());
+}
+
+#[test]
+fn an_exclude_the_repository_does_not_have_is_refused_rather_than_ignored() {
+    let repository = ScratchRepository::init("missing-exclude");
+    let history = build_history(&repository);
+    let reader = repository.reader();
+    let missing = GitObjectId::parse_hex(&format!("{}1", "0".repeat(39))).unwrap();
+    let tip = GitObjectId::parse_hex(&history.renamed_commit).unwrap();
+
+    let refused = reader.scan(&GitScanRequestV1 {
+        exclude: vec![missing.clone()],
+        ..scan_request("refs/heads/main")
+    });
+    assert!(
+        matches!(
+            refused,
+            Err(GitScanError::Command {
+                command: "rev-list",
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+
+    assert!(!reader.has_commit(&missing).unwrap());
+    let unknown = reader.is_ancestor(&missing, &tip);
+    assert!(
+        matches!(
+            unknown,
+            Err(GitScanError::Command {
+                command: "merge-base",
+                ..
+            })
+        ),
+        "an unknown object is an error, never a silent no: {unknown:?}"
     );
 }
 

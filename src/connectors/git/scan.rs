@@ -6,8 +6,9 @@
 //! wave on one hard constraint and one soft one. The hard constraint: adding
 //! `gix` means adding a large new dependency tree to `Cargo.toml`/`Cargo.lock`,
 //! which this workstream may not do. The soft one: the plumbing commands used
-//! here (`show-ref`, `rev-list`, `cat-file`, `diff-tree`) have a stable,
-//! documented, byte-oriented output contract that has not changed in a decade,
+//! here (`show-ref`, `rev-list`, `cat-file`, `diff-tree`, `merge-base`) have
+//! a stable, documented, byte-oriented output contract that has not changed
+//! in a decade,
 //! whereas a library binding would put object-format parsing — including future
 //! SHA-256 repositories — inside this crate. `git` already knows how to read
 //! both object formats; this module only has to know how to read `git`.
@@ -64,6 +65,15 @@ pub struct GitScanRequestV1 {
     pub max_facts: usize,
     /// How much of each commit's content to render.
     pub tree_mode: GitTreeScanModeV1,
+    /// Commits already covered. The walk yields only the commits reachable
+    /// from the target and not from any of these (`git rev-list <target>
+    /// ^<id>…`); empty means a full walk from the root. Each id reaches argv
+    /// only as validated lowercase hex after `--end-of-options`. An id the
+    /// repository does not have makes `rev-list` fail closed
+    /// ([`GitScanError::Command`]) rather than walk as if it were absent, so a
+    /// caller that may hold a pruned id probes
+    /// [`GitRepositoryReader::has_commit`] first.
+    pub exclude: Vec<GitObjectId>,
 }
 
 /// What one scan read.
@@ -236,7 +246,7 @@ impl GitRepositoryReader {
     /// Walk one ref and render its commit and blob-source facts.
     pub fn scan(&self, request: &GitScanRequestV1) -> GitScanResult<GitScanV1> {
         let target = self.resolve_ref(&request.ref_name)?;
-        let commits = self.rev_list(&target, request.max_commits)?;
+        let commits = self.rev_list(&target, &request.exclude, request.max_commits)?;
         let mut facts = Vec::new();
         for commit_id in &commits {
             let commit = self.read_commit(commit_id)?;
@@ -273,27 +283,49 @@ impl GitRepositoryReader {
         })
     }
 
-    /// Commit ids reachable from `target`, oldest first.
+    /// Whether the repository has `commit_id` as a commit.
+    ///
+    /// `false` for anything other than a clean "yes" (an absent object, an
+    /// object of another type, a broken repository): the safe direction for
+    /// a caller deciding whether it may exclude the commit is a full walk.
+    pub fn has_commit(&self, commit_id: &GitObjectId) -> GitScanResult<bool> {
+        let peeled = format!("{}^{{commit}}", commit_id.to_hex());
+        let status = self.exit_status(&["cat-file", "-e", &peeled])?;
+        Ok(status.success())
+    }
+
+    /// Whether `ancestor` is reachable from `descendant` (or is `descendant`
+    /// itself).
+    ///
+    /// `git merge-base --is-ancestor` answers with its exit status: 0 is yes,
+    /// 1 is no, and anything else (an object the repository does not have,
+    /// say) is an error, which is returned as such rather than read as "no".
+    pub fn is_ancestor(
+        &self,
+        ancestor: &GitObjectId,
+        descendant: &GitObjectId,
+    ) -> GitScanResult<bool> {
+        let ancestor = ancestor.to_hex();
+        let descendant = descendant.to_hex();
+        let output = self.output(&["merge-base", "--is-ancestor", &ancestor, &descendant])?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(command_failure("merge-base", &output)),
+        }
+    }
+
+    /// Commit ids reachable from `target` and from none of `exclude`, oldest
+    /// first.
     fn rev_list(
         &self,
         target: &GitObjectId,
+        exclude: &[GitObjectId],
         max_commits: usize,
     ) -> GitScanResult<Vec<GitObjectId>> {
-        let peeled = format!("{}^{{commit}}", target.to_hex());
-        // One more than the bound, so an over-long history is detected rather
-        // than silently truncated to the bound.
-        let limit = format!("--max-count={}", max_commits.saturating_add(1));
-        let stdout = self.run(
-            "rev-list",
-            &[
-                "rev-list",
-                "--topo-order",
-                "--reverse",
-                &limit,
-                "--end-of-options",
-                &peeled,
-            ],
-        )?;
+        let args = rev_list_args(target, exclude, max_commits);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let stdout = self.run("rev-list", &args)?;
         let mut commits = Vec::new();
         for line in stdout.split(|byte| *byte == b'\n') {
             if line.is_empty() {
@@ -370,7 +402,30 @@ impl GitRepositoryReader {
         })
     }
 
+    /// Run one plumbing command and hand back its bounded stdout; a non-zero
+    /// exit is an error.
     fn run(&self, label: &'static str, args: &[&str]) -> GitScanResult<Vec<u8>> {
+        let output = self.output(args)?;
+        if !output.status.success() {
+            return Err(command_failure(label, &output));
+        }
+        if output.stdout.len() > MAX_GIT_OUTPUT_BYTES {
+            return Err(GitScanError::Output {
+                command: label,
+                detail: "output exceeded the reader's bound",
+            });
+        }
+        Ok(output.stdout)
+    }
+
+    /// Run one plumbing command whose answer is its exit status.
+    fn exit_status(&self, args: &[&str]) -> GitScanResult<std::process::ExitStatus> {
+        Ok(self.output(args)?.status)
+    }
+
+    /// The single spawn point: every `git` invocation is built here, bound to
+    /// this reader's `--git-dir`, with its configuration sources neutralised.
+    fn output(&self, args: &[&str]) -> GitScanResult<std::process::Output> {
         let mut command = Command::new(&self.program);
         command
             .arg("--no-optional-locks")
@@ -395,26 +450,58 @@ impl GitRepositoryReader {
             .env_remove("GIT_CEILING_DIRECTORIES")
             .env_remove("GIT_EXTERNAL_DIFF")
             .env_remove("GIT_ATTR_NOSYSTEM");
-        let output = command
+        command
             .output()
-            .map_err(|error| GitScanError::Spawn(error.to_string()))?;
-        if !output.status.success() {
-            let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            stderr.truncate(MAX_STDERR_TEXT_BYTES);
-            return Err(GitScanError::Command {
-                command: label,
-                status: output.status.to_string(),
-                stderr,
-            });
-        }
-        if output.stdout.len() > MAX_GIT_OUTPUT_BYTES {
-            return Err(GitScanError::Output {
-                command: label,
-                detail: "output exceeded the reader's bound",
-            });
-        }
-        Ok(output.stdout)
+            .map_err(|error| GitScanError::Spawn(error.to_string()))
     }
+}
+
+/// The error for a plumbing command that exited with a status its caller
+/// does not accept, carrying bounded standard-error text.
+fn command_failure(label: &'static str, output: &std::process::Output) -> GitScanError {
+    let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    truncate_on_char_boundary(&mut stderr, MAX_STDERR_TEXT_BYTES);
+    GitScanError::Command {
+        command: label,
+        status: output.status.to_string(),
+        stderr,
+    }
+}
+
+fn truncate_on_char_boundary(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+}
+
+/// The `rev-list` argv for the commits reachable from `target` and from none
+/// of `exclude`, oldest first.
+///
+/// The target and every exclusion come after `--end-of-options`, where git
+/// reads `^<hex>^{commit}` as an exclusion revision and nothing as an option.
+/// `--max-count` is one more than the bound, so an over-long walk is detected
+/// rather than silently truncated to the bound.
+#[must_use]
+fn rev_list_args(target: &GitObjectId, exclude: &[GitObjectId], max_commits: usize) -> Vec<String> {
+    let mut args = vec![
+        "rev-list".to_owned(),
+        "--topo-order".to_owned(),
+        "--reverse".to_owned(),
+        format!("--max-count={}", max_commits.saturating_add(1)),
+        "--end-of-options".to_owned(),
+        format!("{}^{{commit}}", target.to_hex()),
+    ];
+    args.extend(
+        exclude
+            .iter()
+            .map(|id| format!("^{}^{{commit}}", id.to_hex())),
+    );
+    args
 }
 
 /// One tree entry resolved at an exact commit and path.
@@ -728,6 +815,56 @@ author Ada Lovelace <ada@example.test> 1755259200 +0000\n\
 committer Ada Lovelace <ada@example.test> 1755259260 -0530\n\
 \n\
 subject line\n\nbody line\n";
+
+    fn oid(byte: &str) -> GitObjectId {
+        GitObjectId::parse_hex(&byte.repeat(20)).unwrap()
+    }
+
+    #[test]
+    fn rev_list_args_keeps_the_full_walk_argv_byte_for_byte() {
+        let target = oid("aa");
+        assert_eq!(
+            rev_list_args(&target, &[], 5),
+            vec![
+                "rev-list".to_owned(),
+                "--topo-order".to_owned(),
+                "--reverse".to_owned(),
+                "--max-count=6".to_owned(),
+                "--end-of-options".to_owned(),
+                format!("{}^{{commit}}", "aa".repeat(20)),
+            ]
+        );
+    }
+
+    #[test]
+    fn rev_list_args_places_every_exclusion_after_the_end_of_options_marker() {
+        let target = oid("aa");
+        let args = rev_list_args(&target, &[oid("bb"), oid("cc")], 5);
+        let marker = args
+            .iter()
+            .position(|arg| arg == "--end-of-options")
+            .expect("the marker is present");
+        assert_eq!(
+            args[marker + 1..],
+            [
+                format!("{}^{{commit}}", "aa".repeat(20)),
+                format!("^{}^{{commit}}", "bb".repeat(20)),
+                format!("^{}^{{commit}}", "cc".repeat(20)),
+            ]
+        );
+        assert!(
+            args[..marker].iter().all(|arg| !arg.starts_with('^')),
+            "no exclusion precedes the marker: {args:?}"
+        );
+    }
+
+    #[test]
+    fn command_failure_text_is_cut_on_a_character_boundary() {
+        let mut text = "é".repeat(MAX_STDERR_TEXT_BYTES);
+        truncate_on_char_boundary(&mut text, MAX_STDERR_TEXT_BYTES);
+        assert!(text.len() <= MAX_STDERR_TEXT_BYTES);
+        assert!(text.chars().all(|c| c == 'é'));
+    }
 
     #[test]
     fn a_commit_object_parses_into_provider_truth() {
