@@ -417,6 +417,8 @@ done'''
                 "--harness", "synthetic", "--timeout-seconds", str(self.args.timeout),
                 "--ttl-seconds", "3600", "--state-dir", str(launch_dir), "--namespace", self.args.namespace]
         argv += transport_arguments(self.args)
+        if self.args.docker_host_gateway and backend == "docker":
+            argv.append("--docker-host-gateway")
         if self.args.shipper_image:
             argv += ["--shipper-image", self.args.shipper_image]
         if self.args.runtime_class and backend == "kubernetes":
@@ -462,6 +464,8 @@ def arguments(argv=None):
     parser.add_argument("--url", default="http://localhost:8080/mcp")
     parser.add_argument("--resource-url")
     parser.add_argument("--docker-url", help="defaults to --url, or the existing Docker route for the localhost development profile")
+    parser.add_argument("--docker-host-gateway", action="store_true",
+                        help="map only the Docker MCP hostname through the Docker host gateway")
     parser.add_argument("--kubernetes-url", help="defaults to --url, or the existing cluster route for the localhost development profile")
     parser.add_argument("--ca-path", type=Path, default=os.environ.get("FLEET_RECALL_CA_PATH"),
                         help="additional certificate-only PEM bundle for probes and launched clients")
@@ -486,6 +490,8 @@ def arguments(argv=None):
     if args.ca_path is not None:
         args.ca_path = args.ca_path.resolve()
     try:
+        require(not args.docker_host_gateway or args.backend in {"docker", "both"},
+                "docker-host-gateway requires the Docker backend")
         args.tenant, args.project = args.scope.split("/", 1)
         require(str(uuid.UUID(args.tenant)) == args.tenant and re.fullmatch(r"[a-z][a-z0-9_.-]{0,127}", args.project), "invalid scope")
         require(30 <= args.timeout <= 600 and 60 <= args.worker_timeout <= 1200, "timeouts out of bounds")

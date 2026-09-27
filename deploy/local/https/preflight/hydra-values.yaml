@@ -1,0 +1,13 @@
+# Apply after the production HTTPS override; only isolated dependencies differ.
+maester:
+  enabled: false
+hydra:
+  automigration:
+    enabled: true
+    type: initContainer
+  config:
+    urls:
+      self:
+        admin: http://hydra-admin.fleet-https-preflight.svc:4445/
+      identity_provider:
+        url: http://kratos-admin.fleet-https-preflight.svc:80

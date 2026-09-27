@@ -1,0 +1,31 @@
+# Retain stable objects for rollback, but close every old Ory NodePort.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hydra-nodeport
+  namespace: ory
+spec:
+  type: ClusterIP
+  ports:
+    - {name: public, port: 4444, targetPort: 4444, nodePort: null}
+    - {name: admin, port: 4445, targetPort: 4445, nodePort: null}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kratos-nodeport
+  namespace: ory
+spec:
+  type: ClusterIP
+  ports:
+    - {name: public, port: 4433, targetPort: 4433, nodePort: null}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kratos-ui-nodeport
+  namespace: ory
+spec:
+  type: ClusterIP
+  ports:
+    - {name: http, port: 4455, targetPort: 3000, nodePort: null}

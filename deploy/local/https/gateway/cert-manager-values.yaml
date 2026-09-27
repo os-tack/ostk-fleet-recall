@@ -1,0 +1,39 @@
+# Exactly one installation in this cluster; root CA key never enters Kubernetes.
+crds:
+  enabled: true
+  keep: true
+global:
+  rbac:
+    aggregateClusterRoles: false
+  leaderElection:
+    namespace: fleet-pki
+clusterResourceNamespace: fleet-pki
+replicaCount: 1
+enableCertificateOwnerRef: false
+extraArgs:
+  - --controllers=*,-ingress-shim,-gateway-shim
+prometheus:
+  enabled: true
+resources:
+  requests:
+    cpu: 20m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+webhook:
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      cpu: 500m
+      memory: 128Mi
+cainjector:
+  resources:
+    requests:
+      cpu: 20m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi

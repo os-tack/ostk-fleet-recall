@@ -75,6 +75,10 @@ pub fn manifest(spec: &SandboxSpecV1) -> anyhow::Result<Value> {
 impl SandboxBackend for KubernetesBackend {
     async fn create(&self, spec: &SandboxSpecV1) -> anyhow::Result<SandboxHandle> {
         spec.validate()?;
+        anyhow::ensure!(
+            spec.docker_host_gateway.is_none(),
+            "docker-host-gateway requires Docker"
+        );
         let args = [
             "apply",
             "--server-side",

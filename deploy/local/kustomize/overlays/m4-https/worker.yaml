@@ -1,0 +1,8 @@
+# Applying the cutover overlay holds scheduling until authenticated acceptance.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: worker
+  namespace: fleet-recall
+spec:
+  suspend: true

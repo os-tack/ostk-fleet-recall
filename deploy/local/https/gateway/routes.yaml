@@ -1,0 +1,91 @@
+# The login UI and Kratos share one origin without rewriting any paths.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: fleet-recall
+  namespace: fleet-edge
+spec:
+  parentRefs: [{name: fleet-edge}]
+  hostnames: [recall.fleet.test]
+  rules:
+    - matches:
+        - path: {type: Exact, value: /mcp}
+        - path: {type: PathPrefix, value: /v1/grants}
+        - path: {type: Exact, value: /v1/auth/aws}
+        - path: {type: PathPrefix, value: /v1/transcripts}
+        - path: {type: Exact, value: /.well-known/oauth-protected-resource}
+        - path: {type: Exact, value: /.well-known/oauth-protected-resource/mcp}
+      backendRefs:
+        - {group: traefik.io, kind: TraefikService, name: recall@file}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: fleet-auth
+  namespace: fleet-edge
+spec:
+  parentRefs: [{name: fleet-edge}]
+  hostnames: [auth.fleet.test]
+  rules:
+    - matches:
+        - path: {type: Exact, value: /.well-known/openid-configuration}
+        - path: {type: Exact, value: /.well-known/jwks.json}
+        - path: {type: Exact, value: /oauth2/auth}
+        - path: {type: Exact, value: /oauth2/token}
+        - path: {type: Exact, value: /oauth2/revoke}
+        - path: {type: Exact, value: /oauth2/register}
+        - path: {type: Exact, value: /oauth2/sessions/logout}
+        - path: {type: Exact, value: /userinfo}
+        - path: {type: Exact, value: /oauth2/fallbacks/consent}
+        - path: {type: Exact, value: /oauth2/fallbacks/error}
+      backendRefs:
+        - {group: traefik.io, kind: TraefikService, name: hydra@file}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: fleet-login-kratos
+  namespace: fleet-edge
+spec:
+  parentRefs: [{name: fleet-edge}]
+  hostnames: [login.fleet.test]
+  rules:
+    - matches:
+        - path: {type: PathPrefix, value: /self-service}
+        - path: {type: Exact, value: /sessions/whoami}
+      backendRefs:
+        - {group: traefik.io, kind: TraefikService, name: kratos@file}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: fleet-login-ui
+  namespace: fleet-edge
+spec:
+  parentRefs: [{name: fleet-edge}]
+  hostnames: [login.fleet.test]
+  rules:
+    - matches:
+        - path: {type: Exact, value: /}
+        - path: {type: Exact, value: /login}
+        - path: {type: Exact, value: /registration}
+        - path: {type: Exact, value: /consent}
+        - path: {type: Exact, value: /logout}
+        - path: {type: Exact, value: /settings}
+        - path: {type: Exact, value: /sessions}
+        - path: {type: Exact, value: /welcome}
+        - path: {type: Exact, value: /error}
+        - path: {type: PathPrefix, value: /assets}
+        - path: {type: Exact, value: /theme.css}
+        - path: {type: Exact, value: /style.css}
+        - path: {type: Exact, value: /main.css}
+        - path: {type: Exact, value: /auth-layout.css}
+        - path: {type: Exact, value: /content-layout.css}
+        - path: {type: Exact, value: /favico.png}
+      backendRefs:
+        - {group: traefik.io, kind: TraefikService, name: ui@file}
+    - matches:
+        - path: {type: Exact, value: /ory-logo.svg}
+        - path: {type: Exact, value: /ory-small.svg}
+      backendRefs:
+        - {group: traefik.io, kind: TraefikService, name: ui@file}

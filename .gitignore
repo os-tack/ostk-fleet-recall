@@ -28,3 +28,4 @@
 *.key
 /deploy/local/.state/
 /deploy/local/bin/__pycache__/
+/deploy/local/https/**/__pycache__/

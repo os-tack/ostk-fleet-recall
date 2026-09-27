@@ -67,6 +67,10 @@ fn container_args(spec: &SandboxSpecV1, agent: bool) -> anyhow::Result<Vec<Strin
         "--mount",
         &volume,
     ]);
+    if let Some(host) = &spec.docker_host_gateway {
+        super::validate_gateway_host(host)?;
+        args.extend(["--add-host".into(), format!("{host}:host-gateway")]);
+    }
     if let Some(path) = &spec.ca_path {
         let source = path
             .to_str()

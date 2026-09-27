@@ -1,0 +1,47 @@
+# Apply to the existing release with --reuse-values, chart 0.64.0.
+# Render the actual edge Pod CIDR before use; never trust 0.0.0.0/0.
+image:
+  tag: v26.2.0
+hydra:
+  dev: false
+  automigration:
+    enabled: false
+  config:
+    urls:
+      self:
+        issuer: https://auth.fleet.test:8443/
+        public: https://auth.fleet.test:8443/
+        admin: http://hydra-admin.ory.svc:4445/
+      login: https://login.fleet.test:8443/login
+      consent: https://login.fleet.test:8443/consent
+      logout: https://login.fleet.test:8443/logout
+      error: https://login.fleet.test:8443/error
+      post_logout_redirect: https://login.fleet.test:8443/
+      identity_provider:
+        publicUrl: https://login.fleet.test:8443
+        url: http://kratos-admin.ory.svc:80
+    webfinger:
+      oidc_discovery:
+        client_registration_url: https://auth.fleet.test:8443/oauth2/register
+    serve:
+      tls:
+        allow_termination_from:
+          - __TRUSTED_PROXY_CIDR__
+      cookies:
+        secure: true
+        same_site_mode: Lax
+      public:
+        cors:
+          enabled: true
+          allowed_origins:
+            - https://login.fleet.test:8443
+secret:
+  enabled: false
+  nameOverride: hydra-secrets
+service:
+  public:
+    type: ClusterIP
+    nodePort: null
+  admin:
+    type: ClusterIP
+    nodePort: null

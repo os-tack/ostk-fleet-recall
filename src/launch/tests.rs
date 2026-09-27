@@ -27,6 +27,7 @@ fn args(directory: &Path) -> LaunchUpV1 {
         allow_http: true,
         resource_url: None,
         sandbox_url: Some("http://host.docker.internal:8080/mcp".into()),
+        docker_host_gateway: false,
         harness: Harness::Synthetic,
         task: "a task\nwith two lines".into(),
         model: None,
@@ -55,6 +56,7 @@ fn spec(directory: &Path) -> SandboxSpecV1 {
         namespace: "sandbox".into(),
         state_dir: directory.into(),
         ca_path: None,
+        docker_host_gateway: None,
         shipper_args: vec![
             "ship".into(),
             "transcripts".into(),
@@ -62,6 +64,77 @@ fn spec(directory: &Path) -> SandboxSpecV1 {
             "/transcripts".into(),
         ],
     }
+}
+
+#[test]
+fn docker_gateway_mapping_is_explicit_and_preserves_url_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut value = args(directory.path());
+    value.url = "https://recall.fleet.test:8443/mcp".into();
+    value.sandbox_url = None;
+    value.allow_http = false;
+    assert!(docker_gateway_host(&value).unwrap().is_none());
+    value.docker_host_gateway = true;
+    assert_eq!(
+        docker_gateway_host(&value).unwrap().as_deref(),
+        Some("recall.fleet.test")
+    );
+    assert_eq!(value.url, "https://recall.fleet.test:8443/mcp");
+    assert!(validate_up(&value).is_ok());
+    value.backend = BackendKind::Kubernetes;
+    assert!(validate_up(&value).is_err());
+    value.backend = BackendKind::Docker;
+    for host in [
+        "localhost",
+        "a.localhost",
+        "127.0.0.1",
+        "[::1]",
+        "a..test",
+        "bad_name.test",
+        "-bad.test",
+    ] {
+        value.sandbox_url = Some(format!("https://{host}:8443/mcp"));
+        assert!(
+            validate_up(&value).is_err(),
+            "unexpected host mapping: {host}"
+        );
+    }
+    value.sandbox_url = Some("https://sandbox.fleet.test:8443/mcp".into());
+    assert_eq!(
+        docker_gateway_host(&value).unwrap().as_deref(),
+        Some("sandbox.fleet.test")
+    );
+}
+
+#[test]
+fn docker_gateway_mapping_targets_both_containers_without_provider_overrides() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut value = spec(directory.path());
+    for agent in [true, false] {
+        assert!(
+            !docker::command_arguments(&value, agent)
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "--add-host")
+        );
+    }
+    value.docker_host_gateway = Some("recall.fleet.test".into());
+    for agent in [true, false] {
+        let arguments = docker::command_arguments(&value, agent).unwrap();
+        let mappings: Vec<_> = arguments
+            .windows(2)
+            .filter(|pair| pair[0] == "--add-host")
+            .collect();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0][1], "recall.fleet.test:host-gateway");
+        assert!(
+            !arguments
+                .iter()
+                .any(|arg| arg.contains("openai.com") || arg.contains("anthropic.com"))
+        );
+    }
+    value.docker_host_gateway = Some("recall.test:127.0.0.1,api.openai.com".into());
+    assert!(docker::command_arguments(&value, true).is_err());
 }
 
 #[test]

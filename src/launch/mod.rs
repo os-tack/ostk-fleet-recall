@@ -107,6 +107,9 @@ pub struct LaunchUpV1 {
     /// MCP URL reachable from containers; defaults to --url.
     #[arg(long)]
     pub sandbox_url: Option<String>,
+    /// Resolve only the sandbox MCP hostname through Docker's host gateway.
+    #[arg(long)]
+    pub docker_host_gateway: bool,
     #[arg(long, value_enum, default_value = "synthetic")]
     pub harness: Harness,
     #[arg(
@@ -155,6 +158,7 @@ pub struct SandboxSpecV1 {
     pub namespace: String,
     pub state_dir: PathBuf,
     pub ca_path: Option<PathBuf>,
+    pub docker_host_gateway: Option<String>,
     pub shipper_args: Vec<String>,
 }
 
@@ -165,6 +169,9 @@ impl SandboxSpecV1 {
         validate_name(&self.transcript_volume)?;
         validate_image(&self.image)?;
         validate_image(&self.shipper_image)?;
+        if let Some(host) = &self.docker_host_gateway {
+            validate_gateway_host(host)?;
+        }
         if let Some(class) = &self.runtime_class {
             validate_name(class)?;
         }
@@ -271,6 +278,7 @@ fn validate_up(args: &LaunchUpV1) -> anyhow::Result<(Uuid, String)> {
         args.sandbox_url.as_deref().unwrap_or(&args.url),
         args.allow_http,
     )?;
+    docker_gateway_host(args)?;
     ensure!(
         (1..=3600).contains(&args.timeout_seconds),
         "timeout must be 1..3600 seconds"
@@ -361,6 +369,43 @@ fn validate_url(value: &str, allow_http: bool) -> anyhow::Result<url::Url> {
         "HTTP requires the explicit development option --allow-http"
     );
     Ok(url)
+}
+
+fn validate_gateway_host(host: &str) -> anyhow::Result<()> {
+    ensure!(
+        host.len() <= 253
+            && host != "localhost"
+            && !host.ends_with(".localhost")
+            && host.parse::<std::net::IpAddr>().is_err()
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            }),
+        "docker-host-gateway requires a DNS hostname other than localhost or an IP address"
+    );
+    Ok(())
+}
+
+fn docker_gateway_host(args: &LaunchUpV1) -> anyhow::Result<Option<String>> {
+    if !args.docker_host_gateway {
+        return Ok(None);
+    }
+    ensure!(
+        args.backend == BackendKind::Docker,
+        "docker-host-gateway requires Docker"
+    );
+    let url = validate_url(
+        args.sandbox_url.as_deref().unwrap_or(&args.url),
+        args.allow_http,
+    )?;
+    let host = url.host_str().context("sandbox MCP URL has no hostname")?;
+    validate_gateway_host(host)?;
+    Ok(Some(host.into()))
 }
 
 fn anchor_token(args: &AnchorArgs, resource: &str) -> anyhow::Result<String> {
@@ -609,7 +654,7 @@ async fn launch_up_with_backend(
             principal = Some(identity);
             grants.push(response);
         }
-        let spec = sandbox_spec(&args, &state, &file, env, &grants, &instance);
+        let spec = sandbox_spec(&args, &state, &file, env, &grants, &instance)?;
         ensure!(
             sufficient_remaining_lifetime(&grants, args.timeout_seconds, chrono::Utc::now()),
             "grants do not have enough remaining lifetime for startup, execution, and final shipping"
@@ -649,7 +694,7 @@ fn sandbox_spec(
     mut env: BTreeMap<String, String>,
     grants: &[GrantResponse],
     instance: &str,
-) -> SandboxSpecV1 {
+) -> anyhow::Result<SandboxSpecV1> {
     // Kubernetes may leave a pod Pending after apply succeeds. The entrypoint
     // refuses a delayed start at this absolute deadline, before provider use.
     env.insert(
@@ -682,7 +727,7 @@ fn sandbox_spec(
         env.insert("FLEET_RECALL_CA_PATH".into(), SANDBOX_CA_PATH.into());
         shipper_args.extend(["--ca-path".into(), SANDBOX_CA_PATH.into()]);
     }
-    SandboxSpecV1 {
+    Ok(SandboxSpecV1 {
         name: state.handle.name.clone(),
         image: args.image.clone(),
         shipper_image: args
@@ -696,8 +741,9 @@ fn sandbox_spec(
         namespace: args.namespace.clone(),
         state_dir: file.directory().to_path_buf(),
         ca_path: state.ca_path.clone(),
+        docker_host_gateway: docker_gateway_host(args)?,
         shipper_args,
-    }
+    })
 }
 
 fn agent_environment(

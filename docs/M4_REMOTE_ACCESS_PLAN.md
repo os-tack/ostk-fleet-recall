@@ -1,9 +1,10 @@
 # M4: dependable remote access for daily Codex use
 
-Status: implementation in progress, 2026-09-27. M4.1 implements the shared
-client and discovery contract; M4.2–M4.5 remain pending. Baseline: `ea6d43d`
-on `main`, including M3 and the merged Prometheus/Grafana telemetry work. This
-document does not record an M4 deployment.
+Status: implementation in progress, 2026-09-27. M4.1 is implemented. M4.2's
+single-Mac HTTPS services, native Codex CLI and container paths are deployed
+and tested; browser trust, desktop restart and a second-machine LAN/VPN check
+remain unqualified. M4.3–M4.5 remain pending. The original baseline was
+`ea6d43d` on `main`, including M3 and merged Prometheus/Grafana telemetry.
 The original remote plan ended at M3. M4 is the follow-on described here.
 
 ## M4.1 checkpoint
@@ -20,9 +21,9 @@ readable for teardown. See [client instructions](REMOTE_PLANE.md) and
 Automated coverage includes real TLS trust/hostname/expiry/rotation checks,
 shim and transcript transport, grant mint/revoke and failed-launch cleanup,
 metadata boundaries, sandbox credential isolation, and delayed-start refusal.
-Actual image mounts, native Codex OAuth refresh, canonical DNS/edge routing,
-and the second-machine journey still require M4.2/release qualification. The
-running M3 deployment has not been upgraded by this implementation checkpoint.
+At that checkpoint, actual image mounts, native Codex OAuth refresh, canonical
+DNS/edge routing, and the second-machine journey still required M4.2/release
+qualification. The M4.1 implementation alone did not upgrade the M3 deployment.
 
 Validation on Rust 1.94: locked build, strict all-target Clippy, formatting,
 and the standard suite (2,789 passed, 19 ignored); 10 Python sandbox/TLS tests,
@@ -31,6 +32,29 @@ Database-gated tests had no connected database, so this is not new live-SQL
 evidence. UBS's staged-file scan remained partial because its shadow workspace
 lacks unchanged Rust modules; changed-path findings were reviewed, and the
 existing dependency exceptions remain documented in [SECURITY.md](SECURITY.md).
+
+## M4.2 local deployment checkpoint
+
+The existing Lima/k0s installation now serves the canonical Recall, Hydra and
+login names over verified HTTPS. The cutover retained the database, existing
+enrolled subject, generation-3 authority, signing/cookie keys, content key and
+transcript spool. Gateway access to private application Secrets is denied;
+public routes exclude administrative APIs. Old Recall/Ory NodePorts are closed.
+The worker's original schedule has been restored after authenticated acceptance.
+
+Live checks passed for secure browser-form login/consent/CSRF and Kratos logout,
+old-issuer rejection, native Codex OAuth and refresh after token expiry, Docker
+and Kubernetes shim/grant/shipping flows, and a real Codex sandbox transcript
+round trip into searchable evidence. Network denial was tested from an unrelated
+pod against the same ready sockets that allowed control pods reached before and
+after the denial test. Wrong trust and unknown TLS names were rejected.
+
+See the [operator runbook](../deploy/local/https/README.md) and
+[qualification record](../deploy/local/https/QUALIFICATION.md). This checkpoint
+does not close the entire M4.2 acceptance row: macOS browser trust awaits user
+authorization, the current Codex desktop process needs restart qualification,
+and LAN/VPN exposure needs a selected stable address and a second machine.
+Cloud deployment and lifecycle/restore rehearsals remain later milestones.
 
 ## Outcome and scope
 

@@ -6,6 +6,13 @@ role boundary applied, the recall workloads, Ory Hydra + Kratos for identity,
 and LocalStack for the AWS surfaces. It is the reference the production
 Pulumi or Terraform program is derived from (ADR 0009).
 
+The existing installation was upgraded to the [M4.2 HTTPS profile](https/README.md)
+on 2026-09-27. Its MCP URL is `https://recall.fleet.test:8443/mcp`;
+LocalStack remains disabled and optional. Use that profile's cutover and
+verification helpers for the current installation. The HTTP bootstrap/M2/M3
+commands below describe earlier development profiles and are not an HTTPS
+reconciliation procedure. See the [tested scope and remaining checks](https/QUALIFICATION.md).
+
 ```
 deploy/local/bootstrap.sh up                # every phase, in order
 deploy/local/bootstrap.sh phase <name>      # one phase (idempotent)

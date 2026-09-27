@@ -1,0 +1,98 @@
+# Chart 41.6.0 / app v3.7.13. Do not grant global Secret access through chart RBAC.
+fullnameOverride: fleet-edge
+deployment:
+  replicas: 1
+  podLabels:
+    fleet-recall.dev/component: https-edge
+api:
+  dashboard: false
+  insecure: false
+  debug: false
+ingressClass:
+  enabled: false
+gateway:
+  enabled: false
+gatewayClass:
+  enabled: false
+rbac:
+  enabled: false
+serviceAccount:
+  name: fleet-edge
+providers:
+  kubernetesCRD:
+    enabled: false
+  kubernetesIngress:
+    enabled: false
+  kubernetesGateway:
+    enabled: true
+    experimentalChannel: false
+    namespaces: [fleet-edge]
+    crossProviderNamespaces: [fleet-edge]
+    labelSelector: fleet-recall.dev/component=https-edge
+  file:
+    enabled: true
+    watch: true
+    content:
+      # Supported Gateway cross-provider backendRefs avoid Secret watches in
+      # application namespaces. These are fixed, private public-service URLs.
+      http:
+        services:
+          recall:
+            loadBalancer:
+              servers:
+                - url: http://recall.fleet-recall.svc.cluster.local:8080
+          hydra:
+            loadBalancer:
+              servers:
+                - url: http://hydra-public.ory.svc.cluster.local:4444
+          kratos:
+            loadBalancer:
+              servers:
+                - url: http://kratos-public.ory.svc.cluster.local:80
+          ui:
+            loadBalancer:
+              servers:
+                - url: http://kratos-ui-kratos-selfservice-ui-node.ory.svc.cluster.local:80
+      tls:
+        options:
+          default:
+            minVersion: VersionTLS12
+            sniStrict: true
+ports:
+  traefik:
+    port: 9000
+    expose:
+      default: false
+  web:
+    expose:
+      default: false
+  websecure:
+    port: 8443
+    exposedPort: 8443
+    nodePort: 30443
+    expose:
+      default: true
+    forwardedHeaders:
+      insecure: false
+  metrics:
+    port: 9100
+    expose:
+      default: false
+service:
+  spec:
+    type: NodePort
+log:
+  level: INFO
+accessLog:
+  enabled: false
+additionalArguments:
+  - --entrypoints.websecure.transport.respondingtimeouts.readtimeout=60s
+  - --entrypoints.websecure.transport.respondingtimeouts.writetimeout=75s
+  - --entrypoints.websecure.transport.respondingtimeouts.idletimeout=90s
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 256Mi

@@ -1,0 +1,24 @@
+image:
+  tag: v26.2.0
+# Browser URLs share an origin with the UI. Server-side SDK calls stay private.
+kratosPublicUrl: http://kratos-public.ory.svc:80
+kratosBrowserUrl: https://login.fleet.test:8443
+kratosAdminUrl: http://kratos-admin.ory.svc:80
+hydraAdminUrl: http://hydra-admin.ory.svc:4445
+basePath: ""
+projectName: Fleet Recall
+config:
+  csrfCookieName: __Host-fleet-recall-csrf
+deployment:
+  # The UI tests env presence, so even a value of "false" disables Secure!
+  extraEnv: []
+  automountServiceAccountToken: false
+secret:
+  # The chart's pre-upgrade hook otherwise generates NEW random cookie keys.
+  # The existing Secret has resource-policy=keep; keep referencing it in place.
+  enabled: false
+  nameOverride: kratos-ui-kratos-selfservice-ui-node
+  hashSumEnabled: false
+service:
+  type: ClusterIP
+  nodePort: null

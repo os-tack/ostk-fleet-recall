@@ -1,0 +1,23 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: fleet-local-ca-namespace
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [cert-manager.io]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [certificates, certificaterequests]
+  validations:
+    - expression: "object.spec.issuerRef.name != 'fleet-local-ca' || request.namespace == 'fleet-edge'"
+      message: The fleet local CA may issue certificates only in fleet-edge.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: fleet-local-ca-namespace
+spec:
+  policyName: fleet-local-ca-namespace
+  validationActions: [Deny]

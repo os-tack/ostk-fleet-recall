@@ -1,0 +1,4 @@
+kratosPublicUrl: http://kratos-public.fleet-https-preflight.svc:80
+kratosAdminUrl: http://kratos-admin.fleet-https-preflight.svc:80
+hydraAdminUrl: http://hydra-admin.fleet-https-preflight.svc:4445
+projectName: Fleet Recall HTTPS preflight

@@ -1,0 +1,10 @@
+kratos:
+  automigration:
+    enabled: true
+    type: initContainer
+  config:
+    serve:
+      admin:
+        base_url: http://kratos-admin.fleet-https-preflight.svc/
+    oauth2_provider:
+      url: http://hydra-admin.fleet-https-preflight.svc:4445

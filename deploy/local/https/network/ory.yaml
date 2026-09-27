@@ -1,0 +1,97 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: https-default-deny-ingress
+  namespace: ory
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: https-hydra-public
+  namespace: ory
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: hydra, app.kubernetes.io/instance: hydra}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: fleet-edge}
+          podSelector:
+            matchLabels: {fleet-recall.dev/component: https-edge}
+      ports: [{port: 4444, protocol: TCP}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: https-hydra-admin
+  namespace: ory
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: hydra, app.kubernetes.io/instance: hydra}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: kratos-selfservice-ui-node, app.kubernetes.io/instance: kratos-ui}
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: kratos, app.kubernetes.io/instance: kratos}
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: hydra-hydra-maester, app.kubernetes.io/instance: hydra}
+      ports: [{port: 4445, protocol: TCP}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: https-kratos-public
+  namespace: ory
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: kratos, app.kubernetes.io/instance: kratos}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: fleet-edge}
+          podSelector:
+            matchLabels: {fleet-recall.dev/component: https-edge}
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: kratos-selfservice-ui-node, app.kubernetes.io/instance: kratos-ui}
+      ports: [{port: 4433, protocol: TCP}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: https-kratos-admin
+  namespace: ory
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: kratos, app.kubernetes.io/instance: kratos}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: kratos-selfservice-ui-node, app.kubernetes.io/instance: kratos-ui}
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: hydra, app.kubernetes.io/instance: hydra}
+      ports: [{port: 4434, protocol: TCP}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: https-login-ui
+  namespace: ory
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: kratos-selfservice-ui-node, app.kubernetes.io/instance: kratos-ui}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: fleet-edge}
+          podSelector:
+            matchLabels: {fleet-recall.dev/component: https-edge}
+      ports: [{port: 3000, protocol: TCP}]

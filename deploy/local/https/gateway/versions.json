@@ -1,0 +1,22 @@
+{
+  "traefik": {
+    "version": "41.6.0",
+    "app_version": "v3.7.13",
+    "chart": "traefik",
+    "repository": "https://traefik.github.io/charts",
+    "archive": "traefik-41.6.0.tgz",
+    "sha256": "cd7254ea853da73bdb88edc896f079b88d43ffa0bfe699fdbf21081361eac365"
+  },
+  "cert_manager": {
+    "version": "v1.21.2",
+    "chart": "oci://quay.io/jetstack/charts/cert-manager",
+    "archive": "cert-manager-v1.21.2.tgz",
+    "sha256": "73a56e1728edd6c99f1f31082618c3259d279a76b7ebd3d4bdc5475c2442d34a"
+  },
+  "gateway_api": {
+    "version": "v1.6.2",
+    "url": "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/standard-install.yaml",
+    "archive": "gateway-standard-v1.6.2.yaml",
+    "sha256": "faede450fa178126aba41337737b97d351ebe87d93c910237ce1e072d1ca40d9"
+  }
+}

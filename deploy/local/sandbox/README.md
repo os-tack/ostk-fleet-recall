@@ -43,6 +43,12 @@ copy for retries and teardown, and mounts it read-only into both containers
 at `/etc/fleet-recall/ca.pem`. The CA bundle must contain only PEM certificates
 and be at most 256 KiB. Existing public roots remain trusted.
 
+For the [single-Mac HTTPS profile](../https/README.md), Docker additionally
+needs `--docker-host-gateway`: it maps only the canonical MCP hostname to
+Docker's host gateway in both the agent and shipper. The HTTPS URL, SNI,
+certificate checks and grant audience remain unchanged. Kubernetes uses the
+profile's split DNS and must omit that Docker-only flag.
+
 The launcher sets `FLEET_RECALL_CA_PATH` and, only for explicit development
 opt-in, `FLEET_RECALL_ALLOW_HTTP=true`. Codex and Claude pass those settings
 only to the Recall shim; they do not replace the provider's TLS trust store.

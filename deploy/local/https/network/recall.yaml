@@ -1,0 +1,134 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: https-default-deny-ingress
+  namespace: fleet-recall
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+# Only the TLS edge reaches the private MCP listener. Sandboxes use the edge.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: https-recall-from-edge
+  namespace: fleet-recall
+spec:
+  podSelector:
+    matchLabels: {app: recall}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: fleet-edge}
+          podSelector:
+            matchLabels: {fleet-recall.dev/component: https-edge}
+      ports: [{port: 8080, protocol: TCP}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: https-embedding-clients
+  namespace: fleet-recall
+spec:
+  podSelector:
+    matchLabels: {app: embed}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - {key: app, operator: In, values: [recall, worker, enrollment]}
+      ports: [{port: 8090, protocol: TCP}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: https-database-clients
+  namespace: fleet-recall
+spec:
+  podSelector:
+    matchLabels: {app: cockroach}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - {key: app, operator: In, values: [cockroach, writer, recall, worker, demo, ingress, enrollment]}
+        - podSelector:
+            matchExpressions:
+              - {key: job, operator: In, values: [db-bootstrap, migrate, boundary, seed, ory-db-bootstrap]}
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: ory}
+          podSelector:
+            matchExpressions:
+              - {key: app.kubernetes.io/name, operator: In, values: [hydra, hydra-automigrate, kratos, kratos-automigrate]}
+      ports: [{port: 26257, protocol: TCP}]
+---
+# These remain operator-local NodePorts in M4.2. Restrict pod access to explicit
+# clients; the node/host boundary is enforced by Lima's loopback forwarding.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: https-publication-clients
+  namespace: fleet-recall
+spec:
+  podSelector:
+    matchLabels: {app: demo}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {fleet-recall.dev/client: publication}
+      ports: [{port: 8080, protocol: TCP}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: https-webhook-clients
+  namespace: fleet-recall
+spec:
+  podSelector:
+    matchLabels: {app: ingress}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {fleet-recall.dev/client: webhook}
+      ports: [{port: 8787, protocol: TCP}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: https-recall-metrics
+  namespace: fleet-recall
+spec:
+  podSelector:
+    matchExpressions:
+      - {key: app, operator: In, values: [recall, embed]}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: fleet-observability}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: prometheus}
+      ports: [{port: 9100, protocol: TCP}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: https-publication-webhook-metrics
+  namespace: fleet-recall
+spec:
+  podSelector:
+    matchExpressions:
+      - {key: app, operator: In, values: [demo, ingress]}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: fleet-observability}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: prometheus}
+      ports: [{port: 9091, protocol: TCP}]

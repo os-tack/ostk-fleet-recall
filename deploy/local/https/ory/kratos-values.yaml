@@ -1,0 +1,52 @@
+# URL/cookie cutover only: retain the existing identity schema, DSN and keys.
+image:
+  tag: v26.2.0
+kratos:
+  development: false
+  automigration:
+    enabled: false
+  config:
+    serve:
+      public:
+        base_url: https://login.fleet.test:8443/
+        cors:
+          enabled: false
+          allowed_origins:
+            - https://login.fleet.test:8443
+    cookies:
+      # v26.2.0's schema declares this switch as a string, not a YAML boolean.
+      secure: "true"
+      same_site: Lax
+      path: /
+    session:
+      cookie:
+        secure: "true"
+        same_site: Lax
+        path: /
+    selfservice:
+      default_browser_return_url: https://login.fleet.test:8443/
+      allowed_return_urls:
+        - https://login.fleet.test:8443/
+        - https://auth.fleet.test:8443/
+      flows:
+        error:
+          ui_url: https://login.fleet.test:8443/error
+        settings:
+          ui_url: https://login.fleet.test:8443/settings
+        logout:
+          after:
+            default_browser_return_url: https://login.fleet.test:8443/login
+        login:
+          ui_url: https://login.fleet.test:8443/login
+        registration:
+          ui_url: https://login.fleet.test:8443/registration
+secret:
+  enabled: false
+  nameOverride: kratos-secrets
+service:
+  public:
+    type: ClusterIP
+    nodePort: null
+  admin:
+    type: ClusterIP
+    nodePort: null

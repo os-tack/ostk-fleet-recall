@@ -104,3 +104,8 @@ portForwards:
   - guestPort: 30080
     hostPort: 8080
     static: true
+  # M4 single-Mac HTTPS edge. Only this forward changes for a LAN/VPN profile.
+  - guestPort: 30443
+    hostIP: 127.0.0.1
+    hostPort: 8443
+    static: true
