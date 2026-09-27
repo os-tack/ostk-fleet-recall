@@ -59,10 +59,18 @@
 //! An evidence search may be scoped with a source filter
 //! ([`EvidenceSourceFilterV1`]: `git`, `items`, or `sessions`), which
 //! restricts both lanes to bodies of that source's media type; the verdict
-//! then carries `scope: {source}`, so `absent` reads "absent from git".
-//! Readiness and the source listing stay scope-wide, with the projection lag
-//! split by kind (`lag_by_kind`) so an answer can say whether the pending
-//! evidence is collected items or the project's own.
+//! then carries `scope: {source}`, so `absent` reads "absent from git", and
+//! it judges only the sources the filter covers
+//! ([`EvidenceSourceFilterV1::covers`]): a failed, stale, or unchecked
+//! source of another kind, a pending outbox of another kind, or projection
+//! lag of another kind does not block `absent`. A source of a kind this
+//! build does not know is covered by every filter. Readiness and the source
+//! listing stay scope-wide, with the projection lag split by kind
+//! (`lag_by_kind`) so an answer can say whether the pending evidence is
+//! collected items or the project's own; a scoped verdict reads that split
+//! (`items` for `items`, `other` for `git` and `sessions`, so a pending
+//! transcript turn still blocks "absent from git"), and the total when the
+//! split cannot be read.
 //!
 //! "Complete" is the newest coverage cursor of each source. For git that is
 //! the latest observed ref target; for CI, the latest window of runs; for a
@@ -107,6 +115,19 @@
 //! every collected body until then. A process never serves collected text it
 //! cannot suppress.
 //!
+//! # Duplicate versions
+//!
+//! An edit is a new version of the whole item, so a section the edit did not
+//! touch has a body per version, each rendering to the same recall text. A
+//! search that matches it would list every version, tied, all but one
+//! `current: false`. The fused candidates are therefore read wider than the
+//! answer, and before the cut the versions of one item that share a recall
+//! text digest are collapsed to the item's presented head when it is among
+//! them, or to the best-ranked copy otherwise; the answer counts what was
+//! removed in `duplicates_collapsed`. Identical text of different items, and
+//! the project's own evidence, never collapse, and an older version whose
+//! text the head no longer has is still listed, with `current: false`.
+//!
 //! # What the text is
 //!
 //! A snippet and a fetched body carry the lexical tier's recall text, never
@@ -136,6 +157,7 @@
 //! publication process never builds it.
 
 mod cockroach;
+mod collapse;
 mod serve;
 mod verdict;
 
@@ -456,7 +478,10 @@ pub struct EvidenceItemV1 {
     /// `reported` (capture, import).
     pub trust: TrustTierV1,
     /// Whether this body's version is the item's presented head. An edit
-    /// supersedes: an older version's body is still recalled, with `false`.
+    /// supersedes: an older version's body is still recalled, with `false`,
+    /// unless its recall text is identical to a listed version's of the same
+    /// item, in which case only one is listed, the head when it is among the
+    /// candidates ([`EvidenceSearchV1::duplicates_collapsed`]).
     pub current: bool,
     /// The lifecycle of this body's version.
     pub lifecycle: ItemLifecycleV1,
@@ -645,6 +670,23 @@ impl EvidenceSourceFilterV1 {
             Self::Sessions => CANONICAL_JSON_MEDIA_TYPE,
         }
     }
+
+    /// Whether a source of `kind` writes the bodies this filter admits, so
+    /// that a scoped verdict judges its health: `git` covers the git
+    /// connector, `items` the collectors, `sessions` the transcript and CI
+    /// connectors. A kind this build does not know is covered by every
+    /// filter: it is not a reason to trust its source any more or less.
+    #[must_use]
+    pub const fn covers(self, kind: &EvidenceSourceKindV1) -> bool {
+        match kind {
+            EvidenceSourceKindV1::Git => matches!(self, Self::Git),
+            EvidenceSourceKindV1::Collector => matches!(self, Self::Items),
+            EvidenceSourceKindV1::Transcript | EvidenceSourceKindV1::Ci => {
+                matches!(self, Self::Sessions)
+            }
+            EvidenceSourceKindV1::Other(_) => true,
+        }
+    }
 }
 
 /// What an evidence verdict was scoped to, when the search carried a filter.
@@ -696,6 +738,12 @@ pub struct EvidenceSearchV1 {
     pub readiness: EvidenceReadinessV1,
     pub sources: EvidenceSourcesV1,
     pub absence: AbsenceV1,
+    /// Superseded versions of a collected item whose recall text is
+    /// identical to another listed version's, removed from the fused
+    /// candidates before the cut so an edited document's unchanged sections
+    /// are listed once, at the item's presented head. Absent when zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub duplicates_collapsed: u32,
 }
 
 /// The collectors of one scope at a glance (ADR 0008), for `recall(status)`.
@@ -933,6 +981,69 @@ mod tests {
         })
         .unwrap();
         assert_eq!(scoped, serde_json::json!({ "source": "sessions" }));
+    }
+
+    #[test]
+    fn a_source_filter_covers_the_sources_that_write_its_bodies() {
+        use EvidenceSourceFilterV1::{Git, Items, Sessions};
+        let cases = [
+            (EvidenceSourceKindV1::Git, [true, false, false]),
+            (EvidenceSourceKindV1::Collector, [false, true, false]),
+            (EvidenceSourceKindV1::Transcript, [false, false, true]),
+            (EvidenceSourceKindV1::Ci, [false, false, true]),
+            // A kind this build does not know gates every scope.
+            (
+                EvidenceSourceKindV1::Other("collected.slack".to_owned()),
+                [true, true, true],
+            ),
+        ];
+        for (kind, expected) in cases {
+            for (filter, covered) in [Git, Items, Sessions].into_iter().zip(expected) {
+                assert_eq!(filter.covers(&kind), covered, "{filter:?} over {kind:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn duplicates_collapsed_is_serialized_only_when_some_were() {
+        let readiness = EvidenceReadinessV1 {
+            events_awaiting_body_projection: 0,
+            lag_by_kind: None,
+            transcript_turns_awaiting_admission: 0,
+            items_awaiting_admission: None,
+            hints_awaiting_fetch: None,
+            hints_unreadable: false,
+            collector_state_unreadable: false,
+            lexical_current: true,
+            dense_current: true,
+            dense_lane: EvidenceDenseLaneV1::NoQueryVector,
+            as_of: DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
+        };
+        let sources = EvidenceSourcesV1 {
+            active: Vec::new(),
+            truncated: false,
+        };
+        let absence = absence_verdict(&[], true, &readiness, &sources, None);
+        let search = EvidenceSearchV1 {
+            hits: Vec::new(),
+            readiness,
+            sources,
+            absence,
+            duplicates_collapsed: 0,
+        };
+        let value = serde_json::to_value(&search).unwrap();
+        assert!(
+            value.get("duplicates_collapsed").is_none(),
+            "nothing collapsed, no field: {value}"
+        );
+        let collapsed = EvidenceSearchV1 {
+            duplicates_collapsed: 2,
+            ..search
+        };
+        assert_eq!(
+            serde_json::to_value(&collapsed).unwrap()["duplicates_collapsed"],
+            2
+        );
     }
 
     #[test]

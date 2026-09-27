@@ -3429,6 +3429,7 @@ fn evidence_search_result(search: EvidenceSearchV1) -> RecallResult {
         readiness,
         sources,
         absence,
+        duplicates_collapsed,
     } = search;
     let mut warnings = evidence_warnings(&readiness, &sources);
     // The lane is served but this search carried no vector: the process
@@ -3445,12 +3446,18 @@ fn evidence_search_result(search: EvidenceSearchV1) -> RecallResult {
         json!(["lexical"])
     };
     let dense_lane = readiness.dense_lane;
-    let mut result = RecallResult::new(json!({
+    let mut data = json!({
         "hits": hits,
         "readiness": readiness,
         "sources": sources,
         "absence": absence,
-    }));
+    });
+    // Superseded versions of a collected item with the same text as a listed
+    // version, removed before the cut; a field only when there were any.
+    if duplicates_collapsed > 0 {
+        data["duplicates_collapsed"] = json!(duplicates_collapsed);
+    }
+    let mut result = RecallResult::new(data);
     result.conflict_coverage = ConflictCoverage::not_evaluated();
     result.warnings = warnings;
     result.diagnostics.insert(
@@ -6216,6 +6223,8 @@ mod tests {
         sources: std::sync::Mutex<Vec<Option<EvidenceSourceFilterV1>>>,
         gets: std::sync::Mutex<Vec<Sha256Digest>>,
         statuses: std::sync::atomic::AtomicUsize,
+        /// What every search reports as `duplicates_collapsed`.
+        duplicates: u32,
     }
 
     impl FakeEvidence {
@@ -6290,6 +6299,7 @@ mod tests {
                     weak_neighbours: 0,
                     scope: source.map(|source| AbsenceScopeV1 { source }),
                 },
+                duplicates_collapsed: self.duplicates,
             })
         }
 
@@ -6384,6 +6394,10 @@ mod tests {
             result.data["absence"].get("weak_neighbours").is_none(),
             "no weak neighbour, no field"
         );
+        assert!(
+            data.get("duplicates_collapsed").is_none(),
+            "nothing collapsed, no field"
+        );
         assert_eq!(result.data["readiness"]["dense_lane"], "used");
         assert_eq!(
             result.data["sources"]["active"][0]["last_outcome"],
@@ -6439,6 +6453,26 @@ mod tests {
         );
         assert_eq!(result.diagnostics["retrieval"]["lanes"], json!(["lexical"]));
         assert!(warning_codes(&result.warnings).contains(&"evidence_query_not_embedded"));
+    }
+
+    #[tokio::test]
+    async fn evidence_search_counts_the_duplicate_versions_it_collapsed() {
+        let evidence = Arc::new(FakeEvidence {
+            duplicates: 2,
+            ..FakeEvidence::default()
+        });
+        let service = evidence_service(Arc::new(UnitEmbedder), &evidence);
+        let result = FleetMemoryService::recall(
+            &service,
+            offline_scope(),
+            recall_request(
+                RecallAction::Search,
+                &json!({ "kind": "evidence", "query": "albatross fleet" }),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.data["duplicates_collapsed"], 2);
     }
 
     #[tokio::test]

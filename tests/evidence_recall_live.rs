@@ -33,8 +33,8 @@ use std::sync::Arc;
 use common::authority::retry_policy;
 use common::runtime_role::RuntimeProbeRole;
 use common::worker::{
-    COMMIT_WORD, FAILING_STEP_WORD, GIT_INSTANCE, STUB_MODEL_DIGEST, StubEmbedder, TRANSCRIPT_WORD,
-    WorkerFixture, vector_toward,
+    COMMIT_WORD, FAILING_STEP_WORD, GIT_INSTANCE, STUB_MODEL_DIGEST, StubEmbedder,
+    TRANSCRIPT_PREFIX, TRANSCRIPT_WORD, WorkerFixture, vector_toward,
 };
 use ostk_fleet_recall::evidence_recall::{
     ABSENCE_DENSE_MIN_COSINE_SIMILARITY, ABSENCE_NEIGHBOUR_BAND_FLOOR, AbsenceReasonV1,
@@ -630,19 +630,94 @@ async fn live_evidence_source_filter_scopes_both_lanes_and_the_verdict_when_conf
         "{:?}",
         dense_from_sessions.hits
     );
-    // No collected item was ever admitted here: items is absent, scoped.
+    // No collector is registered here: scoped to items, the verdict judges
+    // only the collectors, and there is none to vouch for absence.
     let from_items = recall
         .search_from(COMMIT_WORD, None, 10, Some(EvidenceSourceFilterV1::Items))
         .await
         .unwrap();
-    assert!(from_items.hits.is_empty(), "{:?}", from_items.hits);
-    assert_eq!(from_items.absence.verdict, AbsenceVerdictV1::Absent);
+    assert_unknown_because(&from_items, &[AbsenceReasonV1::NoSourcesRegistered]);
+    assert_eq!(from_items.absence.as_of, None);
     assert_eq!(
         from_items.absence.scope,
         Some(AbsenceScopeV1 {
             source: EvidenceSourceFilterV1::Items
         })
     );
+}
+
+#[tokio::test]
+async fn live_a_failed_source_of_another_kind_leaves_a_scoped_verdict_absent_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let capabilities = capabilities(&database_url).await;
+    let fixture = WorkerFixture::install(&pool, "evidence-scoped-failure").await;
+    tick(&fixture, &pool, "all").await;
+    let recall = evidence(&pool, &capabilities, &fixture.installed.scope).await;
+    assert_absent(&search(&recall, NONSENSE).await);
+
+    // The transcript source's last attempt failed.
+    let updated = sqlx::query(
+        "UPDATE memory_worker_sources_v1 \
+         SET last_outcome = 'failed', last_error = 'fixture' \
+         WHERE tenant_id = $1 AND project = $2 AND source_kind = 'transcript'",
+    )
+    .bind(fixture.installed.scope.tenant_id)
+    .bind(&fixture.installed.scope.project)
+    .execute(&pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert!(updated > 0, "the fixture has a transcript source");
+
+    // Absent from git: the git source is healthy, and only it is judged.
+    let from_git = recall
+        .search_from(NONSENSE, None, 10, Some(EvidenceSourceFilterV1::Git))
+        .await
+        .unwrap();
+    assert_absent(&from_git);
+    assert_eq!(
+        from_git.absence.scope,
+        Some(AbsenceScopeV1 {
+            source: EvidenceSourceFilterV1::Git
+        })
+    );
+    assert!(from_git.absence.as_of.is_some());
+    // The listing stays scope-wide: the failed transcript source is still
+    // there to read.
+    let failed: Vec<_> = from_git
+        .sources
+        .active
+        .iter()
+        .filter(|source| source.last_outcome == WorkerSourceOutcomeV1::Failed)
+        .collect();
+    assert!(
+        !failed.is_empty()
+            && failed.iter().all(|source| {
+                source.connector_instance.starts_with(TRANSCRIPT_PREFIX)
+                    && source.last_error.as_deref() == Some("fixture")
+            }),
+        "{:?}",
+        from_git.sources
+    );
+
+    // Scoped to sessions, or unscoped, the failed source blocks absent.
+    let from_sessions = recall
+        .search_from(NONSENSE, None, 10, Some(EvidenceSourceFilterV1::Sessions))
+        .await
+        .unwrap();
+    assert_unknown_because(&from_sessions, &[AbsenceReasonV1::SourceFailed]);
+    assert_eq!(
+        from_sessions.absence.scope,
+        Some(AbsenceScopeV1 {
+            source: EvidenceSourceFilterV1::Sessions
+        })
+    );
+    let unscoped = search(&recall, NONSENSE).await;
+    assert_unknown_because(&unscoped, &[AbsenceReasonV1::SourceFailed]);
+    assert_eq!(unscoped.absence.scope, None);
 }
 
 #[tokio::test]

@@ -153,6 +153,22 @@ all of these hold, and `unknown` otherwise, with every reason that applies:
   its newest coverage cursor is complete (`incomplete_coverage`);
 - the source listing (at most 256) was not cut (`listing_truncated`).
 
+Amended 2026-09-26: a search scoped with `source` (`git`, `items`,
+`sessions`) judges only the sources its filter covers (`git` the git
+connector, `items` the collectors, `sessions` the transcript and CI
+connectors; a kind the build does not know is covered by every filter). Over
+those, `as_of` and the `source_failed`, `source_stale`,
+`source_never_checked`, `incomplete_coverage`, and `no_sources_registered`
+conditions are read; a pending transcript outbox blocks `sessions` and the
+unscoped verdict, pending items or hints and unreadable collector state block
+`items` and the unscoped verdict, and `body_projection_lag` is read from the
+split by kind (`items` for `items`, `other` for `git` and `sessions`, so a
+pending transcript turn still blocks "absent from git") when the split is
+readable, and from the total otherwise. `lexical_projection_lag` and
+`listing_truncated` block every scope. The listing, readiness, and the
+`evidence_source_failed` warning stay scope-wide. Before this a failed
+transcript source made "absent from git" `unknown`.
+
 Each transcript file is its own source (D1), so a transcript directory with
 more than 256 session files makes every empty answer `unknown`
 (`listing_truncated`), and every search answer carries the full listing, up

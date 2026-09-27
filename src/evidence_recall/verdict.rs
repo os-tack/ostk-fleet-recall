@@ -11,8 +11,8 @@ use crate::projectors::lexical::GIT_FACT_MEDIA_TYPE;
 use crate::worker::WorkerSourceOutcomeV1;
 
 use super::{
-    AbsenceReasonV1, AbsenceV1, AbsenceVerdictV1, EvidenceMatchV1, EvidenceReadinessV1,
-    EvidenceSourcesV1, PresentByV1,
+    AbsenceReasonV1, AbsenceScopeV1, AbsenceV1, AbsenceVerdictV1, EvidenceMatchV1,
+    EvidenceReadinessV1, EvidenceSourceFilterV1, EvidenceSourceV1, EvidenceSourcesV1, PresentByV1,
 };
 
 /// The cosine similarity a dense-only hit needs before it votes `present`.
@@ -59,10 +59,14 @@ pub const ABSENCE_NEIGHBOUR_BAND_FLOOR: f32 = 0.30;
 
 /// Media types whose bodies never vote `present` on a dense-only match.
 ///
-/// A raw git fact (a commit's author, message, and paths as one record) is
-/// the neighbour a nonsense query lands on at about 0.29, and on a real
-/// question it is rarely the answer a document or a message is; it still
-/// votes lexically, and it is still returned as a hit.
+/// A git fact rendered as a flat record was the neighbour a nonsense query
+/// landed on at about 0.29, and on a real question it is rarely the answer a
+/// document or a message is; it still votes lexically, and it is still
+/// returned as a hit. Normalization version 4 renders a git fact message
+/// first, which may move its similarities either way; the exclusion stands
+/// until they are re-measured on the readable text
+/// (docs/TRIAL_RETEST_2026-09-26.md), and this constant, not a measurement,
+/// is the contract recall(status) publishes.
 pub const DENSE_VOTE_EXCLUDED_MEDIA_TYPES: &[&str] = &[GIT_FACT_MEDIA_TYPE];
 
 /// What one hit contributes to the absence verdict.
@@ -192,20 +196,37 @@ fn strongest_neighbour(votes: &[HitVoteV1]) -> Option<(usize, f32)> {
 /// floor decides nothing and hides no reason.
 ///
 /// `votes` are in hit order, so `strongest_hit` indexes the caller's hits.
-/// The verdict's `scope` is the caller's to set: it depends on the request,
-/// not on the votes.
+///
+/// With a `scope`, the verdict speaks for that source's bodies only, and
+/// judges only the sources the filter covers
+/// ([`EvidenceSourceFilterV1::covers`]): `as_of`, the failed, stale,
+/// never-checked, and incomplete-coverage reasons, and
+/// `no_sources_registered` are read over the covered sources; a pending
+/// transcript outbox blocks `sessions` and the unscoped verdict, pending
+/// items or hints and unreadable collector state block `items` and the
+/// unscoped verdict; and body projection lag is read from `lag_by_kind`
+/// (`items` for `items`, `other` for `git` and `sessions`, so a pending
+/// transcript turn still blocks "absent from git") when the split is
+/// readable, and from the total otherwise. The lexical tier's lag and a
+/// truncated listing block every scope.
 #[must_use]
 pub fn absence_verdict(
     votes: &[HitVoteV1],
     lexical_terms: bool,
     readiness: &EvidenceReadinessV1,
     sources: &EvidenceSourcesV1,
+    scope: Option<EvidenceSourceFilterV1>,
 ) -> AbsenceV1 {
-    let as_of = sources
+    let covered: Vec<&EvidenceSourceV1> = sources
         .active
+        .iter()
+        .filter(|source| scope.is_none_or(|filter| filter.covers(&source.kind)))
+        .collect();
+    let as_of = covered
         .iter()
         .filter_map(|source| source.last_checked_at)
         .min();
+    let scoped = scope.map(|source| AbsenceScopeV1 { source });
     let lexical = votes.iter().any(|vote| vote.votes_lexically());
     let dense = votes.iter().any(|vote| vote.votes_densely());
     let present_by = match (lexical, dense) {
@@ -231,7 +252,7 @@ pub fn absence_verdict(
             strongest_dense_similarity,
             strongest_hit,
             weak_neighbours,
-            scope: None,
+            scope: scoped,
         };
     }
     let mut reasons = BTreeSet::new();
@@ -241,46 +262,12 @@ pub fn absence_verdict(
     if votes.iter().any(|vote| vote.in_neighbour_band()) {
         reasons.insert(AbsenceReasonV1::DenseNeighbourBelowBound);
     }
-    if readiness.events_awaiting_body_projection > 0 {
-        reasons.insert(AbsenceReasonV1::BodyProjectionLag);
-    }
-    if readiness.transcript_turns_awaiting_admission > 0
-        || readiness
-            .items_awaiting_admission
-            .is_some_and(|pending| pending > 0)
-        || readiness
-            .hints_awaiting_fetch
-            .is_some_and(|pending| pending > 0)
-    {
-        reasons.insert(AbsenceReasonV1::IngestOutboxPending);
-    }
-    // An unreadable hint queue is collector state this login cannot read: a
-    // signed change may be waiting unseen.
-    if readiness.collector_state_unreadable || readiness.hints_unreadable {
-        reasons.insert(AbsenceReasonV1::CollectorStateUnreadable);
-    }
-    if !readiness.lexical_current {
-        reasons.insert(AbsenceReasonV1::LexicalProjectionLag);
-    }
-    if sources.active.is_empty() {
+    readiness_reasons(readiness, scope, &mut reasons);
+    if covered.is_empty() {
         reasons.insert(AbsenceReasonV1::NoSourcesRegistered);
     }
-    for source in &sources.active {
-        if source.last_outcome == WorkerSourceOutcomeV1::Failed {
-            reasons.insert(AbsenceReasonV1::SourceFailed);
-        }
-        if source.last_checked_at.is_none() {
-            reasons.insert(AbsenceReasonV1::SourceNeverChecked);
-        } else if source.stale {
-            reasons.insert(AbsenceReasonV1::SourceStale);
-        }
-        if !source
-            .coverage
-            .as_ref()
-            .is_some_and(|coverage| coverage.completeness == CoverageCompletenessV1::Complete)
-        {
-            reasons.insert(AbsenceReasonV1::IncompleteCoverage);
-        }
+    for source in covered {
+        source_reasons(source, &mut reasons);
     }
     if sources.truncated {
         reasons.insert(AbsenceReasonV1::ListingTruncated);
@@ -297,7 +284,68 @@ pub fn absence_verdict(
         strongest_dense_similarity,
         strongest_hit,
         weak_neighbours,
-        scope: None,
+        scope: scoped,
+    }
+}
+
+/// The reasons readiness gives an empty answer of `scope`, added to
+/// `reasons`.
+fn readiness_reasons(
+    readiness: &EvidenceReadinessV1,
+    scope: Option<EvidenceSourceFilterV1>,
+    reasons: &mut BTreeSet<AbsenceReasonV1>,
+) {
+    // The split by kind serves a scoped verdict; without it (or without a
+    // scope) every pending event counts.
+    let body_projection_lag = match (scope, readiness.lag_by_kind) {
+        (Some(EvidenceSourceFilterV1::Items), Some(lag)) => lag.items > 0,
+        (Some(EvidenceSourceFilterV1::Git | EvidenceSourceFilterV1::Sessions), Some(lag)) => {
+            lag.other > 0
+        }
+        (None, _) | (_, None) => readiness.events_awaiting_body_projection > 0,
+    };
+    if body_projection_lag {
+        reasons.insert(AbsenceReasonV1::BodyProjectionLag);
+    }
+    let judges_sessions = matches!(scope, None | Some(EvidenceSourceFilterV1::Sessions));
+    let judges_items = matches!(scope, None | Some(EvidenceSourceFilterV1::Items));
+    if (judges_sessions && readiness.transcript_turns_awaiting_admission > 0)
+        || (judges_items
+            && (readiness
+                .items_awaiting_admission
+                .is_some_and(|pending| pending > 0)
+                || readiness
+                    .hints_awaiting_fetch
+                    .is_some_and(|pending| pending > 0)))
+    {
+        reasons.insert(AbsenceReasonV1::IngestOutboxPending);
+    }
+    // An unreadable hint queue is collector state this login cannot read: a
+    // signed change may be waiting unseen.
+    if judges_items && (readiness.collector_state_unreadable || readiness.hints_unreadable) {
+        reasons.insert(AbsenceReasonV1::CollectorStateUnreadable);
+    }
+    if !readiness.lexical_current {
+        reasons.insert(AbsenceReasonV1::LexicalProjectionLag);
+    }
+}
+
+/// The reasons one covered source gives an empty answer, added to `reasons`.
+fn source_reasons(source: &EvidenceSourceV1, reasons: &mut BTreeSet<AbsenceReasonV1>) {
+    if source.last_outcome == WorkerSourceOutcomeV1::Failed {
+        reasons.insert(AbsenceReasonV1::SourceFailed);
+    }
+    if source.last_checked_at.is_none() {
+        reasons.insert(AbsenceReasonV1::SourceNeverChecked);
+    } else if source.stale {
+        reasons.insert(AbsenceReasonV1::SourceStale);
+    }
+    if !source
+        .coverage
+        .as_ref()
+        .is_some_and(|coverage| coverage.completeness == CoverageCompletenessV1::Complete)
+    {
+        reasons.insert(AbsenceReasonV1::IncompleteCoverage);
     }
 }
 
@@ -308,7 +356,7 @@ mod tests {
 
     use super::super::{
         EvidenceCoverageV1, EvidenceDenseLaneV1, EvidenceSourceKindV1, EvidenceSourceV1,
-        EvidenceSourcesV1,
+        EvidenceSourcesV1, LagByKindV1,
     };
     use super::*;
 
@@ -370,7 +418,7 @@ mod tests {
         readiness: &EvidenceReadinessV1,
         sources: &EvidenceSourcesV1,
     ) -> Vec<AbsenceReasonV1> {
-        let absence = absence_verdict(&[], lexical_terms, readiness, sources);
+        let absence = absence_verdict(&[], lexical_terms, readiness, sources, None);
         assert_eq!(
             absence.verdict == AbsenceVerdictV1::Absent,
             absence.reasons.is_empty(),
@@ -397,7 +445,50 @@ mod tests {
     }
 
     fn verdict(votes: &[HitVoteV1]) -> AbsenceV1 {
-        absence_verdict(votes, true, &current(), &two_healthy())
+        absence_verdict(votes, true, &current(), &two_healthy(), None)
+    }
+
+    /// A healthy transcript source.
+    fn transcript(instance: &str, checked: i64) -> EvidenceSourceV1 {
+        EvidenceSourceV1 {
+            kind: EvidenceSourceKindV1::Transcript,
+            ..healthy(instance, checked)
+        }
+    }
+
+    /// An empty answer's verdict over `readiness` and `sources`, scoped to
+    /// `filter` when one is given.
+    fn scoped(
+        readiness: &EvidenceReadinessV1,
+        sources: &EvidenceSourcesV1,
+        filter: Option<EvidenceSourceFilterV1>,
+    ) -> AbsenceV1 {
+        let absence = absence_verdict(&[], true, readiness, sources, filter);
+        assert_eq!(
+            absence.verdict == AbsenceVerdictV1::Absent,
+            absence.reasons.is_empty(),
+            "a verdict is absent exactly when no reason applies"
+        );
+        assert_eq!(
+            absence.scope,
+            filter.map(|source| AbsenceScopeV1 { source }),
+            "the verdict carries its scope"
+        );
+        absence
+    }
+
+    /// The reasons of [`scoped`], for each of the three filters and none.
+    fn scoped_reasons(
+        readiness: &EvidenceReadinessV1,
+        sources: &EvidenceSourcesV1,
+    ) -> [Vec<AbsenceReasonV1>; 4] {
+        [
+            Some(EvidenceSourceFilterV1::Git),
+            Some(EvidenceSourceFilterV1::Items),
+            Some(EvidenceSourceFilterV1::Sessions),
+            None,
+        ]
+        .map(|filter| scoped(readiness, sources, filter).reasons)
     }
 
     #[test]
@@ -405,7 +496,7 @@ mod tests {
         let mut lagging = current();
         lagging.events_awaiting_body_projection = 3;
         lagging.lexical_current = false;
-        let absence = absence_verdict(&[lexical()], false, &lagging, &listing(Vec::new()));
+        let absence = absence_verdict(&[lexical()], false, &lagging, &listing(Vec::new()), None);
         assert_eq!(absence.verdict, AbsenceVerdictV1::Present);
         assert_eq!(absence.present_by, Some(PresentByV1::Lexical));
         assert!(absence.reasons.is_empty());
@@ -554,14 +645,14 @@ mod tests {
     fn a_weak_neighbour_never_hides_a_reason() {
         let mut lagging = current();
         lagging.events_awaiting_body_projection = 1;
-        let absence = absence_verdict(&[dense(0.25)], true, &lagging, &two_healthy());
+        let absence = absence_verdict(&[dense(0.25)], true, &lagging, &two_healthy(), None);
         assert_eq!(absence.verdict, AbsenceVerdictV1::Unknown);
         assert_eq!(absence.reasons, [AbsenceReasonV1::BodyProjectionLag]);
         assert_eq!(absence.present_by, None);
         assert_eq!(absence.strongest_dense_similarity, Some(0.25));
         assert_eq!(absence.weak_neighbours, 1);
         // In the band, the candidate is one more reason beside the lag.
-        let banded = absence_verdict(&[dense(0.41)], true, &lagging, &two_healthy());
+        let banded = absence_verdict(&[dense(0.41)], true, &lagging, &two_healthy(), None);
         assert_eq!(
             banded.reasons,
             [
@@ -617,7 +708,7 @@ mod tests {
 
     #[test]
     fn no_hit_over_a_current_fresh_complete_scope_is_absent() {
-        let absence = absence_verdict(&[], true, &current(), &two_healthy());
+        let absence = absence_verdict(&[], true, &current(), &two_healthy(), None);
         assert_eq!(absence.verdict, AbsenceVerdictV1::Absent);
         assert_eq!(
             absence.as_of,
@@ -709,7 +800,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            absence_verdict(&[], true, &current(), &sources).as_of,
+            absence_verdict(&[], true, &current(), &sources, None).as_of,
             Some(instant(40)),
             "a source never checked does not set as_of"
         );
@@ -769,7 +860,7 @@ mod tests {
         let mut incomplete = sources;
         incomplete.active[1].coverage.as_mut().unwrap().completeness =
             CoverageCompletenessV1::Partial;
-        let absence = absence_verdict(&[], true, &current(), &incomplete);
+        let absence = absence_verdict(&[], true, &current(), &incomplete, None);
         assert_eq!(absence.verdict, AbsenceVerdictV1::Unknown);
         assert_eq!(absence.reasons, [AbsenceReasonV1::IncompleteCoverage]);
 
@@ -828,7 +919,7 @@ mod tests {
         // A lexical hit is still present: only the empty answer loses its
         // meaning.
         assert_eq!(
-            absence_verdict(&[lexical()], true, &readiness, &two_healthy()).verdict,
+            absence_verdict(&[lexical()], true, &readiness, &two_healthy(), None).verdict,
             AbsenceVerdictV1::Present
         );
     }
@@ -916,5 +1007,226 @@ mod tests {
         });
         assert_eq!(dense_only.matched_by, EvidenceMatchV1::Dense);
         assert_eq!(dense_only.lexical_score, None);
+    }
+
+    /// A healthy git source checked at 50 and a healthy transcript source
+    /// checked at 40.
+    fn git_and_transcript() -> EvidenceSourcesV1 {
+        listing(vec![
+            healthy("connector.git.a", 50),
+            transcript("connector.transcript.b", 40),
+        ])
+    }
+
+    #[test]
+    fn a_failed_source_of_another_kind_does_not_block_a_scoped_absent() {
+        let mut sources = git_and_transcript();
+        sources.active[1].last_outcome = WorkerSourceOutcomeV1::Failed;
+        sources.active[1].last_error = Some("fixture".to_owned());
+        let from_git = scoped(&current(), &sources, Some(EvidenceSourceFilterV1::Git));
+        assert_eq!(from_git.verdict, AbsenceVerdictV1::Absent);
+        assert_eq!(
+            from_git.as_of,
+            Some(instant(50)),
+            "as_of is the git source's own check"
+        );
+        let [_, _, from_sessions, unscoped] = scoped_reasons(&current(), &sources);
+        assert_eq!(from_sessions, [AbsenceReasonV1::SourceFailed]);
+        assert_eq!(unscoped, [AbsenceReasonV1::SourceFailed]);
+        // And the other way round.
+        let mut git_failed = git_and_transcript();
+        git_failed.active[0].last_outcome = WorkerSourceOutcomeV1::Failed;
+        let [from_git, _, from_sessions, unscoped] = scoped_reasons(&current(), &git_failed);
+        assert_eq!(from_git, [AbsenceReasonV1::SourceFailed]);
+        assert!(from_sessions.is_empty());
+        assert_eq!(unscoped, [AbsenceReasonV1::SourceFailed]);
+    }
+
+    #[test]
+    fn a_stale_source_of_another_kind_does_not_block_a_scoped_absent() {
+        let mut sources = git_and_transcript();
+        sources.active[1].stale = true;
+        let [from_git, _, from_sessions, unscoped] = scoped_reasons(&current(), &sources);
+        assert!(from_git.is_empty());
+        assert_eq!(from_sessions, [AbsenceReasonV1::SourceStale]);
+        assert_eq!(unscoped, [AbsenceReasonV1::SourceStale]);
+    }
+
+    #[test]
+    fn a_never_checked_source_of_another_kind_does_not_block_a_scoped_absent() {
+        let mut sources = git_and_transcript();
+        sources.active[1].last_checked_at = None;
+        let from_git = scoped(&current(), &sources, Some(EvidenceSourceFilterV1::Git));
+        assert_eq!(from_git.verdict, AbsenceVerdictV1::Absent);
+        assert_eq!(from_git.as_of, Some(instant(50)));
+        let [_, _, from_sessions, unscoped] = scoped_reasons(&current(), &sources);
+        assert_eq!(from_sessions, [AbsenceReasonV1::SourceNeverChecked]);
+        assert_eq!(unscoped, [AbsenceReasonV1::SourceNeverChecked]);
+    }
+
+    #[test]
+    fn incomplete_coverage_of_another_kind_does_not_block_a_scoped_absent() {
+        let mut sources = git_and_transcript();
+        sources.active[1].coverage = None;
+        let [from_git, _, from_sessions, unscoped] = scoped_reasons(&current(), &sources);
+        assert!(from_git.is_empty());
+        assert_eq!(from_sessions, [AbsenceReasonV1::IncompleteCoverage]);
+        assert_eq!(unscoped, [AbsenceReasonV1::IncompleteCoverage]);
+    }
+
+    /// Git, transcript, and a collector: every filter covers a source.
+    fn every_kind() -> EvidenceSourcesV1 {
+        let mut sources = git_and_transcript();
+        let mut collector = healthy("docs.specs", 45);
+        collector.kind = EvidenceSourceKindV1::Collector;
+        collector.provider = Some("docs".to_owned());
+        sources.active.push(collector);
+        sources
+    }
+
+    #[test]
+    fn pending_transcript_turns_block_only_sessions_and_the_unscoped_verdict() {
+        let mut readiness = current();
+        readiness.transcript_turns_awaiting_admission = 2;
+        let [from_git, from_items, from_sessions, unscoped] =
+            scoped_reasons(&readiness, &every_kind());
+        assert!(from_git.is_empty());
+        assert!(from_items.is_empty());
+        assert_eq!(from_sessions, [AbsenceReasonV1::IngestOutboxPending]);
+        assert_eq!(unscoped, [AbsenceReasonV1::IngestOutboxPending]);
+    }
+
+    #[test]
+    fn pending_items_and_hints_block_only_items_and_the_unscoped_verdict() {
+        let mut items = current();
+        items.items_awaiting_admission = Some(3);
+        let [from_git, from_items, from_sessions, unscoped] = scoped_reasons(&items, &every_kind());
+        assert!(from_git.is_empty());
+        assert_eq!(from_items, [AbsenceReasonV1::IngestOutboxPending]);
+        assert!(from_sessions.is_empty());
+        assert_eq!(unscoped, [AbsenceReasonV1::IngestOutboxPending]);
+
+        let mut hints = current();
+        hints.hints_awaiting_fetch = Some(1);
+        let [from_git, from_items, from_sessions, unscoped] = scoped_reasons(&hints, &every_kind());
+        assert!(from_git.is_empty());
+        assert_eq!(from_items, [AbsenceReasonV1::IngestOutboxPending]);
+        assert!(from_sessions.is_empty());
+        assert_eq!(unscoped, [AbsenceReasonV1::IngestOutboxPending]);
+    }
+
+    #[test]
+    fn unreadable_collector_state_blocks_only_items_and_the_unscoped_verdict() {
+        let mut state = current();
+        state.collector_state_unreadable = true;
+        let [from_git, from_items, from_sessions, unscoped] = scoped_reasons(&state, &every_kind());
+        assert!(from_git.is_empty());
+        assert_eq!(from_items, [AbsenceReasonV1::CollectorStateUnreadable]);
+        assert!(from_sessions.is_empty());
+        assert_eq!(unscoped, [AbsenceReasonV1::CollectorStateUnreadable]);
+
+        let mut hints = current();
+        hints.hints_unreadable = true;
+        let [from_git, from_items, from_sessions, unscoped] = scoped_reasons(&hints, &every_kind());
+        assert!(from_git.is_empty());
+        assert_eq!(from_items, [AbsenceReasonV1::CollectorStateUnreadable]);
+        assert!(from_sessions.is_empty());
+        assert_eq!(unscoped, [AbsenceReasonV1::CollectorStateUnreadable]);
+    }
+
+    #[test]
+    fn body_projection_lag_follows_the_kind_the_filter_covers() {
+        let lag = [AbsenceReasonV1::BodyProjectionLag];
+        let mut other = current();
+        other.events_awaiting_body_projection = 2;
+        other.lag_by_kind = Some(LagByKindV1 { items: 0, other: 2 });
+        let [from_git, from_items, from_sessions, unscoped] = scoped_reasons(&other, &every_kind());
+        assert_eq!(from_git, lag, "a pending transcript turn still blocks git");
+        assert!(from_items.is_empty());
+        assert_eq!(from_sessions, lag);
+        assert_eq!(unscoped, lag);
+
+        let mut items = current();
+        items.events_awaiting_body_projection = 1;
+        items.lag_by_kind = Some(LagByKindV1 { items: 1, other: 0 });
+        let [from_git, from_items, from_sessions, unscoped] = scoped_reasons(&items, &every_kind());
+        assert!(from_git.is_empty());
+        assert_eq!(from_items, lag);
+        assert!(from_sessions.is_empty());
+        assert_eq!(unscoped, lag);
+
+        // Without the split, the total counts for every scope.
+        let mut unsplit = current();
+        unsplit.events_awaiting_body_projection = 1;
+        unsplit.lag_by_kind = None;
+        for reasons in scoped_reasons(&unsplit, &every_kind()) {
+            assert_eq!(reasons, lag);
+        }
+    }
+
+    #[test]
+    fn no_source_of_the_covered_kind_is_no_sources_registered() {
+        let [from_git, from_items, from_sessions, unscoped] =
+            scoped_reasons(&current(), &git_and_transcript());
+        assert!(from_git.is_empty());
+        assert_eq!(from_items, [AbsenceReasonV1::NoSourcesRegistered]);
+        assert!(from_sessions.is_empty());
+        assert!(unscoped.is_empty());
+        let from_items = scoped(
+            &current(),
+            &git_and_transcript(),
+            Some(EvidenceSourceFilterV1::Items),
+        );
+        assert_eq!(from_items.as_of, None, "no covered source, no check");
+        // A CI source is a session source.
+        let mut ci = listing(vec![healthy("connector.ci.b", 40)]);
+        ci.active[0].kind = EvidenceSourceKindV1::Ci;
+        let [from_git, from_items, from_sessions, unscoped] = scoped_reasons(&current(), &ci);
+        assert_eq!(from_git, [AbsenceReasonV1::NoSourcesRegistered]);
+        assert_eq!(from_items, [AbsenceReasonV1::NoSourcesRegistered]);
+        assert!(from_sessions.is_empty());
+        assert!(unscoped.is_empty());
+    }
+
+    #[test]
+    fn a_kind_this_build_does_not_know_gates_every_scope() {
+        let mut sources = every_kind();
+        let mut other = healthy("collected.slack.acme", 30);
+        other.kind = EvidenceSourceKindV1::Other("collected.slack".to_owned());
+        other.last_outcome = WorkerSourceOutcomeV1::Failed;
+        sources.active.push(other);
+        for reasons in scoped_reasons(&current(), &sources) {
+            assert_eq!(reasons, [AbsenceReasonV1::SourceFailed]);
+        }
+        // Healthy, it is one more source every scope reads as_of from.
+        sources.active[3].last_outcome = WorkerSourceOutcomeV1::Unchanged;
+        for filter in [
+            Some(EvidenceSourceFilterV1::Git),
+            Some(EvidenceSourceFilterV1::Items),
+            Some(EvidenceSourceFilterV1::Sessions),
+            None,
+        ] {
+            let absence = scoped(&current(), &sources, filter);
+            assert_eq!(absence.verdict, AbsenceVerdictV1::Absent, "{filter:?}");
+            assert_eq!(absence.as_of, Some(instant(30)), "{filter:?}");
+        }
+    }
+
+    #[test]
+    fn the_verdict_sets_its_own_scope() {
+        for filter in EvidenceSourceFilterV1::ALL {
+            let empty = absence_verdict(&[], true, &current(), &every_kind(), Some(filter));
+            assert_eq!(empty.scope, Some(AbsenceScopeV1 { source: filter }));
+            let present =
+                absence_verdict(&[lexical()], true, &current(), &every_kind(), Some(filter));
+            assert_eq!(present.verdict, AbsenceVerdictV1::Present);
+            assert_eq!(present.scope, Some(AbsenceScopeV1 { source: filter }));
+            assert_eq!(
+                serde_json::to_value(&empty).unwrap()["scope"],
+                json!({ "source": filter.as_str() })
+            );
+        }
+        assert_eq!(verdict(&[]).scope, None);
+        assert_eq!(verdict(&[lexical()]).scope, None);
     }
 }

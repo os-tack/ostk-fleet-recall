@@ -448,6 +448,14 @@ async fn live_docs_an_edit_moves_every_part_and_a_revert_is_a_third_version_when
     assert_eq!(edited.history.len(), 1);
     assert_eq!(edited.history[0].version_id, first.current.version_id);
     assert!(search(&recall, "budget five").await.hits.len() == 1);
+    // The unchanged section has a body per version with the same text: the
+    // evidence answer lists it once, at the presented head, and says what it
+    // collapsed.
+    let evidence_recall = evidence(&pool, &fixture).await;
+    let scope = evidence_search(&evidence_recall, "albatross fleet").await;
+    assert_eq!(scope.hits.len(), 1, "{:?}", scope.hits);
+    assert!(scope.hits[0].item.as_ref().unwrap().current);
+    assert_eq!(scope.duplicates_collapsed, 1);
 
     // Back to the first content: a third version, presented, with A's text.
     write(root.path(), "policy.md", text("three").as_bytes());
@@ -461,6 +469,21 @@ async fn live_docs_an_edit_moves_every_part_and_a_revert_is_a_third_version_when
         head(&pool, &fixture, "policy.md").await,
         ("live".to_owned(), 3)
     );
+    // Three versions share the unchanged section, two share the reverted
+    // text, and the edit's own text belongs to the superseded version alone:
+    // that one is still listed, `current: false`, with nothing collapsed.
+    let scope = evidence_search(&evidence_recall, "albatross fleet").await;
+    assert_eq!(scope.hits.len(), 1, "{:?}", scope.hits);
+    assert!(scope.hits[0].item.as_ref().unwrap().current);
+    assert_eq!(scope.duplicates_collapsed, 2);
+    let three = evidence_search(&evidence_recall, "budget three").await;
+    assert_eq!(three.hits.len(), 1, "{:?}", three.hits);
+    assert!(three.hits[0].item.as_ref().unwrap().current);
+    assert_eq!(three.duplicates_collapsed, 1);
+    let five = evidence_search(&evidence_recall, "budget five").await;
+    assert_eq!(five.hits.len(), 1, "{:?}", five.hits);
+    assert!(!five.hits[0].item.as_ref().unwrap().current);
+    assert_eq!(five.duplicates_collapsed, 0);
 }
 
 #[tokio::test]

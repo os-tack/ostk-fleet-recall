@@ -400,7 +400,20 @@ lexical terms, nothing awaits body projection or transcript admission, the
 lexical tier is current, and every active source's last attempt succeeded,
 its last completed check is within its `stale_after_seconds`, and its
 newest coverage cursor is complete. Otherwise it is `unknown`, naming every
-reason. Dense lag never blocks `absent`. `get` returns one body's full recall
+reason. Dense lag never blocks `absent`. A scoped verdict judges only the
+sources its filter covers (`git` the git connector, `items` the collectors,
+`sessions` the transcript and CI connectors; a kind the build does not know
+is covered by every filter): a failed, stale, or unchecked source of another
+kind does not block `absent`, a pending transcript outbox blocks `sessions`
+and the unscoped verdict, pending items or hints and unreadable collector
+state block `items` and the unscoped verdict, and body projection lag is
+read from `lag_by_kind` (`items` for `items`, `other` for `git` and
+`sessions`) when the split is readable. The listing, readiness, and
+warnings stay scope-wide. Before the cut to `limit`, superseded versions of
+one collected item whose recall text is identical to a listed version's are
+collapsed to the presented head (or the best-ranked copy), so an edited
+document's unchanged sections are listed once; the answer counts them in
+`duplicates_collapsed`. `get` returns one body's full recall
 text (at most 256 KiB) by its content id. From migration 34 on, a hit on a
 collected item's body also names the item (`item_id`, provider, trust tier,
 lifecycle, and whether its version is the item's presented head), and

@@ -55,7 +55,13 @@ The `ostk-fleet-recall` binary has these commands:
     `hits[strongest_hit]`, and if it answers, retry with its own words.
     `absent` is the strongest negative memory can give, not proof. `source`
     narrows an evidence search to `git`, `items`, or `sessions` (transcripts
-    and CI runs), and the verdict then carries `scope.source`.
+    and CI runs), and the verdict then carries `scope.source` and judges
+    only that source's health: a failed, stale, or unchecked source of
+    another kind, or pending ingest of another kind, does not block
+    `absent` (the listing, readiness, and warnings stay scope-wide). An
+    edited document's unchanged sections are listed once, at the item's
+    presented head, with the superseded copies counted in
+    `duplicates_collapsed`.
     `recall(status)` then adds
     an `evidence` block
     ([ADR 0006](docs/adr/0006-stage5-worker-and-evidence-recall.md)), with a
