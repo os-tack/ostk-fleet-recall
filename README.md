@@ -558,7 +558,10 @@ recall returns, once more before the row is written. A body admitted before
 profile 3 keeps its raw bytes at rest; only its recall text is redacted, on
 the first tick after deploy, which re-projects every lexical row stored
 under an older normalization version (`rows_reprojected` in the `lexical`
-and `dense` steps). That tick's git step also re-walks each ref from the
+and `dense` steps). The same first tick follows any later version, such as
+normalization version 4, which lays a git fact out message first (a snippet
+reads `commit <sha> <message> author …`) and, since it changes no body,
+quarantines nothing. That tick's git step also re-walks each ref from the
 root, so every historical commit whose text is now redacted lands in
 quarantine as a preimage disagreement once: expect a one-time `quarantined`
 count equal to the number of such commits (ADR 0006 D9).

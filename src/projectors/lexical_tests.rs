@@ -61,6 +61,15 @@ fn a_git_fact_body_indexes_its_commit_message_as_words() {
     assert_eq!(derived.state, LexicalStateV1::Indexed);
     assert!(derived.text.contains("record-count"));
     assert!(derived.text.contains("brittle"));
+    // Version 4: the kind, the commit, then the message, before anything
+    // else.
+    assert!(
+        derived
+            .text
+            .starts_with("commit abc123 ci: delete the brittle"),
+        "{}",
+        derived.text
+    );
     // The object id is not a declared text field, so it stays exactly as
     // the body records it rather than being decoded into noise.
     assert!(derived.text.contains("abc123"));
@@ -288,7 +297,9 @@ fn the_normalization_version_is_part_of_the_identity() {
 /// a replay rebuilds. These pin the exact text and digest one body of each
 /// declared media type projects to, so any such change is seen, and either
 /// bumps the version or is reverted. A later media-type branch leaves them
-/// unchanged.
+/// unchanged; a version bump moves every digest (the version is framed into
+/// the preimage) and only the text it changes, which is how version 4 reads:
+/// the git texts moved to the layout, the canonical JSON text did not.
 fn assert_golden(media_type: &str, body: &[u8], text: &str, digest: &str) {
     let derived = projection_of(media_type, body);
     assert_eq!(derived.normalization_version, LEXICAL_NORMALIZATION_VERSION);
@@ -321,11 +332,11 @@ fn a_git_fact_body_projects_to_its_golden_lexical_text() {
         GIT_FACT_MEDIA_TYPE,
         body.as_bytes(),
         concat!(
-            "ada@example.com Ada Lovelace 4b825dc642cb6eb9a060e54bf8d69288fbee4904 commit ",
+            "commit 4b825dc642cb6eb9a060e54bf8d69288fbee4904 ",
             "fix(recall): fold the query A caf\u{e9} test, PGPASSWORD=[REDACTED] done ",
-            "9fceb02d0ae598e95dc970b74767f19372d61af8 1"
+            "author Ada Lovelace ada@example.com parents 9fceb02d0ae598e95dc970b74767f19372d61af8"
         ),
-        "eec8cb779aa91aca33903ee8f32a91d6455977f4260b145276804bf8f0e870c2",
+        "6b7d7bac8fbe925b29bd3a5b5f198952cdf339a7ba43c51c75b0f300fda5d3e8",
     );
 }
 
@@ -345,10 +356,202 @@ fn a_git_fact_body_with_a_provider_token_projects_to_its_golden_lexical_text() {
     assert_golden(
         GIT_FACT_MEDIA_TYPE,
         body.as_bytes(),
-        "4b825dc642cb6eb9a060e54bf8d69288fbee4904 commit ops: rotate [REDACTED] before the \
-         release 1",
-        "a4daae25c2c87ab487435809fe8ae4ebc8afd0825b829ef66330998417ba284b",
+        "commit 4b825dc642cb6eb9a060e54bf8d69288fbee4904 ops: rotate [REDACTED] before the \
+         release",
+        "9b8921867983f6bb47724a810a35b267f7269216733a579d4b08724e3d115544",
     );
+}
+
+/// The full commit fact the git connector writes (every field of
+/// `GitCommitFactV1`, canonical key order), as a body.
+fn full_commit_fact() -> String {
+    format!(
+        concat!(
+            "{{\"ancestry\":\"recorded_parents\",",
+            "\"author\":{{\"at\":\"2026-08-16T19:39:11.000000000Z\",\"email\":\"{ada_email}\",",
+            "\"name\":\"{ada}\",\"utc_offset_minutes\":-300}},",
+            "\"commit_id\":\"4b825dc642cb6eb9a060e54bf8d69288fbee4904\",",
+            "\"committer\":{{\"at\":\"2026-08-16T22:23:21.000000000Z\",",
+            "\"email\":\"{charles_email}\",\"name\":\"{charles}\",\"utc_offset_minutes\":0}},",
+            "\"declared_links\":[{{\"relation\":\"turn_produced_commit\",\"turn_id\":\"turn-7\",",
+            "\"verification\":\"declared\"}}],",
+            "\"kind\":\"commit\",\"message\":\"{message}\",",
+            "\"parents\":[\"9fceb02d0ae598e95dc970b74767f19372d61af8\",",
+            "\"e83c5163316f89bfbde7d9ab23ca2e25604af290\"],",
+            "\"repository\":{{\"installation_id\":\"1\",\"repository_id\":\"aetia\",",
+            "\"schema_version\":1}},",
+            "\"schema_version\":1,",
+            "\"tree_id\":\"f93e3a1a1525fb5b91020da86e44810c87a2d7bc\"}}"
+        ),
+        ada = hex::encode("Ada Lovelace"),
+        ada_email = hex::encode("ada@example.com"),
+        charles = hex::encode("Charles Babbage"),
+        charles_email = hex::encode("charles@example.com"),
+        message = hex::encode(
+            "feat(recall): brief, one call to orient an agent\n\nWith a subject, every current \
+             claim.\n"
+        ),
+    )
+}
+
+#[test]
+fn a_commit_fact_renders_message_first_then_every_field_in_a_fixed_order() {
+    // Version 4: a snippet of a commit reads as a commit. The kind and the
+    // sha open it, the message follows, and every other field stands behind
+    // its key as a label; what answers no query (the schema versions, the
+    // UTC offsets, the constant `declared`) is dropped.
+    let body = full_commit_fact();
+    let derived = projection_of(GIT_FACT_MEDIA_TYPE, body.as_bytes());
+    assert_eq!(
+        derived.text,
+        concat!(
+            "commit 4b825dc642cb6eb9a060e54bf8d69288fbee4904 ",
+            "feat(recall): brief, one call to orient an agent With a subject, every current ",
+            "claim. author Ada Lovelace ada@example.com 2026-08-16T19:39:11.000000000Z ",
+            "committer Charles Babbage charles@example.com 2026-08-16T22:23:21.000000000Z ",
+            "parents 9fceb02d0ae598e95dc970b74767f19372d61af8 ",
+            "e83c5163316f89bfbde7d9ab23ca2e25604af290 ",
+            "tree f93e3a1a1525fb5b91020da86e44810c87a2d7bc repository aetia 1 ",
+            "ancestry recorded_parents declared_links turn_produced_commit turn-7"
+        )
+    );
+    for dropped in ["-300", "utc_offset", "schema_version", "verification"] {
+        assert!(
+            !derived.text.contains(dropped),
+            "{dropped} in {}",
+            derived.text
+        );
+    }
+    assert!(!derived.text.ends_with("declared"));
+}
+
+#[test]
+fn a_root_commit_with_no_links_carries_no_empty_label() {
+    let body = full_commit_fact()
+        .replace(
+            "\"parents\":[\"9fceb02d0ae598e95dc970b74767f19372d61af8\",\
+             \"e83c5163316f89bfbde7d9ab23ca2e25604af290\"]",
+            "\"parents\":[]",
+        )
+        .replace(
+            "\"declared_links\":[{\"relation\":\"turn_produced_commit\",\"turn_id\":\"turn-7\",\
+             \"verification\":\"declared\"}]",
+            "\"declared_links\":[]",
+        );
+    assert!(body.contains("\"parents\":[]"), "{body}");
+    assert!(body.contains("\"declared_links\":[]"), "{body}");
+    let derived = projection_of(GIT_FACT_MEDIA_TYPE, body.as_bytes());
+    // Neither label (the ancestry claim `recorded_parents` is a value, not
+    // the `parents` label).
+    assert!(!derived.text.contains(" parents "), "{}", derived.text);
+    assert!(!derived.text.contains("declared_links"), "{}", derived.text);
+    assert!(
+        derived.text.ends_with(
+            "tree f93e3a1a1525fb5b91020da86e44810c87a2d7bc repository aetia 1 \
+             ancestry recorded_parents"
+        ),
+        "{}",
+        derived.text
+    );
+}
+
+#[test]
+fn a_blob_source_fact_renders_its_path_first() {
+    let body = format!(
+        concat!(
+            "{{\"blob_id\":\"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\",",
+            "\"byte_length\":\"512\",",
+            "\"commit_id\":\"4b825dc642cb6eb9a060e54bf8d69288fbee4904\",",
+            "\"committed_at\":\"2026-08-16T22:23:21.000000000Z\",",
+            "\"kind\":\"blob_source\",\"mode\":\"regular\",\"path\":\"{path}\",",
+            "\"repository\":{{\"installation_id\":\"1\",\"repository_id\":\"aetia\",",
+            "\"schema_version\":1}},",
+            "\"schema_version\":1,",
+            "\"tree_id\":\"f93e3a1a1525fb5b91020da86e44810c87a2d7bc\"}}"
+        ),
+        path = hex::encode("src/projectors/lexical.rs"),
+    );
+    let derived = projection_of(GIT_FACT_MEDIA_TYPE, body.as_bytes());
+    assert_eq!(
+        derived.text,
+        concat!(
+            "blob_source src/projectors/lexical.rs ",
+            "blob e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 mode regular byte_length 512 ",
+            "commit 4b825dc642cb6eb9a060e54bf8d69288fbee4904 ",
+            "tree f93e3a1a1525fb5b91020da86e44810c87a2d7bc ",
+            "committed_at 2026-08-16T22:23:21.000000000Z repository aetia 1"
+        )
+    );
+}
+
+#[test]
+fn a_ref_observation_fact_renders_its_ref_name_first() {
+    let body = concat!(
+        "{\"kind\":\"ref_observation\",\"observation_seq\":3,",
+        "\"observed_at\":\"2026-08-16T22:30:00.000000000Z\",",
+        "\"observer\":\"git.local\",",
+        "\"previous_target\":\"9fceb02d0ae598e95dc970b74767f19372d61af8\",",
+        "\"ref_name\":\"refs/heads/main\",",
+        "\"repository\":{\"installation_id\":\"1\",\"repository_id\":\"aetia\",",
+        "\"schema_version\":1},",
+        "\"schema_version\":1,",
+        "\"target\":\"4b825dc642cb6eb9a060e54bf8d69288fbee4904\"}"
+    );
+    let derived = projection_of(GIT_FACT_MEDIA_TYPE, body.as_bytes());
+    assert_eq!(
+        derived.text,
+        concat!(
+            "ref_observation refs/heads/main ",
+            "target 4b825dc642cb6eb9a060e54bf8d69288fbee4904 ",
+            "previous_target 9fceb02d0ae598e95dc970b74767f19372d61af8 ",
+            "observed_at 2026-08-16T22:30:00.000000000Z observation_seq 3 ",
+            "observer git.local repository aetia 1"
+        )
+    );
+    // A first observation has no previous target: the null yields no leaf,
+    // so its label is omitted rather than left dangling.
+    let first = body.replace(
+        "\"previous_target\":\"9fceb02d0ae598e95dc970b74767f19372d61af8\"",
+        "\"previous_target\":null",
+    );
+    assert!(first.contains(":null"), "{first}");
+    let derived = projection_of(GIT_FACT_MEDIA_TYPE, first.as_bytes());
+    assert_eq!(
+        derived.text,
+        concat!(
+            "ref_observation refs/heads/main ",
+            "target 4b825dc642cb6eb9a060e54bf8d69288fbee4904 ",
+            "observed_at 2026-08-16T22:30:00.000000000Z observation_seq 3 ",
+            "observer git.local repository aetia 1"
+        )
+    );
+}
+
+#[test]
+fn a_git_body_of_an_unknown_kind_or_with_an_unknown_key_loses_no_leaf() {
+    // A kind this build does not lay out falls to the walk, decoded fields
+    // included.
+    let body = format!(
+        "{{\"kind\":\"tag\",\"message\":\"{}\"}}",
+        hex::encode("hello")
+    );
+    let derived = projection_of(GIT_FACT_MEDIA_TYPE, body.as_bytes());
+    assert_eq!(derived.text, "tag hello");
+    // A key the layout does not name is appended after it, never dropped.
+    let body = full_commit_fact().replace(
+        "\"tree_id\":\"f93e3a1a1525fb5b91020da86e44810c87a2d7bc\"}",
+        "\"tree_id\":\"f93e3a1a1525fb5b91020da86e44810c87a2d7bc\",\"zebra_field\":\"zebra\"}",
+    );
+    assert!(body.contains("zebra_field"), "{body}");
+    let derived = projection_of(GIT_FACT_MEDIA_TYPE, body.as_bytes());
+    assert!(
+        derived
+            .text
+            .starts_with("commit 4b825dc642cb6eb9a060e54bf8d69288fbee4904 feat(recall)"),
+        "{}",
+        derived.text
+    );
+    assert!(derived.text.ends_with(" zebra"), "{}", derived.text);
 }
 
 #[test]
@@ -363,7 +566,7 @@ fn a_canonical_json_body_projects_to_its_golden_lexical_text() {
         body.as_bytes(),
         "assistant 1 01931f2c-0000-7000-8000-000000000002 D\u{e9}ploiement termin\u{e9}; \
          token: [REDACTED]",
-        "ed2a9bd919be4c5055e2da792369f92615607f7d868d88321ce51dd91ae45754",
+        "2624f4881435e9f24076677a812ff03aa3fb4551d3605272075828290836b3ec",
     );
 }
 

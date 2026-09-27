@@ -386,7 +386,7 @@ vectors the serving model embedded, and a dense-only match below the chunk
 lane's 0.18 cosine floor is dropped. Snippets and fetched text are the lexical
 tier's redacted recall text, never the stored body bytes. The verdict is
 `present` when a hit matched the query's words, or when a dense-only
-neighbour reached cosine 0.45 and its body is not a raw git fact
+neighbour reached cosine 0.45 and its body is not a git fact
 (`present_by` names the lane); a weaker neighbour is listed and counted in
 `weak_neighbours`, with `strongest_dense_similarity` and `strongest_hit`
 reported. Such a neighbour never makes the answer `present`, but one whose

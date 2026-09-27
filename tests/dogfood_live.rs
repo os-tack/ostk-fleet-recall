@@ -1825,7 +1825,9 @@ fn render_report(
          rejected because it would either reject ordinary commits or rewrite provider bytes, and \
          either way it would move the body's content address and every chunk-occurrence identity \
          derived from it. Only the lossy search text changed; `LEXICAL_NORMALIZATION_VERSION` \
-         rose 1 -> 2 so the two texts can never claim the same identity.\n"
+         rose 1 -> 2 so the two texts can never claim the same identity; 3 redacted the recall \
+         copy under redaction profile 3; 4 lays a git fact out message first, so a snippet \
+         reads `commit <sha> <message> author …` rather than a record.\n"
     );
     if events_unprojectable > 0 {
         let _ = writeln!(
