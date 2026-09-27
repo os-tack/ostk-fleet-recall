@@ -1,0 +1,32 @@
+# LocalStack (chart localstack/localstack 0.7.1) standing in for S3, STS, IAM
+# and Secrets Manager. The auth token, the seed-model hostPath, and the env
+# list are supplied by a generated, uncommitted override
+# (deploy/local/.state/localstack-override.yaml); this file holds the rest.
+# The startup script ports deploy/localstack/init/ready.d/10-seed-aws.sh: the
+# model bucket for the production-shaped download path and the action bucket.
+image:
+  repository: localstack/localstack
+  tag: "2026.07.0"
+debug: false
+service:
+  type: NodePort
+  edgeService:
+    nodePort: 30566
+enableStartupScripts: true
+startupScriptContent: |
+  #!/bin/sh
+  set -eu
+  bucket=fleet-recall-local-models
+  action_bucket=fleet-recall-local-actions
+  prefix=bundles/demo
+  awslocal s3api create-bucket --bucket "$bucket" >/dev/null
+  awslocal s3api create-bucket --bucket "$action_bucket" >/dev/null
+  for name in config.json model.safetensors tokenizer.json; do
+      test -f "/seed-model/$name"
+      awslocal s3api put-object --bucket "$bucket" --key "$prefix/$name" --body "/seed-model/$name" >/dev/null
+  done
+  echo "seeded s3://$bucket/$prefix"
+resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi

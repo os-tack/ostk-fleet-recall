@@ -1,0 +1,79 @@
+# The public read-only viewer. Its environment holds only the publication URL
+# and the shared non-secret variables; the process refuses to start if any
+# private database URL is present.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo
+  namespace: fleet-recall
+  labels:
+    app: demo
+    fleet-recall.dev/phase: recall
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo
+  template:
+    metadata:
+      labels:
+        app: demo
+    spec:
+      enableServiceLinks: false
+      automountServiceAccountToken: false
+      containers:
+        - name: demo
+          image: ostk-fleet-recall:__IMAGE_TAG__
+          imagePullPolicy: IfNotPresent
+          args: ["demo", "--listen", "0.0.0.0:8080"]
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: fleet-env
+            - secretRef:
+                name: db-url-publication
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+          volumeMounts:
+            - name: model
+              mountPath: /opt/ostk/models/potion-retrieval-32M
+              readOnly: true
+            - name: crdb-ca
+              mountPath: /etc/crdb
+              readOnly: true
+      volumes:
+        - name: model
+          hostPath:
+            path: __MODEL_BUNDLE_DIR__
+            type: Directory
+        - name: crdb-ca
+          secret:
+            secretName: crdb-ca
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo
+  namespace: fleet-recall
+  labels:
+    app: demo
+    fleet-recall.dev/phase: recall
+spec:
+  type: NodePort
+  selector:
+    app: demo
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      nodePort: 30088

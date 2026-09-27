@@ -1,0 +1,55 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Every resource carries `fleet-recall.dev/phase`; bootstrap.sh renders this
+# tree once, substitutes __IMAGE_TAG__, __MODEL_BUNDLE_DIR__ and
+# __MODEL_SHA256__, and applies one phase at a time with `-l`.
+resources:
+  - namespaces.yaml
+  - cockroach/statefulset.yaml
+  - cockroach/services.yaml
+  - jobs/db-bootstrap.yaml
+  - jobs/migrate.yaml
+  - jobs/boundary.yaml
+  - jobs/ory-db-bootstrap.yaml
+  - jobs/seed.yaml
+  - recall/configmaps.yaml
+  - recall/writer.yaml
+  - recall/demo.yaml
+  - recall/ingress.yaml
+  - recall/worker-cronjob.yaml
+  - ory/nodeports.yaml
+configMapGenerator:
+  - name: db-bootstrap-scripts
+    namespace: fleet-recall
+    files:
+      - db-bootstrap.sh=jobs/db-bootstrap.sh
+    options:
+      disableNameSuffixHash: true
+      labels:
+        fleet-recall.dev/phase: db-bootstrap
+  - name: boundary-scripts
+    namespace: fleet-recall
+    files:
+      - boundary.sh=jobs/boundary.sh
+    options:
+      disableNameSuffixHash: true
+      labels:
+        fleet-recall.dev/phase: boundary
+  - name: cockroach-policies
+    namespace: fleet-recall
+    files:
+      - runtime-role-grants.sql=../../../cockroach/runtime-role-grants.sql
+      - publication-reader-role-grants.sql=../../../cockroach/publication-reader-role-grants.sql
+      - ingress-receiver-role-grants.sql=../../../cockroach/ingress-receiver-role-grants.sql
+    options:
+      disableNameSuffixHash: true
+      labels:
+        fleet-recall.dev/phase: boundary
+  - name: ory-db-bootstrap-scripts
+    namespace: fleet-recall
+    files:
+      - ory-db-bootstrap.sh=jobs/ory-db-bootstrap.sh
+    options:
+      disableNameSuffixHash: true
+      labels:
+        fleet-recall.dev/phase: ory-db-bootstrap

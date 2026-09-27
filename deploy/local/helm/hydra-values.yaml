@@ -1,0 +1,100 @@
+# Ory Hydra (chart ory/hydra 0.64.0) as the local OAuth 2.1 authorization
+# server. Dev mode: http issuer on the Mac's loopback, which OAuth 2.1 and
+# Claude Code accept. JWT access tokens so the recall service verifies offline;
+# dynamic client registration so stock harnesses register themselves; the
+# `fleet-recall` scope in the default scope set is the audience substitute
+# recorded in ADR 0009 D8. Secrets (dsn, secretsSystem, secretsCookie) come
+# from the pre-created `hydra-secrets`; the CockroachDB CA is mounted for the
+# verify-full DSN.
+hydra:
+  dev: true
+  automigration:
+    enabled: true
+    type: job
+  config:
+    urls:
+      self:
+        issuer: http://localhost:4444/
+        public: http://localhost:4444/
+        admin: http://hydra-admin.ory.svc:4445/
+      login: http://localhost:4455/login
+      consent: http://localhost:4455/consent
+      logout: http://localhost:4455/logout
+      error: http://localhost:4455/error
+      post_logout_redirect: http://localhost:4455/
+      identity_provider:
+        publicUrl: http://localhost:4433
+        url: http://kratos-admin.ory.svc:80
+    strategies:
+      access_token: jwt
+      scope: wildcard
+      jwt:
+        scope_claim: list
+    webfinger:
+      oidc_discovery:
+        client_registration_url: http://localhost:4444/oauth2/register
+        supported_scope:
+          - profile
+          - email
+          - fleet-recall
+    oidc:
+      dynamic_client_registration:
+        enabled: true
+        default_scope:
+          - openid
+          - offline_access
+          - profile
+          - email
+          - fleet-recall
+      subject_identifiers:
+        supported_types:
+          - public
+        pairwise:
+          salt: local-dev-only-salt
+    oauth2:
+      pkce:
+        enforced_for_public_clients: true
+      allowed_top_level_claims:
+        - email
+    ttl:
+      access_token: 1h
+      refresh_token: 720h
+      id_token: 1h
+      auth_code: 10m
+    serve:
+      cookies:
+        same_site_mode: Lax
+      public:
+        cors:
+          enabled: true
+          allowed_origins:
+            - http://localhost:4455
+secret:
+  enabled: false
+  nameOverride: hydra-secrets
+service:
+  public:
+    type: ClusterIP
+    port: 4444
+  admin:
+    type: ClusterIP
+    port: 4445
+deployment:
+  extraVolumes:
+    - name: crdb-ca
+      secret:
+        secretName: crdb-ca
+  extraVolumeMounts:
+    - name: crdb-ca
+      mountPath: /etc/crdb
+      readOnly: true
+  automountServiceAccountToken: false
+job:
+  extraVolumes:
+    - name: crdb-ca
+      secret:
+        secretName: crdb-ca
+  extraVolumeMounts:
+    - name: crdb-ca
+      mountPath: /etc/crdb
+      readOnly: true

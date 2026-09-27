@@ -1,0 +1,72 @@
+# One worker tick every five minutes, never overlapping. The project and embed
+# steps run in this image; the ingest steps need git and gh and a host that
+# holds the sources, so they are skipped here.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: worker
+  namespace: fleet-recall
+  labels:
+    app: worker
+    fleet-recall.dev/phase: recall
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: worker
+        spec:
+          restartPolicy: Never
+          enableServiceLinks: false
+          automountServiceAccountToken: false
+          containers:
+            - name: worker
+              image: ostk-fleet-recall:__IMAGE_TAG__
+              imagePullPolicy: IfNotPresent
+              args:
+                - worker
+                - --once
+                - --sources
+                - /etc/fleet-recall/worker-sources.json
+                - --steps
+                - project,embed
+              envFrom:
+                - configMapRef:
+                    name: fleet-env
+                - secretRef:
+                    name: db-url-writer
+                - secretRef:
+                    name: fleet-pins
+                - secretRef:
+                    name: fleet-content-kek
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+              volumeMounts:
+                - name: sources
+                  mountPath: /etc/fleet-recall
+                  readOnly: true
+                - name: model
+                  mountPath: /opt/ostk/models/potion-retrieval-32M
+                  readOnly: true
+                - name: crdb-ca
+                  mountPath: /etc/crdb
+                  readOnly: true
+          volumes:
+            - name: sources
+              configMap:
+                name: fleet-sources
+            - name: model
+              hostPath:
+                path: __MODEL_BUNDLE_DIR__
+                type: Directory
+            - name: crdb-ca
+              secret:
+                secretName: crdb-ca

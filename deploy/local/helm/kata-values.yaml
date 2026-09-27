@@ -1,0 +1,12 @@
+# Optional: Kata Containers for VM-isolated sandbox pods. On arm64 the
+# supported shim is qemu-runtime-rs (RuntimeClass kata-qemu-runtime-rs); the
+# Firecracker shim is amd64-only. Needs /dev/kvm and vhost_vsock in the guest.
+#
+#   helm upgrade --install kata-deploy \
+#     oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy \
+#     --version <see https://github.com/kata-containers/kata-containers/releases> \
+#     -n kube-system -f deploy/local/helm/kata-values.yaml
+k8sDistribution: k0s
+shims:
+  qemu-runtime-rs:
+    enabled: true

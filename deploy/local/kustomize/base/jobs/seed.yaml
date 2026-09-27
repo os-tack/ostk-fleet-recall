@@ -1,0 +1,43 @@
+# The Terraform seed task's analog: ingest the demo corpus as the writer.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed
+  namespace: fleet-recall
+  labels:
+    fleet-recall.dev/phase: seed
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        job: seed
+    spec:
+      restartPolicy: Never
+      enableServiceLinks: false
+      automountServiceAccountToken: false
+      containers:
+        - name: seed
+          image: ostk-fleet-recall:__IMAGE_TAG__
+          imagePullPolicy: IfNotPresent
+          args: ["ingest", "--input", "/opt/ostk/demo/demo.ndjson"]
+          envFrom:
+            - configMapRef:
+                name: fleet-env
+            - secretRef:
+                name: db-url-writer
+          volumeMounts:
+            - name: model
+              mountPath: /opt/ostk/models/potion-retrieval-32M
+              readOnly: true
+            - name: crdb-ca
+              mountPath: /etc/crdb
+              readOnly: true
+      volumes:
+        - name: model
+          hostPath:
+            path: __MODEL_BUNDLE_DIR__
+            type: Directory
+        - name: crdb-ca
+          secret:
+            secretName: crdb-ca
