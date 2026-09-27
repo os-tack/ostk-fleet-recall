@@ -4,6 +4,8 @@
   Kubernetes service-account launches, and real Codex transcript recall. See
   `deploy/local/README.md` for checkpoint evidence and the Claude usage-limit
   qualification. Nothing here changes a frozen registry generation.
+- Follow-on: [M4 implementation plan](../M4_REMOTE_ACCESS_PLAN.md) proposes
+  dependable HTTPS access in local and cloud deployments; M4 is not yet implemented.
 - Date: 2026-09-27
 - Scope: where the recall process, the embedding model, the writer credential,
   and the scope binding run relative to the agent; how an agent in an

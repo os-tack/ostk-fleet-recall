@@ -6,6 +6,10 @@ server continues to use its deployment identity. M3 adds a pinned embedding
 service, stdio shim, Docker/Kubernetes launcher, and scoped transcript spool
 for Claude Code and Codex. Local in-process embedding remains supported.
 
+The next milestone is planned in [M4: dependable remote access](M4_REMOTE_ACCESS_PLAN.md),
+covering canonical HTTPS identity, local LAN/VPN access, and a separate AWS
+remote deployment. It is a plan, not a completed deployment checkpoint.
+
 ## Prepare the database and enrollment login
 
 Apply migrations through 39 with the one-shot migrator, retire that login,
