@@ -1652,6 +1652,156 @@ fn reconciliation_rejects_invalid_physical_scope() {
     }
 }
 
+const SUPERSESSION_VARIABLES: [&str; 3] = [
+    "FLEET_RECALL_SUPERSESSION_DATABASE_URL",
+    "FLEET_RECALL_SUPERSESSION_TENANT_ID",
+    "FLEET_RECALL_SUPERSESSION_PROJECT",
+];
+
+fn supersession_values() -> BTreeMap<&'static str, String> {
+    BTreeMap::from([
+        (
+            "FLEET_RECALL_SUPERSESSION_DATABASE_URL",
+            "postgresql://superseder:supersession-secret@cluster.example:26257/fleet_recall?sslmode=verify-full".into(),
+        ),
+        (
+            "FLEET_RECALL_SUPERSESSION_TENANT_ID",
+            "0198a849-f6ae-7d61-9800-000000000002".into(),
+        ),
+        (
+            "FLEET_RECALL_SUPERSESSION_PROJECT",
+            "physical-project".into(),
+        ),
+    ])
+}
+
+#[test]
+fn supersession_runtime_config_is_scope_bound_and_redacted() {
+    let values = supersession_values();
+    let config = SupersessionRuntimeConfig::from_lookup(|name| values.get(name).cloned())
+        .expect("private supersession config");
+
+    assert_eq!(
+        config.trusted_scope().tenant_id,
+        Uuid::parse_str("0198a849-f6ae-7d61-9800-000000000002").unwrap()
+    );
+    assert_eq!(config.trusted_scope().project, "physical-project");
+    assert_eq!(
+        config.trusted_scope().agent,
+        "private-evidence-supersession"
+    );
+    assert_eq!(config.trusted_scope().session_id, None);
+    assert_eq!(config.trusted_scope().privacy_tier, PrivacyTier::T1Project);
+
+    let debug = format!("{config:?}");
+    for secret in [
+        config.database_url(),
+        "superseder",
+        "supersession-secret",
+        "cluster.example",
+        "physical-project",
+        "0198a849-f6ae-7d61-9800-000000000002",
+    ] {
+        assert!(!debug.contains(secret), "debug exposed {secret}");
+    }
+    assert!(debug.contains("<redacted>"));
+    assert!(debug.contains("<bound>"));
+}
+
+#[test]
+fn supersession_uses_only_its_exact_dedicated_variables() {
+    let values = supersession_values();
+    let mut requested = Vec::new();
+    SupersessionRuntimeConfig::from_lookup(|name| {
+        assert!(
+            SUPERSESSION_VARIABLES.contains(&name),
+            "looked up unrelated or fallback variable {name}"
+        );
+        requested.push(name.to_owned());
+        values.get(name).cloned()
+    })
+    .expect("dedicated supersession variables");
+    assert_eq!(requested, SUPERSESSION_VARIABLES);
+
+    for missing in SUPERSESSION_VARIABLES {
+        let mut values = supersession_values();
+        values.remove(missing);
+        values.insert(
+            "FLEET_RECALL_DATABASE_URL",
+            "postgresql://serving:wrong@cluster.example:26257/fleet?sslmode=verify-full".into(),
+        );
+        values.insert(
+            "FLEET_RECALL_RECONCILIATION_DATABASE_URL",
+            "postgresql://reconciler:wrong@cluster.example:26257/fleet?sslmode=verify-full".into(),
+        );
+        values.insert("FLEET_RECALL_TENANT_ID", Uuid::now_v7().to_string());
+        values.insert("FLEET_RECALL_PROJECT", "serving-project".into());
+        let error = SupersessionRuntimeConfig::from_lookup(|name| values.get(name).cloned())
+            .expect_err(
+                "serving or reconciliation variables must not supply supersession authority",
+            );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{missing} is required")),
+            "wrong error for {missing}: {error}"
+        );
+    }
+}
+
+#[test]
+fn supersession_database_requires_strict_tls_and_explicit_identity() {
+    for url in [
+        "postgresql://superseder:secret@cluster.example:26257/fleet?sslmode=verify-full",
+        "postgresql://superseder:secret@127.0.0.1:26257/fleet?sslmode=verify-full",
+    ] {
+        let mut values = supersession_values();
+        values.insert("FLEET_RECALL_SUPERSESSION_DATABASE_URL", url.into());
+        SupersessionRuntimeConfig::from_lookup(|name| values.get(name).cloned())
+            .unwrap_or_else(|error| panic!("rejected closed supersession URL {url}: {error}"));
+    }
+
+    for url in [
+        "postgresql://superseder:secret@cluster.example:26257/fleet",
+        "postgresql://superseder:secret@cluster.example:26257/fleet?sslmode=disable",
+        "postgresql://superseder:secret@cluster.example:26257/fleet?sslmode=require",
+        "postgresql://superseder:secret@cluster.example:26257/fleet?sslmode=verify-full&options=-csearch_path%3Dattacker",
+        "postgresql://superseder@cluster.example:26257/fleet?sslmode=verify-full",
+        "postgresql://superseder:secret@%2Fvar%2Frun%2Fpostgres:26257/fleet?sslmode=verify-full",
+        "postgresql://root@127.0.0.1:26257/fleet_recall?sslmode=disable",
+    ] {
+        let mut values = supersession_values();
+        values.insert("FLEET_RECALL_SUPERSESSION_DATABASE_URL", url.into());
+        // The local escape that the serving runtime honours is deliberately
+        // absent here: the one-shot pass has no insecure path even when the
+        // operator sets it.
+        values.insert("FLEET_RECALL_ALLOW_INSECURE_LOCAL_DATABASE", "1".into());
+        assert!(
+            SupersessionRuntimeConfig::from_lookup(|name| values.get(name).cloned()).is_err(),
+            "accepted unsafe supersession URL {url}"
+        );
+    }
+}
+
+#[test]
+fn supersession_rejects_invalid_physical_scope() {
+    for (name, value) in [
+        ("FLEET_RECALL_SUPERSESSION_TENANT_ID", "not-a-uuid"),
+        (
+            "FLEET_RECALL_SUPERSESSION_TENANT_ID",
+            "00000000-0000-0000-0000-000000000000",
+        ),
+        ("FLEET_RECALL_SUPERSESSION_PROJECT", " physical-project "),
+    ] {
+        let mut values = supersession_values();
+        values.insert(name, value.into());
+        assert!(
+            SupersessionRuntimeConfig::from_lookup(|name| values.get(name).cloned()).is_err(),
+            "accepted invalid supersession scope {name}"
+        );
+    }
+}
+
 const PROCESS_WRITER_URL: &str = "postgresql://fleet_writer:writer-secret@cluster.example:26257/fleet_recall?sslmode=verify-full";
 const PROCESS_MIGRATOR_URL: &str = "postgresql://fleet_migrator:migrator-secret@cluster.example:26257/fleet_recall?sslmode=verify-full";
 

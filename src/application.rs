@@ -3800,7 +3800,12 @@ fn quarantine_status_block(
                 .get("preimage_disagreement")
                 .copied()
                 .unwrap_or_default();
-            if disagreements > 0 {
+            // A disagreement whose representation has since gained a
+            // `supersedes` successor is resolved: the at-rest supersession
+            // pass rewrote the fact and its re-presentation now replays.
+            // Only what remains is something an operator acts on.
+            let unresolved = disagreements.saturating_sub(summary.resolved_preimage_disagreements);
+            if unresolved > 0 {
                 let bound = if summary.bound_exceeded {
                     "at least "
                 } else {
@@ -3809,7 +3814,7 @@ fn quarantine_status_block(
                 warnings.push(json!({
                     "code": "quarantine_preimage_disagreement",
                     "message": format!(
-                        "{bound}{disagreements} evidence deliveries were quarantined because two reports disagreed on one source fact's bytes; quarantine.preimage_disagreement_sample names the newest, and an operator reconciles them (a retry cannot)"
+                        "{bound}{unresolved} evidence deliveries were quarantined because two reports disagreed on one source fact's bytes and no successor has resolved them; quarantine.preimage_disagreement_sample names the newest, and an operator reconciles them or runs the at-rest supersession pass (a retry cannot)"
                     ),
                 }));
             }
@@ -3818,6 +3823,7 @@ fn quarantine_status_block(
                     "by_reason": summary.by_reason,
                     "bound_exceeded": summary.bound_exceeded,
                     "preimage_disagreement_sample": summary.preimage_disagreement_sample,
+                    "resolved_preimage_disagreements": summary.resolved_preimage_disagreements,
                 }),
                 warnings,
             )
@@ -7198,12 +7204,13 @@ mod tests {
                 "by_reason": {},
                 "bound_exceeded": false,
                 "preimage_disagreement_sample": [],
+                "resolved_preimage_disagreements": 0,
             })
         );
         assert!(warnings.is_empty());
 
         let received_at = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
-        let (block, warnings) = quarantine_status_block(Ok(QuarantineSummaryV1 {
+        let summary = QuarantineSummaryV1 {
             by_reason: [
                 ("oversize".to_owned(), 3),
                 ("preimage_disagreement".to_owned(), 2),
@@ -7215,9 +7222,12 @@ mod tests {
                 source_fact_id: Some(Sha256Digest::from_bytes([7; 32])),
                 received_at,
             }],
-        }));
+            resolved_preimage_disagreements: 0,
+        };
+        let (block, warnings) = quarantine_status_block(Ok(summary.clone()));
         assert_eq!(block["by_reason"]["oversize"], 3);
         assert_eq!(block["by_reason"]["preimage_disagreement"], 2);
+        assert_eq!(block["resolved_preimage_disagreements"], 0);
         assert_eq!(
             block["preimage_disagreement_sample"][0]["source_fact_id"],
             json!(Sha256Digest::from_bytes([7; 32]))
@@ -7236,6 +7246,29 @@ mod tests {
                 .unwrap()
                 .starts_with("2 evidence deliveries were quarantined")
         );
+
+        // One of the two resolved by a successor: the warning names only the
+        // unresolved one. Both resolved: no warning, though the rows remain
+        // counted under their reason.
+        let (block, warnings) = quarantine_status_block(Ok(QuarantineSummaryV1 {
+            resolved_preimage_disagreements: 1,
+            ..summary.clone()
+        }));
+        assert_eq!(block["resolved_preimage_disagreements"], 1);
+        assert!(
+            warnings[0]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("1 evidence deliveries were quarantined")
+        );
+        let (block, warnings) = quarantine_status_block(Ok(QuarantineSummaryV1 {
+            resolved_preimage_disagreements: 2,
+            preimage_disagreement_sample: Vec::new(),
+            ..summary
+        }));
+        assert_eq!(block["by_reason"]["preimage_disagreement"], 2);
+        assert_eq!(block["resolved_preimage_disagreements"], 2);
+        assert!(warnings.is_empty(), "{warnings:?}");
 
         let (block, warnings) =
             quarantine_status_block(Err(FleetError::Memory("permission denied".into())));

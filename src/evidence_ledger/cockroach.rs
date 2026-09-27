@@ -1281,13 +1281,36 @@ const QUARANTINE_BY_REASON_SQL: &str = "SELECT reason, count(*)::INT8 AS rows \
            WHERE tenant_id = $1 AND project = $2 LIMIT $3) AS bounded \
      GROUP BY reason ORDER BY reason";
 
-/// The newest preimage disagreements: the one quarantine reason that means
-/// two connectors reported different bytes under one source fact, which an
-/// operator reconciles rather than a retry.
+/// The newest UNRESOLVED preimage disagreements: the one quarantine reason
+/// that means two reports disagreed on one source fact's bytes, which an
+/// operator reconciles rather than a retry -- minus the rows whose
+/// representation has since gained a `supersedes` successor (the at-rest
+/// supersession pass rewrote the fact, and the same delivery now replays).
+/// The `NOT EXISTS` is one seek per sampled row on migration 0037's
+/// predecessor-key index.
 const QUARANTINE_PREIMAGE_SAMPLE_SQL: &str = "SELECT source_fact_id, received_at \
-     FROM public.memory_evidence_quarantine@primary \
+     FROM public.memory_evidence_quarantine@primary AS quarantined \
      WHERE tenant_id = $1 AND project = $2 AND reason = 'preimage_disagreement' \
+       AND NOT EXISTS (SELECT 1 FROM public.memory_evidence_events AS successor \
+                       WHERE successor.tenant_id = $1 AND successor.project = $2 \
+                         AND successor.predecessor_representation_key_digest \
+                             = quarantined.representation_key_digest) \
      ORDER BY received_at DESC, quarantine_id LIMIT $3";
+
+/// The preimage disagreements a `supersedes` successor has resolved, over the
+/// same bounded scope read as the reason counts: one seek per disagreement
+/// row on the predecessor-key index. A quarantine row without a
+/// representation key can never be resolved this way and is not counted.
+const QUARANTINE_RESOLVED_SQL: &str = "SELECT count(*)::INT8 \
+     FROM (SELECT representation_key_digest \
+           FROM public.memory_evidence_quarantine@primary \
+           WHERE tenant_id = $1 AND project = $2 AND reason = 'preimage_disagreement' \
+           LIMIT $3) AS bounded \
+     WHERE bounded.representation_key_digest IS NOT NULL \
+       AND EXISTS (SELECT 1 FROM public.memory_evidence_events AS successor \
+                   WHERE successor.tenant_id = $1 AND successor.project = $2 \
+                     AND successor.predecessor_representation_key_digest \
+                         = bounded.representation_key_digest)";
 
 /// One quarantined preimage disagreement, as `recall(status)` names it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1306,9 +1329,17 @@ pub struct QuarantineSummaryV1 {
     /// More rows exist than [`MAX_QUARANTINE_STATUS_ROWS`]; the counts are
     /// lower bounds.
     pub bound_exceeded: bool,
-    /// The newest preimage disagreements, at most
+    /// The newest UNRESOLVED preimage disagreements, at most
     /// [`MAX_QUARANTINE_STATUS_SAMPLE`].
     pub preimage_disagreement_sample: Vec<QuarantinedFactV1>,
+    /// Preimage-disagreement rows whose representation has since gained a
+    /// `supersedes` successor: the at-rest supersession pass rewrote the
+    /// fact, and its re-presentation now replays instead of quarantining.
+    /// Bounded like `by_reason`. `by_reason.preimage_disagreement` minus this
+    /// is what an operator still has to act on. Absent on the wire before
+    /// migration 0037's ledger, hence the default.
+    #[serde(default)]
+    pub resolved_preimage_disagreements: i64,
 }
 
 /// Count the scope's quarantine rows by reason and name its newest preimage
@@ -1362,10 +1393,17 @@ pub async fn quarantine_summary(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let resolved_preimage_disagreements: i64 = sqlx::query_scalar(QUARANTINE_RESOLVED_SQL)
+        .bind(tenant_id)
+        .bind(project)
+        .bind(sentinel)
+        .fetch_one(pool)
+        .await?;
     Ok(QuarantineSummaryV1 {
         by_reason,
         bound_exceeded,
         preimage_disagreement_sample,
+        resolved_preimage_disagreements,
     })
 }
 
@@ -1485,6 +1523,18 @@ mod tests {
             QUARANTINE_PREIMAGE_SAMPLE_SQL
                 .contains("ORDER BY received_at DESC, quarantine_id LIMIT $3")
         );
+        // A resolved disagreement is excluded from the sample and counted
+        // separately, both through the predecessor-key seek.
+        assert!(QUARANTINE_PREIMAGE_SAMPLE_SQL.contains("AND NOT EXISTS (SELECT 1"));
+        assert!(
+            QUARANTINE_PREIMAGE_SAMPLE_SQL
+                .contains("successor.predecessor_representation_key_digest")
+        );
+        assert!(QUARANTINE_RESOLVED_SQL.contains("memory_evidence_quarantine@primary"));
+        assert!(QUARANTINE_RESOLVED_SQL.contains("reason = 'preimage_disagreement'"));
+        assert!(QUARANTINE_RESOLVED_SQL.contains("LIMIT $3) AS bounded"));
+        assert!(QUARANTINE_RESOLVED_SQL.contains("AND EXISTS (SELECT 1"));
+        assert!(!QUARANTINE_RESOLVED_SQL.contains("DELETE"));
         assert_eq!(
             quarantine_reason_label(QuarantineReasonV1::PreimageDisagreement),
             "preimage_disagreement"
@@ -1496,9 +1546,19 @@ mod tests {
                 source_fact_id: None,
                 received_at: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
             }],
+            resolved_preimage_disagreements: 1,
         };
         let wire = serde_json::to_value(&summary).unwrap();
         assert_eq!(wire["by_reason"]["preimage_disagreement"], 2);
+        assert_eq!(wire["resolved_preimage_disagreements"], 1);
+        // A summary written before the field existed still decodes.
+        let older: QuarantineSummaryV1 = serde_json::from_value(serde_json::json!({
+            "by_reason": {},
+            "bound_exceeded": false,
+            "preimage_disagreement_sample": [],
+        }))
+        .unwrap();
+        assert_eq!(older.resolved_preimage_disagreements, 0);
         assert_eq!(
             wire["preimage_disagreement_sample"][0]["source_fact_id"],
             serde_json::Value::Null

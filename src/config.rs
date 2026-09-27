@@ -530,6 +530,58 @@ impl ConflictReconciliationRuntimeConfig {
     }
 }
 
+/// Minimal runtime configuration for the private at-rest supersession pass
+/// (`ostk-evidence-supersede`, ADR 0006 D9 amendment).
+///
+/// The process has its own database credential and physical fleet identity,
+/// exactly like [`ConflictReconciliationRuntimeConfig`]: it never consults
+/// serving, control-bootstrap, registry, or successor configuration and
+/// exposes no insecure-local database escape. The writer-authority pins and
+/// the content key are read separately, through [`WriterAuthorityConfig::from_env`]
+/// and [`content_key_encryption_key`], because the pass appends under the
+/// active head and must open the raw content it rewrites.
+#[derive(Clone)]
+pub struct SupersessionRuntimeConfig {
+    database_url: String,
+    trusted_scope: FleetScope,
+}
+
+impl std::fmt::Debug for SupersessionRuntimeConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SupersessionRuntimeConfig")
+            .field("database_url", &"<redacted>")
+            .field("trusted_scope", &"<bound>")
+            .finish()
+    }
+}
+
+impl SupersessionRuntimeConfig {
+    /// Read only the dedicated database URL and physical scope needed by this
+    /// one-shot writer.
+    pub fn from_env() -> Result<Self> {
+        Self::from_lookup(|name| env::var(name).ok())
+    }
+
+    pub(crate) fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
+        supersession_runtime_config(
+            &required_from(&mut lookup, "FLEET_RECALL_SUPERSESSION_DATABASE_URL")?,
+            &required_from(&mut lookup, "FLEET_RECALL_SUPERSESSION_TENANT_ID")?,
+            &required_from(&mut lookup, "FLEET_RECALL_SUPERSESSION_PROJECT")?,
+        )
+    }
+
+    #[must_use]
+    pub fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    #[must_use]
+    pub const fn trusted_scope(&self) -> &FleetScope {
+        &self.trusted_scope
+    }
+}
+
 /// Deployment-only pins that enable the event-first writer path (ADR 0002 D4).
 ///
 /// The three primary pins are optional as one group. Either all three are
@@ -1812,17 +1864,64 @@ fn conflict_reconciliation_runtime_config(
 }
 
 fn validate_reconciliation_database_url(database_url: &str) -> Result<()> {
-    const VARIABLE_NAME: &str = "FLEET_RECALL_RECONCILIATION_DATABASE_URL";
-    validate_database_url_with_local_escape(database_url, VARIABLE_NAME, false, false)?;
-    validate_explicit_private_database_identity(database_url, VARIABLE_NAME)?;
+    validate_one_shot_ceremony_database_url(
+        database_url,
+        "FLEET_RECALL_RECONCILIATION_DATABASE_URL",
+    )
+}
+
+fn supersession_runtime_config(
+    database_url: &str,
+    tenant_id: &str,
+    project: &str,
+) -> Result<SupersessionRuntimeConfig> {
+    validate_one_shot_ceremony_database_url(
+        database_url,
+        "FLEET_RECALL_SUPERSESSION_DATABASE_URL",
+    )?;
+
+    let tenant_id = tenant_id.parse::<Uuid>().map_err(|error| {
+        FleetError::Configuration(format!(
+            "FLEET_RECALL_SUPERSESSION_TENANT_ID must be a UUID: {error}"
+        ))
+    })?;
+    if tenant_id.is_nil() {
+        return Err(FleetError::Configuration(
+            "FLEET_RECALL_SUPERSESSION_TENANT_ID must not be the nil UUID".into(),
+        ));
+    }
+    let trusted_scope = FleetScope::new(
+        tenant_id,
+        project,
+        "private-evidence-supersession",
+        None,
+        PrivacyTier::T1Project,
+    )
+    .map_err(|error| {
+        FleetError::Configuration(format!(
+            "FLEET_RECALL_SUPERSESSION_PROJECT is invalid: {error}"
+        ))
+    })?;
+
+    Ok(SupersessionRuntimeConfig {
+        database_url: database_url.to_owned(),
+        trusted_scope,
+    })
+}
+
+/// The URL rule every private one-shot ceremony shares: strict TLS with no
+/// local escape, an explicit private identity, and an ordinary network host.
+fn validate_one_shot_ceremony_database_url(database_url: &str, variable_name: &str) -> Result<()> {
+    validate_database_url_with_local_escape(database_url, variable_name, false, false)?;
+    validate_explicit_private_database_identity(database_url, variable_name)?;
 
     let parsed = Url::parse(database_url).map_err(|error| {
         FleetError::Configuration(format!(
-            "{VARIABLE_NAME} must be a valid PostgreSQL URL: {error}"
+            "{variable_name} must be a valid PostgreSQL URL: {error}"
         ))
     })?;
     let host = parsed.host_str().ok_or_else(|| {
-        FleetError::Configuration(format!("{VARIABLE_NAME} must include a hostname"))
+        FleetError::Configuration(format!("{variable_name} must include a hostname"))
     })?;
     let ordinary_network_host = match parsed.host() {
         Some(Host::Ipv4(_) | Host::Ipv6(_)) => !host.contains('%'),
@@ -1831,7 +1930,7 @@ fn validate_reconciliation_database_url(database_url: &str) -> Result<()> {
     };
     if !ordinary_network_host || host.starts_with(['/', '\\']) {
         return Err(FleetError::Configuration(format!(
-            "{VARIABLE_NAME} must use an ordinary DNS or IP hostname, not an encoded or Unix-socket host"
+            "{variable_name} must use an ordinary DNS or IP hostname, not an encoded or Unix-socket host"
         )));
     }
     Ok(())
