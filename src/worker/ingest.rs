@@ -28,11 +28,11 @@ use crate::connectors::git::{
     drain_git_facts, git_coverage_observation,
 };
 use crate::connectors::transcript::{
-    CockroachTranscriptOutboxRepository, MAX_TRANSCRIPT_BYTES, TranscriptCollectionRequestV1,
-    TranscriptConnectorBindingV1, TranscriptConnectorError, TranscriptCoverageBindingV1,
-    TranscriptDrainModeV1, TranscriptDrainRequest, TranscriptEnqueueOutcome,
-    TranscriptIngressClocksV1, TranscriptOutboxRepository as _, collect_batch, drain_source_outbox,
-    transcript_parser_key_v3,
+    CockroachTranscriptOutboxRepository, MAX_REPORTED_UNKNOWN_KINDS, MAX_TRANSCRIPT_BYTES,
+    TranscriptCollectionRequestV1, TranscriptCollectionStatsV1, TranscriptConnectorBindingV1,
+    TranscriptConnectorError, TranscriptCoverageBindingV1, TranscriptDrainModeV1,
+    TranscriptDrainRequest, TranscriptEnqueueOutcome, TranscriptIngressClocksV1,
+    TranscriptOutboxRepository as _, collect_batch, drain_source_outbox, transcript_parser_key_v4,
 };
 use crate::coverage_runtime::{
     CockroachCoverageRuntimeRepository, CoverageObservationOutcome, CoverageRuntimeRepository as _,
@@ -90,13 +90,14 @@ const MAX_LAST_ERROR_BYTES: usize = 2_048;
 /// One tick observes each ref once and each CI window once.
 const OBSERVATIONS_PER_TICK: usize = 1;
 
-const TRANSCRIPT_COUNTERS: [&str; 9] = [
+const TRANSCRIPT_COUNTERS: [&str; 10] = [
     "bytes_consumed",
     "turns_parsed",
     "turns_staged",
     "turns_withheld",
     "turns_redacted",
     "records_skipped",
+    "records_unknown_skipped",
     "appended",
     "replayed",
     "receipts",
@@ -208,6 +209,35 @@ pub(super) fn zeroed(keys: &[&'static str]) -> WorkerCountersV1 {
 
 fn add(counters: &mut WorkerCountersV1, key: &'static str, value: u64) {
     *counters.entry(key).or_insert(0) += value;
+}
+
+/// Count what one transcript window's collection reported, and gather the
+/// unknown record kinds it skipped. The names are bounded per parse; the same
+/// bound holds across the windows of one file, so a file that invents a kind
+/// per window cannot grow the report either.
+fn count_collection(
+    counters: &mut WorkerCountersV1,
+    skipped_kinds: &mut BTreeSet<String>,
+    stats: TranscriptCollectionStatsV1,
+) {
+    add(counters, "turns_parsed", u64::from(stats.turns_parsed));
+    add(counters, "turns_withheld", u64::from(stats.turns_withheld));
+    add(counters, "turns_redacted", u64::from(stats.turns_redacted));
+    add(
+        counters,
+        "records_skipped",
+        u64::from(stats.records_skipped),
+    );
+    add(
+        counters,
+        "records_unknown_skipped",
+        u64::from(stats.records_unknown_skipped),
+    );
+    for kind in stats.unknown_kinds {
+        if skipped_kinds.len() < MAX_REPORTED_UNKNOWN_KINDS || skipped_kinds.contains(&kind) {
+            skipped_kinds.insert(kind);
+        }
+    }
 }
 
 fn count(value: usize) -> u64 {
@@ -479,6 +509,7 @@ impl Ingest<'_> {
         let mut reports = Vec::with_capacity(discovered.files.len());
         for file in &discovered.files {
             let mut counters = zeroed(&TRANSCRIPT_COUNTERS);
+            let mut skipped_kinds = BTreeSet::new();
             let (instance, result) = match (&file.instance, &bound) {
                 (Ok(instance), Ok((active, verified, guarantee))) => {
                     let result = self
@@ -489,6 +520,7 @@ impl Ingest<'_> {
                             file,
                             instance,
                             &mut counters,
+                            &mut skipped_kinds,
                         )
                         .await;
                     (Some(instance.clone()), result)
@@ -505,6 +537,7 @@ impl Ingest<'_> {
                     stale_after,
                     result,
                     counters,
+                    skipped_kinds.into_iter().collect(),
                     inventory,
                 )
                 .await;
@@ -545,6 +578,7 @@ impl Ingest<'_> {
                     self.sources().stale_after(source.stale_after_seconds),
                     result,
                     counters,
+                    Vec::new(),
                     inventory,
                 )
                 .await;
@@ -580,6 +614,7 @@ impl Ingest<'_> {
                     self.sources().stale_after(source.stale_after_seconds),
                     result,
                     counters,
+                    Vec::new(),
                     inventory,
                 )
                 .await;
@@ -598,6 +633,7 @@ impl Ingest<'_> {
         stale_after: u64,
         result: SourceResult<WorkerSourceOutcomeV1>,
         counters: WorkerCountersV1,
+        skipped_kinds: Vec<String>,
         inventory: &mut Option<BTreeSet<String>>,
     ) -> WorkerSourceReportV1 {
         let (mut outcome, mut error) = match result {
@@ -629,6 +665,7 @@ impl Ingest<'_> {
             outcome,
             error,
             counters,
+            skipped_kinds,
         }
     }
 
@@ -693,6 +730,7 @@ impl Ingest<'_> {
 
     /// Collect one transcript file into the outbox, then drain its pending
     /// turns under this source's own coverage domain.
+    #[allow(clippy::too_many_arguments)] // one call site, all named
     async fn ingest_transcript(
         &self,
         active: &ActiveStage4Package,
@@ -701,6 +739,7 @@ impl Ingest<'_> {
         file: &TranscriptFile<'_>,
         instance: &ContractId,
         counters: &mut WorkerCountersV1,
+        skipped_kinds: &mut BTreeSet<String>,
     ) -> SourceResult<WorkerSourceOutcomeV1> {
         let outbox = CockroachTranscriptOutboxRepository::new(
             self.pool.clone(),
@@ -708,7 +747,15 @@ impl Ingest<'_> {
             self.retry(),
         );
         let collected = self
-            .collect_transcript(active, guarantee, file, instance, &outbox, counters)
+            .collect_transcript(
+                active,
+                guarantee,
+                file,
+                instance,
+                &outbox,
+                counters,
+                skipped_kinds,
+            )
             .await;
         // The drain runs even when collection failed: turns an earlier window
         // or tick staged are durable, and a bad later line must not strand
@@ -731,7 +778,9 @@ impl Ingest<'_> {
     }
 
     /// Stage every complete line past the durable cursor, window by window.
-    /// Whether the cursor advanced.
+    /// Whether the cursor advanced. `skipped_kinds` gathers the unknown
+    /// record kinds every window skipped, under the parser's own bound.
+    #[allow(clippy::too_many_arguments)] // one call site, all named
     async fn collect_transcript(
         &self,
         active: &ActiveStage4Package,
@@ -740,6 +789,7 @@ impl Ingest<'_> {
         instance: &ContractId,
         outbox: &CockroachTranscriptOutboxRepository,
         counters: &mut WorkerCountersV1,
+        skipped_kinds: &mut BTreeSet<String>,
     ) -> SourceResult<bool> {
         let group = file.group;
         let source_id = file.source_id.as_str();
@@ -751,7 +801,7 @@ impl Ingest<'_> {
                 group.installation_id.to_string(),
             )]),
         };
-        let parser_key = transcript_parser_key_v3();
+        let parser_key = transcript_parser_key_v4();
         let mut progressed = false;
         let mut bytes: Option<Vec<u8>> = None;
 
@@ -800,14 +850,7 @@ impl Ingest<'_> {
                 },
             })
             .map_err(describe)?;
-            add(counters, "turns_parsed", u64::from(stats.turns_parsed));
-            add(counters, "turns_withheld", u64::from(stats.turns_withheld));
-            add(counters, "turns_redacted", u64::from(stats.turns_redacted));
-            add(
-                counters,
-                "records_skipped",
-                u64::from(stats.records_skipped),
-            );
+            count_collection(counters, skipped_kinds, stats);
             // A window that holds no complete line moves nothing. Decided
             // before the enqueue, which would answer `AlreadyCovered` for a
             // cursor that did not move and so hide a line no window can hold.
@@ -1333,6 +1376,7 @@ mod tests {
             outcome,
             error: None,
             counters,
+            skipped_kinds: Vec::new(),
         }
     }
 
@@ -1367,5 +1411,34 @@ mod tests {
         let report = step_report(Vec::new(), Vec::new(), &GIT_COUNTERS);
         assert_eq!(report.status, WorkerStepStatusV1::Ok);
         assert_eq!(report.counters["appended"], 0);
+    }
+
+    #[test]
+    fn a_source_report_names_its_skipped_kinds_only_when_it_has_any() {
+        let quiet = source(WorkerSourceOutcomeV1::Ok, 1);
+        let printed = serde_json::to_value(&quiet).unwrap();
+        assert!(
+            printed.get("skipped_kinds").is_none(),
+            "an empty list is omitted from the printed report: {printed}"
+        );
+
+        let mut counters = zeroed(&TRANSCRIPT_COUNTERS);
+        counters.insert("records_unknown_skipped", 2);
+        let naming = WorkerSourceReportV1 {
+            connector_instance: "connector.transcript.session".into(),
+            kind: WorkerSourceKindV1::Transcript,
+            source: "session.jsonl".into(),
+            outcome: WorkerSourceOutcomeV1::Ok,
+            error: None,
+            counters,
+            skipped_kinds: vec!["agent-pulse".into(), "telemetry-burst".into()],
+        };
+        let printed = serde_json::to_value(&naming).unwrap();
+        assert_eq!(
+            printed["skipped_kinds"],
+            serde_json::json!(["agent-pulse", "telemetry-burst"])
+        );
+        assert_eq!(printed["counters"]["records_unknown_skipped"], 2);
+        assert_eq!(printed["outcome"], "ok");
     }
 }

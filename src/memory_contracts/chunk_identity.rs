@@ -135,6 +135,10 @@ pub enum NormalizationRuleV1 {
     WhitespaceCollapse,
     TrailingWhitespaceTrim,
     ControlCharacterStrip,
+    /// A scalar the canonical profile forbids in a string other than a
+    /// control (a noncharacter or a private-use scalar) folds to a space.
+    /// Declared last so every existing sorted rule set stays sorted.
+    ForbiddenScalarFold,
 }
 
 /// Parser/extractor identity: artifact digest, version, exact configuration

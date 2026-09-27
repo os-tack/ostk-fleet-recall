@@ -56,6 +56,12 @@ pub struct TranscriptCollectionStatsV1 {
     pub turns_redacted: u32,
     /// Records that carried no turn.
     pub records_skipped: u32,
+    /// The subset of `records_skipped` whose `type` is outside the parser's
+    /// closed set and which carried no `message`.
+    pub records_unknown_skipped: u32,
+    /// The distinct `type` names behind `records_unknown_skipped`, sorted, at
+    /// most [`super::parser::MAX_REPORTED_UNKNOWN_KINDS`] of them.
+    pub unknown_kinds: Vec<String>,
     /// Distinct secret classes detected in this pass, shared and provider
     /// shapes alike (metadata only; never the matched bytes).
     pub classes_detected: Vec<CollectedSecretClassV1>,
@@ -111,6 +117,8 @@ pub fn collect_batch(
     let mut stats = TranscriptCollectionStatsV1 {
         turns_parsed: u32::try_from(parsed.turns.len()).unwrap_or(u32::MAX),
         records_skipped: parsed.skipped_records,
+        records_unknown_skipped: parsed.records_unknown_skipped,
+        unknown_kinds: parsed.unknown_kinds.clone(),
         ..TranscriptCollectionStatsV1::default()
     };
 

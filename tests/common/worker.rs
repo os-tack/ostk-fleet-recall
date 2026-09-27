@@ -214,8 +214,13 @@ pub fn first_turn_text() -> String {
     format!("why does the {TRANSCRIPT_WORD} importer drop rows")
 }
 
-/// A transcript line of a record type the parser refuses.
-pub const BROKEN_TRANSCRIPT_LINE: &str = r#"{"type":"telemetry-burst","sessionId":"s","uuid":"u","timestamp":"2026-08-15T12:30:00.000Z"}"#;
+/// A transcript line the parser refuses: a turn whose timestamp is not a
+/// timestamp, so the record is malformed rather than merely unknown.
+pub const BROKEN_TRANSCRIPT_LINE: &str = r#"{"type":"user","sessionId":"s","uuid":"u","timestamp":"not-a-timestamp","message":{"role":"user","content":[{"type":"text","text":"broken"}]}}"#;
+
+/// A transcript line of a record type outside the parser's closed set that
+/// carries no `message`: skipped, counted, and named rather than refused.
+pub const UNKNOWN_KIND_TRANSCRIPT_LINE: &str = r#"{"type":"telemetry-burst","sessionId":"s"}"#;
 
 /// A scratch transcript directory.
 ///

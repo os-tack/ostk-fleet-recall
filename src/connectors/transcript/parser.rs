@@ -18,20 +18,29 @@
 //! yields a DIFFERENT representation, never a silent in-place reinterpretation.
 //!
 //! The declared normalization rules are the ones this parser actually applies:
-//! [`NormalizationRuleV1::NewlineLf`] (CRLF and lone CR collapse to LF) and
-//! [`NormalizationRuleV1::TrailingWhitespaceTrim`] (trailing spaces and tabs are
-//! stripped from every line, and trailing blank lines from the whole turn). No
-//! other transformation happens, so the declared set is exhaustive rather than
-//! aspirational.
+//! [`NormalizationRuleV1::NewlineLf`], [`NormalizationRuleV1::UnicodeNfc`],
+//! [`NormalizationRuleV1::WhitespaceCollapse`],
+//! [`NormalizationRuleV1::TrailingWhitespaceTrim`],
+//! [`NormalizationRuleV1::ControlCharacterStrip`], and
+//! [`NormalizationRuleV1::ForbiddenScalarFold`] — see [`normalize`] for what
+//! each does. No other transformation happens, so the declared set is
+//! exhaustive rather than aspirational.
 //!
 //! # Fail-closed parsing
 //!
 //! An unparseable line, a malformed timestamp, or a record missing a field the
 //! identity needs is a [`TranscriptConnectorError::MalformedTranscript`], and a
-//! record `type` outside the closed set is a
+//! record `type` outside the closed set that carries a `message` object is a
 //! [`TranscriptConnectorError::UnknownRecordKind`] that names the type. Either
 //! aborts the whole batch. Nothing partial is staged: a batch that cannot be
 //! parsed in full advances no cursor and writes no outbox row.
+//!
+//! A record `type` outside the closed set that carries NO `message` is not a
+//! refusal: it cannot hold a conversational turn, so it is skipped, counted in
+//! [`ParsedTranscriptV1::records_unknown_skipped`], and named in
+//! [`ParsedTranscriptV1::unknown_kinds`] (at most
+//! [`MAX_REPORTED_UNKNOWN_KINDS`] names). The skip is visible, never silent:
+//! the count and the names reach the worker's source report.
 
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
@@ -57,8 +66,17 @@ const CHUNK_IDENTITY_SCHEMA_VERSION: u32 = 1;
 /// both change which turns exist, so the identity had to change with them —
 /// see [`transcript_parser_key_v2`]. It went from 2 to 3 when the agent runtime
 /// began writing `cost-state` records, which generation 2 refused — see
-/// [`transcript_parser_key_v3`].
-pub const TRANSCRIPT_PARSER_VERSION: u32 = 3;
+/// [`transcript_parser_key_v3`]. It went from 3 to 4 when real session and
+/// subagent journal files carried nine more messageless record kinds and a
+/// noncharacter inside a turn's text, each of which stopped a file — see
+/// [`transcript_parser_key_v4`].
+pub const TRANSCRIPT_PARSER_VERSION: u32 = 4;
+
+/// The retired generation-3 parser version.
+///
+/// Kept, like generations 1 and 2, so [`transcript_parser_key_v3`] still
+/// mints its exact original bytes.
+const TRANSCRIPT_PARSER_GENERATION_3_VERSION: u32 = 3;
 
 /// The retired generation-2 parser version.
 ///
@@ -94,10 +112,11 @@ const TRANSCRIPT_PARSER_CONFIGURATION_V2: &str = "ostk-transcript-jsonl:v2;recor
      normalize=newline_lf,unicode_nfc,whitespace_collapse,trailing_whitespace_trim,\
      control_character_strip;batch_bound=unconsumed_remainder";
 
-/// Exact configuration label whose digest becomes the CURRENT parser key's
-/// `configuration_digest`. It is generation 2's label with one more non-turn
-/// record kind, `cost-state`, in the closed skip set; every other choice is
-/// unchanged, so a file generation 2 could read parses to the same turns.
+/// Exact configuration label of the RETIRED generation-3 parser. Frozen: its
+/// digest is part of every generation-3 turn's identity. It is generation 2's
+/// label with one more non-turn record kind, `cost-state`, in the closed skip
+/// set; every other choice is unchanged, so a file generation 2 could read
+/// parses to the same turns.
 const TRANSCRIPT_PARSER_CONFIGURATION_V3: &str = "ostk-transcript-jsonl:v3;records=user,assistant;\
      skips=system,summary,mode,permission-mode,atis-latch,bridge-session,ai-title,last-prompt,\
      queue-operation,attachment,file-history-snapshot,file-history-delta,cost-state;\
@@ -105,6 +124,22 @@ const TRANSCRIPT_PARSER_CONFIGURATION_V3: &str = "ostk-transcript-jsonl:v3;recor
      blocks=text-only;join=lf;\
      normalize=newline_lf,unicode_nfc,whitespace_collapse,trailing_whitespace_trim,\
      control_character_strip;batch_bound=unconsumed_remainder";
+
+/// Exact configuration label whose digest becomes the CURRENT parser key's
+/// `configuration_digest`. It names the three choices generation 4 made on top
+/// of generation 3: nine more messageless record kinds in the closed skip set,
+/// the two-way treatment of an unknown kind (skipped and counted when it
+/// carries no `message`, refused with the type named when it does), and the
+/// folding of a scalar the canonical profile forbids to a space.
+const TRANSCRIPT_PARSER_CONFIGURATION_V4: &str = "ostk-transcript-jsonl:v4;records=user,assistant;\
+     skips=system,summary,mode,permission-mode,atis-latch,bridge-session,ai-title,last-prompt,\
+     queue-operation,attachment,file-history-snapshot,file-history-delta,cost-state,\
+     agent-name,started,result,relocated,worktree-state,failed,launched,continued-in,\
+     fork-context-ref;unknown_records=skipped_and_counted_without_message,refused_with_message;\
+     text_free_turn_records=skipped;keys=sessionId>session_id,uuid,timestamp,message.content;\
+     blocks=text-only;join=lf;\
+     normalize=newline_lf,unicode_nfc,whitespace_collapse,trailing_whitespace_trim,\
+     control_character_strip,forbidden_scalar_fold;batch_bound=unconsumed_remainder";
 
 const TRANSCRIPT_PARSER_ARTIFACT: &str = "ostk-transcript-jsonl-parser";
 
@@ -203,7 +238,7 @@ pub fn transcript_parser_key_v2() -> ParserKeyV1 {
     }
 }
 
-/// The CURRENT production parser key.
+/// The RETIRED generation-3 parser key, frozen at its original bytes.
 ///
 /// Generation 3 exists because generation 2 could not read a current Claude
 /// session file either: the agent runtime now appends `cost-state` records
@@ -211,15 +246,14 @@ pub fn transcript_parser_key_v2() -> ParserKeyV1 {
 /// record-kind set refused the batch at the first one. Generation 3 adds that
 /// one kind to the skip set and changes nothing else, so every file generation
 /// 2 could read parses to byte-identical turns; only the parser identity those
-/// turns carry is new. The set stays CLOSED: the next kind the runtime adds
-/// fails its file as [`TranscriptConnectorError::UnknownRecordKind`], naming
-/// the type, until a parser release admits it.
+/// turns carry is new. Its set was CLOSED with no allowance: any kind outside
+/// it failed its file as [`TranscriptConnectorError::UnknownRecordKind`].
 #[must_use]
 pub fn transcript_parser_key_v3() -> ParserKeyV1 {
     ParserKeyV1 {
         schema_version: CHUNK_IDENTITY_SCHEMA_VERSION,
         parser_artifact_digest: label_digest(TRANSCRIPT_PARSER_ARTIFACT),
-        parser_version: TRANSCRIPT_PARSER_VERSION,
+        parser_version: TRANSCRIPT_PARSER_GENERATION_3_VERSION,
         configuration_digest: label_digest(TRANSCRIPT_PARSER_CONFIGURATION_V3),
         // The same five rules as generation 2, in the same strictly sorted
         // order.
@@ -233,17 +267,63 @@ pub fn transcript_parser_key_v3() -> ParserKeyV1 {
     }
 }
 
+/// The CURRENT production parser key.
+///
+/// Generation 4 exists because generation 3 refused three real files. Two
+/// stopped at a record kind outside the closed set: `agent-name` in a session
+/// file, and `started` in a subagent workflow `journal.jsonl`. The third
+/// stopped at a turn whose text held U+FFFF, a noncharacter the canonical
+/// encoder refuses, so the whole window staged nothing. Three choices changed:
+///
+/// 1. **Nine more messageless kinds are in the closed skip set**: the
+///    subagent workflow journal kinds `started`, `result`, `failed`,
+///    `launched`, `agent-name`, and `fork-context-ref`, and the session kinds
+///    `relocated`, `worktree-state`, and `continued-in`. None carries a
+///    `message`.
+/// 2. **An unknown kind is refused only when it could hold a turn.** A record
+///    whose `type` is outside the set and which carries no `message` object
+///    cannot hold a conversational turn, so it is skipped, counted in
+///    [`ParsedTranscriptV1::records_unknown_skipped`], and named in
+///    [`ParsedTranscriptV1::unknown_kinds`]. One that carries a `message` is
+///    still [`TranscriptConnectorError::UnknownRecordKind`], naming the type,
+///    until a parser release decides what its message means.
+/// 3. **A scalar the canonical profile forbids folds to a space**
+///    ([`NormalizationRuleV1::ForbiddenScalarFold`]), so every normalized turn
+///    is canonically encodable. See [`normalize`] for the residual.
+#[must_use]
+pub fn transcript_parser_key_v4() -> ParserKeyV1 {
+    ParserKeyV1 {
+        schema_version: CHUNK_IDENTITY_SCHEMA_VERSION,
+        parser_artifact_digest: label_digest(TRANSCRIPT_PARSER_ARTIFACT),
+        parser_version: TRANSCRIPT_PARSER_VERSION,
+        configuration_digest: label_digest(TRANSCRIPT_PARSER_CONFIGURATION_V4),
+        // Generation 3's five rules plus ForbiddenScalarFold, which is declared
+        // last in NormalizationRuleV1, so the set stays strictly sorted.
+        declared_normalization_rules: vec![
+            NormalizationRuleV1::NewlineLf,
+            NormalizationRuleV1::UnicodeNfc,
+            NormalizationRuleV1::WhitespaceCollapse,
+            NormalizationRuleV1::TrailingWhitespaceTrim,
+            NormalizationRuleV1::ControlCharacterStrip,
+            NormalizationRuleV1::ForbiddenScalarFold,
+        ],
+    }
+}
+
 /// Closed set of transcript record kinds.
 ///
-/// Closed on purpose: an unrecognized `type` must abort the batch rather than be
-/// silently skipped, because a skipped record is an invisible coverage hole.
-/// Every kind other than `User` and `Assistant` carries no turn and is counted,
-/// not dropped.
+/// Closed on purpose: a `type` outside it gets a deliberate decision rather
+/// than a catch-all. Since generation 4 that decision is two-way: an unknown
+/// kind that carries a `message` object could hold a turn, so it aborts the
+/// batch as [`TranscriptConnectorError::UnknownRecordKind`]; one that carries
+/// no `message` cannot, so it is skipped, counted, and named (see
+/// [`classify_unknown`]). Every kind here other than `User` and `Assistant`
+/// carries no turn and is counted, not dropped.
 ///
 /// The non-turn kinds below `Summary` are the session-runtime bookkeeping
-/// records a live Claude session file actually contains. They are enumerated
-/// rather than tolerated by a catch-all, so a kind the agent runtime adds in
-/// future still stops the batch and gets a deliberate decision.
+/// records a live Claude session file, or a subagent workflow `journal.jsonl`,
+/// actually contains. They are enumerated so the parser's configuration label
+/// names exactly what it reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum TranscriptRecordKind {
@@ -273,6 +353,24 @@ enum TranscriptRecordKind {
     FileHistoryDelta,
     /// Running session cost and token totals (generation 3).
     CostState,
+    /// Name the runtime assigned a subagent (generation 4).
+    AgentName,
+    /// Subagent workflow journal: the workflow started.
+    Started,
+    /// Subagent workflow journal: the workflow's result.
+    Result,
+    /// The session file moved to a new path.
+    Relocated,
+    /// Subagent workflow journal: the workflow failed.
+    Failed,
+    /// Subagent workflow journal: a subagent was launched.
+    Launched,
+    /// The session continued in another session file.
+    ContinuedIn,
+    /// The session's git worktree state.
+    WorktreeState,
+    /// Reference to the context a forked subagent inherited.
+    ForkContextRef,
 }
 
 /// Which side of the conversation a turn came from.
@@ -368,9 +466,18 @@ pub struct ParsedTurnV1 {
 pub struct ParsedTranscriptV1 {
     /// Turns, in source order.
     pub turns: Vec<ParsedTurnV1>,
-    /// Records that carried no turn (`system`, `summary`), counted so a
-    /// coverage gap can never hide behind a silent skip.
+    /// Every non-turn line: records of a known non-turn kind, turn-shaped
+    /// records with no text block, and messageless records of an unknown
+    /// kind. Counted so a coverage gap can never hide behind a silent skip.
     pub skipped_records: u32,
+    /// The subset of [`Self::skipped_records`] whose `type` is outside the
+    /// closed set and which carried no `message` (generation 4).
+    pub records_unknown_skipped: u32,
+    /// The distinct `type` names behind [`Self::records_unknown_skipped`],
+    /// sorted, each cut to [`MAX_QUOTED_RECORD_KIND_CHARS`] characters, at
+    /// most [`MAX_REPORTED_UNKNOWN_KINDS`] of them. Past the bound a new name
+    /// is still counted but no longer named.
+    pub unknown_kinds: Vec<String>,
     /// Byte offset one past the last line this parse consumed.
     pub consumed_bytes: u64,
     /// Number of newline-delimited lines consumed.
@@ -387,9 +494,11 @@ fn malformed(source_id: &str, line_ordinal: u32, reason: &'static str) -> Transc
     }
 }
 
-/// Exactly the five declared normalization rules, in one pass: NFC-compose,
+/// Exactly the six declared normalization rules, in one pass: NFC-compose,
 /// fold every whitespace scalar (CRLF, LF, tabs) to a single ASCII space, drop
-/// every other control scalar, collapse runs, and trim both ends.
+/// every other control scalar, fold every other scalar the canonical profile
+/// forbids (a noncharacter or a private-use scalar) to a space, collapse runs,
+/// and trim both ends.
 ///
 /// # Why generation 2 folds newlines
 ///
@@ -400,10 +509,20 @@ fn malformed(source_id: &str, line_ordinal: u32, reason: &'static str) -> Transc
 /// encoded at all: the first real turn of a real session file failed with
 /// `ForbiddenUnicode`. Folding is what makes the turn expressible.
 ///
-/// Residual, recorded rather than hidden: **line structure is not preserved**.
-/// The canonical body carries the turn's words, in order, and not its layout.
-/// A consumer that needs the original layout must go back to the source span
-/// the turn carries, which names the exact raw bytes it came from.
+/// # Why generation 4 folds forbidden scalars
+///
+/// The same encoder refuses noncharacters and private-use scalars, and a real
+/// session file carried U+FFFF inside a text block; under generation 3 the
+/// whole window failed at canonical encoding and staged nothing. Folding the
+/// scalar to a space (rather than dropping it, so the words either side stay
+/// two words) is lossy but admissible, the same choice the CI connector's
+/// text rendering makes.
+///
+/// Residual, recorded rather than hidden: **line structure is not preserved**,
+/// and neither is a forbidden scalar. The canonical body carries the turn's
+/// words, in order, and not its layout. A consumer that needs the original
+/// layout or bytes must go back to the source span the turn carries, which
+/// names the exact raw bytes it came from.
 fn normalize(raw: &str) -> String {
     let mut normalized = String::with_capacity(raw.len());
     let mut pending_space = false;
@@ -413,6 +532,10 @@ fn normalize(raw: &str) -> String {
             continue;
         }
         if character.is_control() {
+            continue;
+        }
+        if crate::memory_contracts::canonical::is_forbidden_scalar(character) {
+            pending_space = !normalized.is_empty();
             continue;
         }
         if pending_space {
@@ -526,34 +649,53 @@ fn build_turn(
 
 /// What one framed line turned out to be.
 ///
-/// There are exactly two outcomes and no third: a line is a turn, or it is a
-/// counted non-turn record. An unrecognized record kind is neither — it is a
-/// closed refusal from [`classify_line`], because a silently skipped record is
-/// an invisible coverage hole.
+/// There are exactly three outcomes: a line is a turn, a counted non-turn
+/// record of a known kind, or a counted and NAMED record of an unknown kind
+/// that carries no `message`. An unknown kind that carries a `message` is
+/// none of these — it is a closed refusal from [`classify_unknown`], because
+/// a skipped record that might have held a turn is an invisible coverage hole.
 enum LineKind {
     /// Carries no conversational turn: a session-runtime record, or a
     /// turn-shaped record whose content holds only tool or thinking blocks.
     Skipped,
-    /// A conversational turn. Boxed so the two variants stay similar in size.
+    /// A messageless record whose `type` is outside the closed set, carrying
+    /// that type (cut to [`MAX_QUOTED_RECORD_KIND_CHARS`] characters) so the
+    /// parse can name it.
+    SkippedUnknown(String),
+    /// A conversational turn. Boxed so the variants stay similar in size.
     Turn(Box<ParsedTurnV1>),
 }
 
 /// Longest record `type` an [`TranscriptConnectorError::UnknownRecordKind`]
-/// quotes, in characters. The type comes from the file, so it is bounded.
+/// quotes, or [`ParsedTranscriptV1::unknown_kinds`] carries, in characters.
+/// The type comes from the file, so it is bounded.
 const MAX_QUOTED_RECORD_KIND_CHARS: usize = 64;
 
-/// Just the `type` of a line, read to explain why the line was refused.
+/// Most distinct unknown kind names one parse reports.
+///
+/// Past this bound a new name is still counted in
+/// [`ParsedTranscriptV1::records_unknown_skipped`] but not named, so a file
+/// that invents a type per line cannot grow the report without bound.
+pub const MAX_REPORTED_UNKNOWN_KINDS: usize = 8;
+
+/// Just the `type` of a line and whether it carries a `message`, read to
+/// decide what a line that is not a known transcript record is.
 #[derive(Deserialize)]
 struct TranscriptRecordKindProbe {
     #[serde(rename = "type")]
     kind: String,
+    #[serde(default)]
+    message: Option<serde_json::Value>,
 }
 
-/// Why a line that did not decode as a transcript record was refused: an
-/// object whose `type` names no kind in the closed set is an unknown record
-/// kind, named so an operator can see which kind stopped the source; anything
-/// else is malformed.
-fn refuse_line(context: &LineContext<'_>, line: &[u8]) -> TranscriptConnectorError {
+/// Decide what a line that did not decode as a transcript record is.
+///
+/// An object whose `type` names no kind in the closed set is an unknown
+/// record kind. If it carries a `message` it might hold a turn this parser
+/// cannot read, so it is refused, naming the type so an operator can see
+/// which kind stopped the source. If it carries no `message` it cannot hold a
+/// turn, so it is skipped and named. Anything else is malformed.
+fn classify_unknown(context: &LineContext<'_>, line: &[u8]) -> TranscriptConnectorResult<LineKind> {
     let unknown_kind = serde_json::from_slice::<TranscriptRecordKindProbe>(line)
         .ok()
         .filter(|probe| {
@@ -562,28 +704,34 @@ fn refuse_line(context: &LineContext<'_>, line: &[u8]) -> TranscriptConnectorErr
             ))
             .is_err()
         });
-    match unknown_kind {
-        Some(probe) => TranscriptConnectorError::UnknownRecordKind {
-            source_id: context.source_id.to_owned(),
-            line_ordinal: context.line_ordinal,
-            kind: probe
-                .kind
-                .chars()
-                .take(MAX_QUOTED_RECORD_KIND_CHARS)
-                .collect(),
-        },
-        None => malformed(
+    let Some(probe) = unknown_kind else {
+        return Err(malformed(
             context.source_id,
             context.line_ordinal,
             "line is not a transcript record",
-        ),
+        ));
+    };
+    let kind: String = probe
+        .kind
+        .chars()
+        .take(MAX_QUOTED_RECORD_KIND_CHARS)
+        .collect();
+    if probe.message.is_some() {
+        return Err(TranscriptConnectorError::UnknownRecordKind {
+            source_id: context.source_id.to_owned(),
+            line_ordinal: context.line_ordinal,
+            kind,
+        });
     }
+    Ok(LineKind::SkippedUnknown(kind))
 }
 
 /// Decode one framed line and decide what it is.
 fn classify_line(context: &LineContext<'_>, line: &[u8]) -> TranscriptConnectorResult<LineKind> {
-    let record: TranscriptRecordV1 =
-        serde_json::from_slice(line).map_err(|_| refuse_line(context, line))?;
+    let record: TranscriptRecordV1 = match serde_json::from_slice(line) {
+        Ok(record) => record,
+        Err(_) => return classify_unknown(context, line),
+    };
     let role = match record.kind {
         TranscriptRecordKind::User => TranscriptRoleV1::User,
         TranscriptRecordKind::Assistant => TranscriptRoleV1::Assistant,
@@ -599,7 +747,16 @@ fn classify_line(context: &LineContext<'_>, line: &[u8]) -> TranscriptConnectorR
         | TranscriptRecordKind::Attachment
         | TranscriptRecordKind::FileHistorySnapshot
         | TranscriptRecordKind::FileHistoryDelta
-        | TranscriptRecordKind::CostState => return Ok(LineKind::Skipped),
+        | TranscriptRecordKind::CostState
+        | TranscriptRecordKind::AgentName
+        | TranscriptRecordKind::Started
+        | TranscriptRecordKind::Result
+        | TranscriptRecordKind::Relocated
+        | TranscriptRecordKind::Failed
+        | TranscriptRecordKind::Launched
+        | TranscriptRecordKind::ContinuedIn
+        | TranscriptRecordKind::WorktreeState
+        | TranscriptRecordKind::ForkContextRef => return Ok(LineKind::Skipped),
     };
     Ok(build_turn(context, record, role)?
         .map_or(LineKind::Skipped, |turn| LineKind::Turn(Box::new(turn))))
@@ -657,6 +814,8 @@ pub fn parse_transcript(
 
     let mut turns = Vec::new();
     let mut skipped_records = 0_u32;
+    let mut records_unknown_skipped = 0_u32;
+    let mut unknown_kinds: Vec<String> = Vec::new();
     let mut ordinal = first_ordinal;
     let mut line_ordinal = 0_u32;
     let mut offset = 0_usize;
@@ -713,13 +872,28 @@ pub fn parse_transcript(
             },
             line,
         )?;
-        let LineKind::Turn(turn) = classified else {
-            skipped_records = skipped_records
-                .checked_add(1)
-                .ok_or_else(|| malformed(source_id, line_ordinal, "skip count overflow"))?;
-            consumed = next;
-            offset = next;
-            continue;
+        let turn = match classified {
+            LineKind::Turn(turn) => turn,
+            LineKind::Skipped | LineKind::SkippedUnknown(_) => {
+                skipped_records = skipped_records
+                    .checked_add(1)
+                    .ok_or_else(|| malformed(source_id, line_ordinal, "skip count overflow"))?;
+                if let LineKind::SkippedUnknown(kind) = classified {
+                    records_unknown_skipped = records_unknown_skipped
+                        .checked_add(1)
+                        .ok_or_else(|| malformed(source_id, line_ordinal, "skip count overflow"))?;
+                    // Sorted and deduplicated as it grows; a name past the
+                    // bound is counted above but not kept.
+                    if unknown_kinds.len() < MAX_REPORTED_UNKNOWN_KINDS
+                        && let Err(slot) = unknown_kinds.binary_search(&kind)
+                    {
+                        unknown_kinds.insert(slot, kind);
+                    }
+                }
+                consumed = next;
+                offset = next;
+                continue;
+            }
         };
         turns.push(*turn);
         if turns.len() > MAX_TURNS_PER_BATCH {
@@ -739,6 +913,8 @@ pub fn parse_transcript(
     Ok(ParsedTranscriptV1 {
         turns,
         skipped_records,
+        records_unknown_skipped,
+        unknown_kinds,
         consumed_bytes: u64::try_from(consumed)
             .map_err(|_| malformed(source_id, line_ordinal, "consumed offset is out of range"))?,
         consumed_lines: line_ordinal,

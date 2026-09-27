@@ -97,11 +97,14 @@ fn an_unparseable_line_fails_the_whole_batch_closed() {
 }
 
 #[test]
-fn an_unknown_record_type_is_refused_rather_than_skipped() {
+fn an_unknown_record_type_carrying_a_message_is_refused() {
+    // A message object might hold a turn this parser cannot read, so the
+    // record is refused rather than skipped; without one it would be skipped
+    // (see `an_unknown_record_type_without_a_message_is_skipped_and_named`).
     let bytes = format!(
         "{}\n{}\n",
         line("user", "turn-1", "2026-08-15T12:30:00.000Z", "hello"),
-        r#"{"type":"telemetry","sessionId":"s","uuid":"u"}"#
+        r#"{"type":"telemetry","sessionId":"s","uuid":"u","message":{"role":"telemetry","content":[]}}"#
     );
     let error = parse_transcript("s", bytes.as_bytes(), 0, 0).unwrap_err();
     // The refusal names the kind, so an operator can see which new record
@@ -121,12 +124,77 @@ fn an_unknown_record_type_is_refused_rather_than_skipped() {
 #[test]
 fn an_unknown_record_type_is_quoted_within_a_bound() {
     let long = "x".repeat(10_000);
-    let bytes = format!(r#"{{"type":"{long}"}}"#) + "\n";
+    let bytes =
+        format!(r#"{{"type":"{long}","message":{{"role":"telemetry","content":[]}}}}"#) + "\n";
     let error = parse_transcript("s", bytes.as_bytes(), 0, 0).unwrap_err();
     let TranscriptConnectorError::UnknownRecordKind { kind, .. } = error else {
         panic!("expected an unknown record kind, got {error:?}");
     };
     assert!(kind.len() <= 64);
+}
+
+#[test]
+fn an_unknown_record_type_without_a_message_is_skipped_and_named() {
+    // Generation 4: a record of a kind outside the closed set that carries no
+    // message cannot hold a turn, so it is a counted, NAMED skip rather than a
+    // refusal of the whole file. Numbering continues across it.
+    let bytes = format!(
+        "{}\n{}\n{}\n",
+        line("user", "turn-1", "2026-08-15T12:30:00.000Z", "hello"),
+        r#"{"type":"telemetry-burst","sessionId":"s"}"#,
+        line("assistant", "turn-2", "2026-08-15T12:30:01.000Z", "hi")
+    );
+    let parsed = parse_transcript("s", bytes.as_bytes(), 0, 0).unwrap();
+    assert_eq!(parsed.turns.len(), 2);
+    assert_eq!(parsed.turns[0].ordinal, 0);
+    assert_eq!(parsed.turns[1].ordinal, 1);
+    assert_eq!(
+        parsed.skipped_records, 1,
+        "still counted as a non-turn line"
+    );
+    assert_eq!(parsed.records_unknown_skipped, 1);
+    assert_eq!(parsed.unknown_kinds, vec!["telemetry-burst".to_owned()]);
+    assert_eq!(
+        parsed.consumed_bytes,
+        bytes.len() as u64,
+        "the line is consumed"
+    );
+}
+
+#[test]
+fn unknown_kind_names_are_bounded_and_deduplicated() {
+    // Twelve distinct kinds, one of them repeated, and one absurdly long name:
+    // every one is counted, at most MAX_REPORTED_UNKNOWN_KINDS are named, each
+    // name is cut to the quoting bound, and the names come back sorted.
+    use std::fmt::Write as _;
+    let mut source = String::new();
+    for index in 0..12 {
+        let _ = writeln!(
+            source,
+            r#"{{"type":"kind-{:02}","sessionId":"s"}}"#,
+            11 - index
+        );
+    }
+    source.push_str(r#"{"type":"kind-05","sessionId":"s"}"#);
+    source.push('\n');
+    let long = "y".repeat(10_000);
+    let _ = writeln!(source, r#"{{"type":"{long}","sessionId":"s"}}"#);
+    let parsed = parse_transcript("s", source.as_bytes(), 0, 0).unwrap();
+    assert!(parsed.turns.is_empty());
+    assert_eq!(parsed.skipped_records, 14);
+    assert_eq!(parsed.records_unknown_skipped, 14, "every line is counted");
+    assert_eq!(parsed.unknown_kinds.len(), MAX_REPORTED_UNKNOWN_KINDS);
+    assert_eq!(MAX_REPORTED_UNKNOWN_KINDS, 8);
+    assert!(
+        parsed
+            .unknown_kinds
+            .iter()
+            .all(|kind| kind.chars().count() <= 64)
+    );
+    let mut sorted = parsed.unknown_kinds.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(parsed.unknown_kinds, sorted, "sorted and distinct");
 }
 
 #[test]
@@ -238,9 +306,11 @@ fn a_turn_record_missing_an_identity_field_is_still_refused() {
 
 #[test]
 fn every_session_runtime_record_kind_is_counted_and_none_is_a_turn() {
-    // The exact non-turn kinds a live Claude session file carries. Each must be
-    // a counted skip; an unrecognized kind must still abort (covered by
-    // `an_unknown_record_type_is_refused_rather_than_skipped`).
+    // The exact non-turn kinds a live Claude session file or subagent workflow
+    // journal carries. Each must be a counted skip of a KNOWN kind: none is an
+    // unknown kind, and none is a turn. (An unrecognized kind carrying a
+    // message must still abort — covered by
+    // `an_unknown_record_type_carrying_a_message_is_refused`.)
     let kinds = [
         "mode",
         "permission-mode",
@@ -255,21 +325,42 @@ fn every_session_runtime_record_kind_is_counted_and_none_is_a_turn() {
         "cost-state",
         "system",
         "summary",
+        "agent-name",
+        "result",
+        "relocated",
+        "worktree-state",
+        "failed",
+        "continued-in",
+        "fork-context-ref",
     ];
     let mut source = String::new();
     for kind in kinds {
         use std::fmt::Write as _;
         let _ = writeln!(source, r#"{{"type":"{kind}","sessionId":"s"}}"#);
     }
+    // Two journal records exactly as the runtime writes them: `launched` is
+    // the whole line, and `started` carries no sessionId at all.
+    source.push_str(r#"{"type":"launched"}"#);
+    source.push('\n');
+    source.push_str(
+        r#"{"type":"started","key":"workflow-1","agentId":"a1b2c3","timestamp":"2026-08-15T12:29:59.000Z"}"#,
+    );
+    source.push('\n');
     source.push_str(&line("user", "turn-1", "2026-08-15T12:30:00.000Z", "hello"));
     source.push('\n');
     let parsed = parse_transcript("s", source.as_bytes(), 0, 0).unwrap();
     assert_eq!(parsed.turns.len(), 1);
+    assert_eq!(kinds.len() + 2, 22);
     assert_eq!(
         parsed.skipped_records,
-        u32::try_from(kinds.len()).unwrap(),
+        u32::try_from(kinds.len() + 2).unwrap(),
         "every non-turn kind is counted, never silently dropped"
     );
+    assert_eq!(
+        parsed.records_unknown_skipped, 0,
+        "every kind is a known one"
+    );
+    assert!(parsed.unknown_kinds.is_empty());
 }
 
 #[test]
@@ -369,6 +460,32 @@ fn normalization_applies_exactly_the_declared_rules() {
     assert_eq!(normalize("a\u{0}\u{7}b"), "ab");
     // NFC composition, so two byte spellings of one word normalize alike.
     assert_eq!(normalize("cafe\u{301}"), normalize("caf\u{e9}"));
+    // Generation 4: a noncharacter or private-use scalar folds to a space, so
+    // the words either side stay two words; at an edge it trims away, and a
+    // run with real whitespace collapses to one space.
+    assert_eq!(normalize("a\u{ffff}b"), "a b");
+    assert_eq!(normalize("\u{e000}a\u{e000}"), "a");
+    assert_eq!(normalize("a \u{fdd0} b"), "a b");
+}
+
+#[test]
+fn forbidden_scalars_are_folded_so_a_turn_is_canonically_encodable() {
+    // The property generation 4 exists for: a real session file carried
+    // U+FFFF in a text block, and the canonical encoder refuses noncharacters
+    // and private-use scalars, so the whole window failed at encoding. One
+    // representative of every forbidden range the encoder names.
+    for forbidden in [
+        '\u{ffff}',
+        '\u{e000}',
+        '\u{fdd0}',
+        '\u{10ffff}',
+        '\u{1fffe}',
+        '\u{f0000}',
+    ] {
+        let normalized = normalize(&format!("left {forbidden} right"));
+        assert_eq!(normalized, "left right", "U+{:04X}", u32::from(forbidden));
+        ostk_fleet_recall_canonical_probe(&normalized);
+    }
 }
 
 #[test]
@@ -395,10 +512,18 @@ fn every_parser_key_validates_and_is_a_distinct_identity() {
     let first = transcript_parser_key_v1();
     let second = transcript_parser_key_v2();
     let third = transcript_parser_key_v3();
-    for key in [&first, &second, &third] {
+    let fourth = transcript_parser_key_v4();
+    for key in [&first, &second, &third, &fourth] {
         key.validate().unwrap();
     }
-    for (older, newer) in [(&first, &second), (&first, &third), (&second, &third)] {
+    for (older, newer) in [
+        (&first, &second),
+        (&first, &third),
+        (&first, &fourth),
+        (&second, &third),
+        (&second, &fourth),
+        (&third, &fourth),
+    ] {
         assert_ne!(older, newer);
         assert_ne!(
             older.key_digest().unwrap().digest(),
@@ -411,12 +536,38 @@ fn every_parser_key_validates_and_is_a_distinct_identity() {
         second.declared_normalization_rules,
         third.declared_normalization_rules
     );
+    assert_eq!(fourth.declared_normalization_rules.len(), 6);
+    assert_eq!(
+        fourth.declared_normalization_rules.last(),
+        Some(&NormalizationRuleV1::ForbiddenScalarFold)
+    );
     // The retired keys keep their own versions; the production key is the
     // parser's current one, so a behaviour change is visible as an identity
     // change rather than happening underneath the old identity.
     assert_eq!(first.parser_version, 1);
     assert_eq!(second.parser_version, 2);
-    assert_eq!(third.parser_version, TRANSCRIPT_PARSER_VERSION);
+    assert_eq!(third.parser_version, 3);
+    assert_eq!(fourth.parser_version, TRANSCRIPT_PARSER_VERSION);
+}
+
+#[test]
+fn retired_labels_are_frozen() {
+    // A turn ingested under a retired generation carries that generation's
+    // configuration digest inside its immutable revision. These digests are
+    // SHA-256 of the exact label bytes and must never move: a change here is
+    // a change to the identity of every turn already in the ledger.
+    assert_eq!(
+        transcript_parser_key_v1().configuration_digest.to_hex(),
+        "278afd292e0fef3a93f5734a96a59fcb99a2eddb3e5612d5209d19beecc40c69"
+    );
+    assert_eq!(
+        transcript_parser_key_v2().configuration_digest.to_hex(),
+        "b7166c1bc8ccd39090780d645f7b802f6effeb2e175e68cb99fd2ba21ef1251b"
+    );
+    assert_eq!(
+        transcript_parser_key_v3().configuration_digest.to_hex(),
+        "d5b63ab39eb361e2774ae73ad9d874d5b015ba8689b71f8e6445466a04758186"
+    );
 }
 
 #[test]

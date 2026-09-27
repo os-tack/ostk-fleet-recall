@@ -1,7 +1,7 @@
 //! Unit tests for the collection pipeline — above all, the security boundary:
 //! secret-shaped content never becomes an outbox row.
 
-use super::super::parser::transcript_parser_key_v1;
+use super::super::parser::{transcript_parser_key_v1, transcript_parser_key_v4};
 use super::super::test_fixture::{
     PLANTED_KEY_MATERIAL, PLANTED_REDACTABLE_SECRET, active_package, binding, clean_transcript,
     clocks, line, secret_transcript,
@@ -353,6 +353,87 @@ fn a_malformed_line_stages_nothing_and_advances_nothing() {
         error,
         TranscriptConnectorError::MalformedTranscript { .. }
     ));
+}
+
+/// Collect under the CURRENT parser key, whose generation-4 rules the two
+/// tests below depend on.
+fn collect_v4(transcript: &str) -> (TranscriptBatchV1, TranscriptCollectionStatsV1) {
+    let active = active_package();
+    collect_batch(&TranscriptCollectionRequestV1 {
+        active: &active,
+        binding: &binding(),
+        guarantee: &guarantee(),
+        parser_key: &transcript_parser_key_v4(),
+        source_id: "session.jsonl",
+        bytes: transcript.as_bytes(),
+        cursor: None,
+        clocks: &clocks(),
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_turn_carrying_a_noncharacter_is_staged_rather_than_refusing_the_window() {
+    // The real defect: one U+FFFF inside a text block failed the canonical
+    // encoding of that turn, and because collection is all-or-nothing, the
+    // whole window staged nothing. Generation 4 folds the scalar to a space.
+    let transcript = format!(
+        "{}\n{}\n",
+        line(
+            "user",
+            SESSION,
+            "turn-1",
+            "2026-08-15T12:30:00.000Z",
+            "ok\u{ffff}bad"
+        ),
+        line(
+            "assistant",
+            SESSION,
+            "turn-2",
+            "2026-08-15T12:30:01.000Z",
+            "a clean reply"
+        )
+    );
+    let (batch, stats) = collect_v4(&transcript);
+    assert_eq!(batch.rows.len(), 2);
+    assert_eq!(stats.turns_staged, 2);
+    let payload = String::from_utf8(batch.rows[0].canonical_payload.clone()).unwrap();
+    assert!(payload.contains("ok bad"), "{payload}");
+    assert!(!payload.contains('\u{ffff}'));
+}
+
+#[test]
+fn an_unknown_messageless_record_is_counted_and_named_in_the_stats() {
+    let transcript = format!(
+        "{}\n{}\n{}\n",
+        line(
+            "user",
+            SESSION,
+            "turn-1",
+            "2026-08-15T12:30:00.000Z",
+            "the first turn"
+        ),
+        r#"{"type":"telemetry-burst","sessionId":"s"}"#,
+        line(
+            "assistant",
+            SESSION,
+            "turn-2",
+            "2026-08-15T12:30:01.000Z",
+            "the second turn"
+        )
+    );
+    let (batch, stats) = collect_v4(&transcript);
+    let ordinals: Vec<u32> = batch.rows.iter().map(|row| row.turn_ordinal).collect();
+    assert_eq!(ordinals, vec![0, 1], "the skipped record takes no ordinal");
+    assert_eq!(stats.records_skipped, 1);
+    assert_eq!(stats.records_unknown_skipped, 1);
+    assert_eq!(stats.unknown_kinds, vec!["telemetry-burst".to_owned()]);
+    assert_eq!(batch.cursor.next_ordinal, 2);
+    assert_eq!(
+        batch.cursor.byte_offset,
+        u64::try_from(transcript.len()).unwrap(),
+        "the skipped line is consumed"
+    );
 }
 
 #[test]

@@ -87,9 +87,10 @@ pub use outbox::{
     TranscriptOutboxRepository, TranscriptOutboxRowV1, TranscriptOutboxStateV1,
 };
 pub use parser::{
-    MAX_TRANSCRIPT_BYTES, MAX_TURNS_PER_BATCH, ParsedTranscriptV1, ParsedTurnV1,
-    TRANSCRIPT_PARSER_VERSION, TranscriptRoleV1, parse_transcript, transcript_parser_key_v1,
-    transcript_parser_key_v2, transcript_parser_key_v3,
+    MAX_REPORTED_UNKNOWN_KINDS, MAX_TRANSCRIPT_BYTES, MAX_TURNS_PER_BATCH, ParsedTranscriptV1,
+    ParsedTurnV1, TRANSCRIPT_PARSER_VERSION, TranscriptRoleV1, parse_transcript,
+    transcript_parser_key_v1, transcript_parser_key_v2, transcript_parser_key_v3,
+    transcript_parser_key_v4,
 };
 // The redactor is the crate's one secret boundary (`crate::redaction`); it is
 // re-exported here because the transcript connector is where it was first
