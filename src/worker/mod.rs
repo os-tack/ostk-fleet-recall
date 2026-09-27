@@ -304,6 +304,13 @@ pub struct WorkerSourceReportV1 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub counters: WorkerCountersV1,
+    /// Record `type` names a transcript source skipped because they are
+    /// outside the parser's closed set and carried no `message`: sorted,
+    /// distinct, at most eight (the parser's own bound). Counted under
+    /// `records_unknown_skipped`. Always empty for a git, CI, or collector
+    /// source, and omitted from the printed report when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped_kinds: Vec<String>,
 }
 
 /// One step's outcome in one tick.

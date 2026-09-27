@@ -409,6 +409,7 @@ impl CollectorPasses<'_> {
                 outcome,
                 error,
                 counters,
+                skipped_kinds: Vec::new(),
             },
             recorded,
         )
@@ -754,6 +755,7 @@ mod tests {
             outcome,
             error: (outcome == WorkerSourceOutcomeV1::Failed).then(|| "boom".to_owned()),
             counters: zeroed(&COLLECTOR_COUNTERS),
+            skipped_kinds: Vec::new(),
         }
     }
 

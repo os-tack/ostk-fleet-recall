@@ -523,10 +523,19 @@ window fails that file's source, naming the byte offset, until the group's
 `window_bytes` is raised past the line; nothing after it is read meanwhile.
 Turns staged from earlier windows are still admitted. The parser admits the
 `user` and `assistant` turns of a Claude session file and counts every
-bookkeeping record kind it knows (such as `system`, `attachment`, and
-`cost-state`) as skipped. A record of any other `type` fails that file's
-source the same way, naming the type, until a release of the parser admits
-it.
+bookkeeping record kind it knows as skipped: the session kinds (such as
+`system`, `attachment`, `cost-state`, `relocated`, `worktree-state`, and
+`continued-in`) and the subagent workflow journal kinds (`started`, `result`,
+`failed`, `launched`, `agent-name`, and `fork-context-ref`). A record of any
+other `type` that carries no `message` is skipped too, counted under
+`records_unknown_skipped`, and named in the source's `skipped_kinds` (at most
+8 names); one that carries a `message` fails that file's source the same way
+as a line longer than the window, naming the type, until a release of the
+parser admits it. Turn text is folded so it is always canonically encodable:
+whitespace collapses, control scalars are dropped, and noncharacters and
+private-use scalars become a space; the turn's source span still names the
+raw bytes. Turns already staged keep their generation-3 parser identity;
+turns staged after this release carry generation 4.
 
 A CI source reads at most 512 settled runs per tick, starting after its
 highest recorded window, or at its `first_run_number` (1 by default) when that

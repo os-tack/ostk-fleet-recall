@@ -58,7 +58,7 @@ use ostk_fleet_recall::connectors::transcript::{
     TranscriptCollectionRequestV1, TranscriptConnectorBindingV1, TranscriptCoverageBindingV1,
     TranscriptDrainModeV1, TranscriptDrainRequest, TranscriptEnqueueOutcome,
     TranscriptIngressClocksV1, TranscriptOutboxRepository, collect_batch, drain_outbox,
-    scan_secrets, transcript_parser_key_v3,
+    scan_secrets, transcript_parser_key_v4,
 };
 use ostk_fleet_recall::control_log::{
     CockroachGenesisRepository, GenesisRepository, TrustedControlScope,
@@ -939,6 +939,8 @@ struct TranscriptIngest {
     passes: u32,
     turns_withheld: u32,
     turns_redacted: u32,
+    records_unknown_skipped: u32,
+    unknown_kinds: BTreeSet<String>,
     classes_detected: Vec<String>,
     completeness: Option<CoverageCompletenessV1>,
 }
@@ -959,7 +961,7 @@ async fn ingest_transcript(memory: &ActivatedMemory, path: &Path) -> TranscriptI
     );
     let guarantee = RedactionGuaranteeV1::from_active_package(&memory.active_transcript)
         .expect("the activated package must promise redaction before the durable outbox");
-    let parser_key = transcript_parser_key_v3();
+    let parser_key = transcript_parser_key_v4();
     let mut instance_coordinates = BTreeMap::new();
     instance_coordinates.insert(
         ContractId::new("provider_installation_id").unwrap(),
@@ -976,6 +978,8 @@ async fn ingest_transcript(memory: &ActivatedMemory, path: &Path) -> TranscriptI
     let mut passes = 0_u32;
     let mut turns_withheld = 0_u32;
     let mut turns_redacted = 0_u32;
+    let mut records_unknown_skipped = 0_u32;
+    let mut unknown_kinds: BTreeSet<String> = BTreeSet::new();
     let mut classes: BTreeSet<String> = BTreeSet::new();
 
     // The parser bounds one BATCH, not the file, so a 9.7 MiB session file is
@@ -1007,6 +1011,8 @@ async fn ingest_transcript(memory: &ActivatedMemory, path: &Path) -> TranscriptI
         counts.skipped += u64::from(stats.records_skipped);
         turns_withheld += stats.turns_withheld;
         turns_redacted += stats.turns_redacted;
+        records_unknown_skipped += stats.records_unknown_skipped;
+        unknown_kinds.extend(stats.unknown_kinds.iter().cloned());
         for class in &stats.classes_detected {
             classes.insert(format!("{class:?}"));
         }
@@ -1083,6 +1089,8 @@ async fn ingest_transcript(memory: &ActivatedMemory, path: &Path) -> TranscriptI
         passes,
         turns_withheld,
         turns_redacted,
+        records_unknown_skipped,
+        unknown_kinds,
         classes_detected: classes.into_iter().collect(),
         completeness,
     }
@@ -1739,6 +1747,21 @@ fn render_report(
         out,
         "| non-turn records counted (skipped) | {} |",
         transcript.counts.skipped
+    );
+    let _ = writeln!(
+        out,
+        "| messageless records of an unknown kind (skipped) / kinds | {} / {} |",
+        transcript.records_unknown_skipped,
+        if transcript.unknown_kinds.is_empty() {
+            "none".to_owned()
+        } else {
+            transcript
+                .unknown_kinds
+                .iter()
+                .map(|kind| format!("`{kind}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
     );
     let _ = writeln!(
         out,

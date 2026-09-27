@@ -3,6 +3,7 @@
 
 use super::super::parser::{
     parse_transcript, transcript_parser_key_v1, transcript_parser_key_v2, transcript_parser_key_v3,
+    transcript_parser_key_v4,
 };
 use super::super::test_fixture::{
     INSTALLATION_COORDINATE, active_package, binding, binding_without_coordinates,
@@ -127,8 +128,16 @@ fn a_different_parser_key_is_a_different_representation() {
     let first = derive(&transcript_parser_key_v1());
     let second = derive(&transcript_parser_key_v2());
     let third = derive(&transcript_parser_key_v3());
+    let fourth = derive(&transcript_parser_key_v4());
 
-    for (older, newer) in [(&first, &second), (&first, &third), (&second, &third)] {
+    for (older, newer) in [
+        (&first, &second),
+        (&first, &third),
+        (&first, &fourth),
+        (&second, &third),
+        (&second, &fourth),
+        (&third, &fourth),
+    ] {
         assert_ne!(older.revision, newer.revision);
         assert_ne!(
             older.candidate.source_fact.canonical_resource_id,
@@ -459,5 +468,9 @@ fn the_representation_key_changes_with_the_parser_key() {
     assert_ne!(
         key_for(&transcript_parser_key_v2()),
         key_for(&transcript_parser_key_v3())
+    );
+    assert_ne!(
+        key_for(&transcript_parser_key_v3()),
+        key_for(&transcript_parser_key_v4())
     );
 }

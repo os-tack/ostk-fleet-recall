@@ -29,9 +29,12 @@ pub enum TranscriptConnectorError {
         reason: &'static str,
     },
     /// A transcript line is a record whose `type` is outside the parser's
-    /// closed record-kind set, typically one the agent runtime added after this
-    /// parser generation. The whole batch is refused, so the source reads no
-    /// further until a parser release admits the kind.
+    /// closed record-kind set AND which carries a `message` object, so it
+    /// might hold a turn this parser cannot read — typically a kind the agent
+    /// runtime added after this parser generation. The whole batch is
+    /// refused, so the source reads no further until a parser release admits
+    /// the kind. (A messageless unknown kind is skipped and counted instead;
+    /// see the parser's `records_unknown_skipped`.)
     #[error(
         "transcript {source_id} line {line_ordinal} is a {kind:?} record, a type this parser does \
          not read; the file is read no further until a parser release admits it"

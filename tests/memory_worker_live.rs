@@ -34,7 +34,7 @@ use common::runtime_role::RuntimeProbeRole;
 use common::worker::{
     BROKEN_TRANSCRIPT_LINE, CI_INSTANCE, COMMIT_WORD, FAILING_STEP_WORD, GIT_INSTANCE, RecordedCi,
     RecordedCiSettledThrough, SECOND_COMMIT_DATE, StubEmbedder, TRANSCRIPT_WORD,
-    WorkerFixture as Fixture, line,
+    UNKNOWN_KIND_TRANSCRIPT_LINE, WorkerFixture as Fixture, line,
 };
 use ostk_fleet_recall::FleetError;
 use ostk_fleet_recall::connectors::ci::MAX_CI_WINDOW_RUNS;
@@ -500,6 +500,67 @@ async fn live_worker_isolates_step_failures_when_configured() {
             .is_empty(),
         "the healthy transcript is still recallable"
     );
+}
+
+#[tokio::test]
+async fn live_worker_skips_and_names_a_messageless_unknown_record_kind_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let owner = common::migrated_pool(&database_url).await;
+    let capabilities = capabilities(&database_url).await;
+    let fixture = Fixture::install(&owner, "worker-skipped-kind").await;
+    // A turn, a record of a kind the parser does not know that carries no
+    // message, and a turn: the source stays healthy, both turns are admitted,
+    // and the report counts and names the skipped kind.
+    std::fs::write(
+        fixture.transcripts.path().join("skipped-kind.jsonl"),
+        format!(
+            "{}\n{UNKNOWN_KIND_TRANSCRIPT_LINE}\n{}\n",
+            line(
+                "user",
+                "skip-1",
+                "2026-08-18T09:00:00.000Z",
+                "where is the quincunx report kept"
+            ),
+            line(
+                "assistant",
+                "skip-2",
+                "2026-08-18T09:00:01.000Z",
+                "under the reports directory"
+            )
+        ),
+    )
+    .unwrap();
+    let directory = tempfile::tempdir().expect("sources directory");
+    let sources = directory.path().join("worker-sources.json");
+    std::fs::write(
+        &sources,
+        serde_json::to_vec_pretty(&fixture.sources_json()).unwrap(),
+    )
+    .unwrap();
+
+    let (outcome, printed) = fixture.run_command(&owner, &capabilities, &sources).await;
+    let report = outcome.expect("a tick with a skipped kind is a healthy tick");
+    assert_all_ok(&report);
+    let source = transcript_source(&report, "skipped-kind.jsonl");
+    assert_eq!(source.outcome, WorkerSourceOutcomeV1::Ok, "{source:?}");
+    assert_eq!(source.error, None);
+    assert_eq!(source.counters["records_unknown_skipped"], 1, "{source:?}");
+    assert_eq!(source.counters["records_skipped"], 1, "{source:?}");
+    assert_eq!(source.counters["appended"], 2, "{source:?}");
+    assert_eq!(source.skipped_kinds, vec!["telemetry-burst".to_owned()]);
+    for other in &report.step(WorkerStepV1::Transcript).unwrap().sources {
+        if other.source != "skipped-kind.jsonl" {
+            assert!(other.skipped_kinds.is_empty(), "{other:?}");
+        }
+    }
+    let parsed = printed_report(&printed, &report);
+    assert!(
+        printed.contains(r#""skipped_kinds":["telemetry-burst"]"#),
+        "the printed line names the kind: {printed}"
+    );
+    assert_eq!(parsed["steps"]["transcript"]["status"], "ok");
 }
 
 /// Append `lines` to one of the fixture's transcript files.
