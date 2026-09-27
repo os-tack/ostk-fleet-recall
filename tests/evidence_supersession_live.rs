@@ -207,6 +207,7 @@ async fn admit_raw_commit(
             max_commits: source.max_commits,
             max_facts: source.max_facts,
             tree_mode: GitTreeScanModeV1::CommitsOnly,
+            exclude: Vec::new(),
         })
         .unwrap();
     let raw_fact = scan
