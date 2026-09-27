@@ -797,6 +797,7 @@ async fn ingest_git(memory: &ActivatedMemory, git_dir: &Path, ref_name: &str) ->
             ref_name: GitRefName::parse(ref_name).unwrap(),
             max_commits: MAX_COMMITS,
             max_facts: MAX_FACTS,
+            exclude: Vec::new(),
             // Commit facts only. Blob-source facts would multiply the walk by
             // the changed-path count of 350 commits for evidence neither
             // question asks about; the omission is reported as a coverage

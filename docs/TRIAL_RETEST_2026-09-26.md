@@ -270,8 +270,9 @@ dense-vote exclusion for git facts stays until re-measured on the new text.
 **Next steps.** Replies on `get` behind an index
 on `thread_root_external_id`; the at-rest supersession pass that rewrites
 pre-profile-3 bodies, for which `redacted_at_read` and the quarantine
-sample are now the worklist (the same nine git facts are re-quarantined on
-every full tick until then); scoping the lexical-tier lag per kind (the
+sample are now the worklist (the same nine git facts were re-quarantined on
+every moved-tip tick until the walk became incremental; they now re-present
+only on a full walk); scoping the lexical-tier lag per kind (the
 body-projection lag is scoped since the self-ingest round below).
 
 ## Self-ingest round, 2026-09-27: the repository in its own memory

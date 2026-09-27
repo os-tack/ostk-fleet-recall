@@ -164,6 +164,9 @@ pub struct GitSourceV1 {
     pub git_dir: PathBuf,
     /// The fully qualified ref to observe, e.g. `refs/heads/main`.
     pub ref_name: String,
+    /// Hard bound on commits walked in one tick: the whole history on a full
+    /// walk, only the commits past the latest receipt's revision on an
+    /// incremental one.
     #[serde(default = "default_git_max_commits")]
     pub max_commits: usize,
     #[serde(default = "default_git_max_facts")]

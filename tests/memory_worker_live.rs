@@ -177,6 +177,17 @@ fn counter(report: &WorkerTickReportV1, step: WorkerStepV1, key: &str) -> u64 {
     report.step(step).expect("every step is reported").counters[key]
 }
 
+/// The outcome of every source of one step, in report order.
+fn source_outcomes(report: &WorkerTickReportV1, step: WorkerStepV1) -> Vec<WorkerSourceOutcomeV1> {
+    report
+        .step(step)
+        .expect("every step is reported")
+        .sources
+        .iter()
+        .map(|source| source.outcome)
+        .collect()
+}
+
 fn assert_all_ok(report: &WorkerTickReportV1) {
     for step in WorkerStepV1::ALL {
         assert_eq!(
@@ -310,6 +321,120 @@ async fn live_worker_second_tick_is_a_replay_when_configured() {
         assert_eq!(outcome, "unchanged", "{instance}");
         assert!(checked, "an unchanged check still counts as checked");
     }
+}
+
+/// The git step walks only the commits past the ref's latest receipt, and a
+/// rewrite of the tip yields the rewritten commit alone, counted as a rewrite
+/// and recorded on the observation's previous target.
+#[tokio::test]
+async fn live_worker_walks_only_new_commits_and_records_a_rewrite_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let fixture = Fixture::install(&pool, "worker-incremental").await;
+    let worker = fixture.worker(&pool, "all").await;
+
+    // Tick 1: no receipt yet, so the two seeded commits are a full walk.
+    let first = worker.run_tick().await;
+    assert_all_ok(&first);
+    assert_eq!(counter(&first, WorkerStepV1::Git, "commits_walked"), 2);
+    assert_eq!(counter(&first, WorkerStepV1::Git, "full_walks"), 1);
+    assert_eq!(counter(&first, WorkerStepV1::Git, "ref_rewritten"), 0);
+
+    // Tick 2: one commit past the receipt's revision.
+    let second = fixture.repository.head();
+    let third = fixture
+        .repository
+        .commit(Some(&second), "add a third commit", THIRD_COMMIT_DATE);
+    let incremental = worker.run_tick().await;
+    assert_all_ok(&incremental);
+    for (key, expected) in [
+        ("commits_walked", 1),
+        ("replayed", 0),
+        ("appended", 2),
+        ("receipts", 1),
+        ("full_walks", 0),
+        ("ref_rewritten", 0),
+    ] {
+        assert_eq!(
+            counter(&incremental, WorkerStepV1::Git, key),
+            expected,
+            "{key}"
+        );
+    }
+    assert_eq!(
+        source_outcomes(&incremental, WorkerStepV1::Git),
+        vec![WorkerSourceOutcomeV1::Ok]
+    );
+
+    // Tick 3: the third commit is reworded in place, so the receipt's
+    // revision is no longer an ancestor of the tip.
+    let rewritten = fixture.repository.commit(
+        Some(&second),
+        "add a third commit, reworded",
+        THIRD_COMMIT_DATE,
+    );
+    assert_ne!(rewritten, third);
+    let rewrite = worker.run_tick().await;
+    assert_all_ok(&rewrite);
+    for (key, expected) in [
+        ("commits_walked", 1),
+        ("ref_rewritten", 1),
+        ("full_walks", 0),
+        ("appended", 2),
+        ("replayed", 0),
+        ("quarantined", 0),
+    ] {
+        assert_eq!(counter(&rewrite, WorkerStepV1::Git, key), expected, "{key}");
+    }
+
+    // Each tick's observation names the target the previous tick saw, and
+    // the first names none.
+    let stored = body_and_lexical_bytes(&pool, &fixture).await;
+    for needle in [
+        format!("target {rewritten} previous_target {third} "),
+        format!("target {third} previous_target {second} "),
+        format!("target {second} observed_at"),
+    ] {
+        assert!(
+            stored.iter().any(|bytes| bytes
+                .windows(needle.len())
+                .any(|window| window == needle.as_bytes())),
+            "no stored text carries {needle:?}"
+        );
+    }
+    // The scope also holds the transcript and CI connectors' events, so
+    // count the git connector's alone.
+    let accepted = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT canonical_event FROM memory_evidence_events \
+         WHERE tenant_id = $1 AND project = $2 AND event_kind = 'evidence.accepted'",
+    )
+    .bind(fixture.installed.scope.tenant_id)
+    .bind(&fixture.installed.scope.project)
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .iter()
+    .filter(|bytes| {
+        let statement: EvidenceStatementV2 = decode_strict(bytes).unwrap();
+        let uri = statement.source_fact.canonical_resource_id.to_string();
+        uri.split(':').nth(4) == Some("git_source_object_version")
+    })
+    .count();
+    assert_eq!(
+        accepted, 7,
+        "three commits, one rewritten commit, and three observations"
+    );
+
+    // Tick 4: the tip is the receipt's revision, so nothing is walked.
+    let unchanged = worker.run_tick().await;
+    assert_all_ok(&unchanged);
+    assert_eq!(counter(&unchanged, WorkerStepV1::Git, "commits_walked"), 0);
+    assert_eq!(
+        source_outcomes(&unchanged, WorkerStepV1::Git),
+        vec![WorkerSourceOutcomeV1::Unchanged]
+    );
 }
 
 /// The literal provider tokens the redaction tick plants: a Slack bot token in

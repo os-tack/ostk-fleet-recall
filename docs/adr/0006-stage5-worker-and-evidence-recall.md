@@ -63,9 +63,16 @@ as the `fleet_writer` login and so runs as `fleet_runtime`, like `serve`
 cursor of an instance says something checkable:
 
 - **git** observes its ref only when the ref's target differs from the
-  revision of the instance's latest receipt; one observation covers `[1, 2)`
-  of a domain whose target is `[1, 2)`, so it is complete. An unmoved ref is
-  `unchanged` and opens no new domain.
+  revision of the instance's latest receipt, and walks
+  `git rev-list <target> ^<revision>`: the receipt's revision is the next
+  tick's exclusion boundary, and the receipt's source manifest covers the
+  commits past it plus the observation. One observation covers `[1, 2)` of a
+  domain whose target is `[1, 2)`, so it is complete. An unmoved ref is
+  `unchanged` and opens no new domain. A ref whose recorded revision the
+  repository no longer has is walked from the root and reported as
+  `full_walks`; a revision that is no longer an ancestor of the target is
+  reported as `ref_rewritten`, and the tick's observation carries it as
+  `previous_target`.
 - **transcript** drains one file's pending turns under a domain whose target
   is `[lowest pending ordinal, next ordinal)`. A tick that stages new turns
   opens a new domain, so the newest cursor says the newest drained slice is
@@ -375,7 +382,7 @@ holds no `DELETE` on them.
   turns every empty answer `unknown` once its sources go stale.
 
 **Deferred.** An `--interval` loop and managed scheduling; `git` and `gh` in
-the production image; changed-path and incremental git scans; supersession
+the production image; changed-path git scans; supersession
 or erasure of bodies admitted before redaction profile 3 (the git ingress
 redactor itself landed with profile 3, see D9); transcript tool-use,
 tool-result, and thinking records;

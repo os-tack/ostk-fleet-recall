@@ -576,10 +576,14 @@ under an older normalization version (`rows_reprojected` in the `lexical`
 and `dense` steps). The same first tick follows any later version, such as
 normalization version 4, which lays a git fact out message first (a snippet
 reads `commit <sha> <message> author …`) and, since it changes no body,
-quarantines nothing. That tick's git step also re-walks each ref from the
-root, so every historical commit whose text is now redacted lands in
-quarantine as a preimage disagreement once: expect a one-time `quarantined`
-count equal to the number of such commits (ADR 0006 D9).
+quarantines nothing. The git step walks only the commits past each ref's
+latest receipt (`commits_walked`; `full_walks` is 1 for a ref with no receipt
+or whose recorded revision has been pruned), so a historical commit whose
+text is now redacted is re-presented, and quarantined as a preimage
+disagreement, only on a full walk: expect a `quarantined` count equal to the
+number of such commits on a full walk and zero on an incremental one (ADR
+0006 D9). A history rewrite shows as `ref_rewritten` = 1, and that tick's ref
+observation names the previous target.
 
 There is no long-running loop, so `--once` is required. Schedule the command
 with cron, a systemd timer, or a scheduled task, and run one worker per scope
@@ -1073,8 +1077,8 @@ ADRs 0005 to 0008 record everything else deferred. The main items are:
   assertion whose predicate allows it; `accepted_event_id` in search and
   conflict projections.
 - **Worker and evidence recall.** A long-running `--interval` loop and
-  managed scheduling; `git` and `gh` in the production image; changed-path and
-  incremental git scans; supersession or erasure of bodies admitted before
+  managed scheduling; `git` and `gh` in the production image; changed-path
+  git scans; supersession or erasure of bodies admitted before
   redaction profile 3 (their bodies stay raw at rest; only the recall text is
   redacted); transcript tool-use,
   tool-result, and thinking records; publication-plane evidence recall (and
