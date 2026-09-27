@@ -940,7 +940,13 @@ async fn live_exact_replay_is_a_no_op_when_configured() {
         .append(&scope.witness, &redelivered, Arc::new(NeverRuns))
         .await
         .unwrap();
-    assert_eq!(replay, AppendOutcome::Replayed { position });
+    assert_eq!(
+        replay,
+        AppendOutcome::Replayed {
+            position,
+            accepted_event_id: redelivered.accepted_event_id(),
+        }
+    );
 
     assert_eq!(
         scoped_count(&pool, "memory_evidence_events", &scope.physical_scope).await,

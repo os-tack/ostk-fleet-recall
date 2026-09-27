@@ -42,7 +42,8 @@ use crate::memory_contracts::common::{AuthenticatedProjectScopeV1, ContractId, H
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::memory_contracts::evidence::AcceptedEventId;
 use crate::memory_contracts::evidence_v2::{
-    EvidenceStatementV2, RegistryHeadBindingV1, StructurallyResolvedConnectorSchemaV2,
+    EvidenceStatementV2, RegistryHeadBindingV1, RepresentationLineageV2,
+    StructurallyResolvedConnectorSchemaV2,
 };
 use crate::memory_contracts::quarantine::MAX_ATTEMPT_COUNT;
 use crate::memory_contracts::relation::{
@@ -149,11 +150,18 @@ pub struct EvidenceDeliveryContextV1 {
     pub attempt_count: u32,
 }
 
-/// The evidence-only identity pair EVENT-01 names.
+/// The evidence-only identity pair EVENT-01 names, plus the representation
+/// this one supersedes when its lineage names one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EvidenceIdentityLinks {
     pub source_fact_id: Sha256Digest,
     pub representation_key: Sha256Digest,
+    /// The digest of the predecessor representation key a `supersedes`
+    /// lineage names; `None` for an `origin` rendering. Stored beside the
+    /// envelope as `predecessor_representation_key_digest` (migration 0037)
+    /// so the classifier and the body projector can seek a successor by the
+    /// predecessor's own semantic object digest.
+    pub predecessor_representation_key: Option<Sha256Digest>,
 }
 
 /// A contract-admitted accepted event ready for exactly one physical append.
@@ -226,6 +234,12 @@ impl AppendableAcceptedEvent {
             evidence_identity: Some(EvidenceIdentityLinks {
                 source_fact_id: statement.source_fact_id.digest(),
                 representation_key: statement.representation_key.digest(),
+                predecessor_representation_key: match &statement.representation.lineage {
+                    RepresentationLineageV2::Origin => None,
+                    RepresentationLineageV2::Supersedes {
+                        predecessor_representation_key,
+                    } => Some(predecessor_representation_key.digest()),
+                },
             }),
             delivery: Some(delivery),
         })

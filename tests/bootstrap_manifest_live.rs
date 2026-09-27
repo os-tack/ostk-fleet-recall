@@ -696,7 +696,13 @@ async fn live_bootstrap_manifest_determinism_replay_and_chain_audit_when_configu
         .append(&scope.witness, &replay_appendable, Arc::new(NeverRuns))
         .await
         .unwrap();
-    assert_eq!(replay_outcome, AppendOutcome::Replayed { position });
+    assert_eq!(
+        replay_outcome,
+        AppendOutcome::Replayed {
+            position,
+            accepted_event_id: replay_appendable.accepted_event_id(),
+        }
+    );
     assert_eq!(
         import_row_count(&pool, &scope.physical_scope).await,
         2,

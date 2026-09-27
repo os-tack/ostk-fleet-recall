@@ -32,8 +32,12 @@ pub enum AppendOutcome {
         /// Shard chain digest after the append.
         chain_digest: Sha256Digest,
     },
-    /// An event with this exact accepted-event ID and byte-identical canonical
-    /// bytes already exists (EVENT-01: exact replay is a no-op).
+    /// The ledger already holds this event: either an event with this exact
+    /// accepted-event ID and byte-identical canonical bytes (EVENT-01: exact
+    /// replay is a no-op), or, for `evidence.accepted` only, a `supersedes`
+    /// successor of the presented representation that attests the same
+    /// governed content (a pre-profile-3 fact re-presented after the at-rest
+    /// supersession pass rewrote it; ADR 0006 D9 amendment of 2026-09-27).
     ///
     /// The projection closure is deliberately NOT re-run: EVENT-03 commits the
     /// projection in the same transaction as the original append, so it is
@@ -42,8 +46,13 @@ pub enum AppendOutcome {
     /// ever had once. A projector that needs to rebuild state must replay from
     /// `memory_evidence_events`, which is the only authority (REPLAY-01).
     Replayed {
-        /// `(epoch, shard, committed offset)` of the original append.
+        /// `(epoch, shard, committed offset)` of the event that stands for
+        /// the presented one.
         position: AppendPositionV1,
+        /// Identity of that event: the presented ID on an exact replay, the
+        /// successor's ID when a successor stood in. A caller that records
+        /// what the ledger made durable cites this, never the ID it computed.
+        accepted_event_id: AcceptedEventId,
     },
     /// The append was refused and a bounded dead-letter receipt was written to
     /// `memory_evidence_quarantine`. No event row was written and the shard

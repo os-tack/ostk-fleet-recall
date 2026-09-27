@@ -28,7 +28,7 @@ use crate::memory_contracts::digest::{
     DigestDomain, Sha256Digest, body_digest, domain_separated_digest,
 };
 use crate::memory_contracts::evidence::AcceptedEventId;
-use crate::memory_contracts::evidence_v2::RegistryHeadBindingV1;
+use crate::memory_contracts::evidence_v2::{EvidenceStatementV2, RegistryHeadBindingV1};
 use crate::memory_contracts::quarantine::{
     BoundedDiagnosticV1, QuarantineReasonV1, QuarantineRecordId, QuarantineRecordV1,
 };
@@ -97,8 +97,77 @@ const SELECT_EVENT_BY_SEMANTIC_OBJECT_SQL: &str = "SELECT event_id \
 const INSERT_EVENT_SQL: &str = "INSERT INTO public.memory_evidence_events (\
      tenant_id, project, epoch_id, shard, committed_offset, event_id, event_schema_version, \
      event_kind, semantic_object_digest, consistency_family, consistency_key_digest, \
-     canonical_event, previous_chain_digest, chain_digest, accepted_at\
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)";
+     canonical_event, previous_chain_digest, chain_digest, accepted_at, \
+     predecessor_representation_key_digest\
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)";
+
+/// The `supersedes` successors of one representation, sought through
+/// migration 0037's `memory_evidence_events_predecessor_key_idx`: a scope
+/// prefix plus the predecessor digest, with every column the walk reads
+/// stored in the index. Bounded per hop; the walk itself is bounded by
+/// [`MAX_SUPERSESSION_DEPTH`].
+const SELECT_SUCCESSORS_BY_PREDECESSOR_SQL: &str = "SELECT event_id, epoch_id, shard, \
+     committed_offset, semantic_object_digest, canonical_event \
+     FROM public.memory_evidence_events \
+     WHERE tenant_id = $1 AND project = $2 AND predecessor_representation_key_digest = $3 \
+       AND event_kind = 'evidence.accepted' LIMIT 8";
+
+/// Successor lookups one preimage-disagreement classification may perform
+/// before it stops walking and quarantines. Each lookup is one index seek;
+/// a representation superseded more than eight times in a row is not a
+/// shape this crate produces, so the bound is a cost ceiling, not a limit
+/// a legitimate delivery can hit.
+pub const MAX_SUPERSESSION_DEPTH: usize = 8;
+
+/// The bounded, non-revisiting frontier of one successor walk.
+///
+/// Pure state so the bound is testable without a database: at most
+/// [`MAX_SUPERSESSION_DEPTH`] digests are ever looked up, and a digest is
+/// looked up once. A stored chain that loops back on itself (a tamper, since
+/// `derive_representation_key_v2` refuses a self-supersede and every key
+/// commits to its predecessor) therefore exhausts the walk instead of
+/// spinning it.
+struct SupersessionWalk {
+    visited: Vec<Sha256Digest>,
+    pending: Vec<Sha256Digest>,
+}
+
+impl SupersessionWalk {
+    fn new(start: Sha256Digest) -> Self {
+        Self {
+            visited: Vec::with_capacity(MAX_SUPERSESSION_DEPTH),
+            pending: vec![start],
+        }
+    }
+
+    /// The next predecessor digest to look up, or `None` when the frontier
+    /// is empty or the lookup budget is spent.
+    fn next(&mut self) -> Option<Sha256Digest> {
+        while let Some(digest) = self.pending.pop() {
+            if self.visited.len() >= MAX_SUPERSESSION_DEPTH {
+                return None;
+            }
+            if self.visited.contains(&digest) {
+                continue;
+            }
+            self.visited.push(digest);
+            return Some(digest);
+        }
+        None
+    }
+
+    /// Queue a successor's own digest so ITS successors are looked up next.
+    fn push(&mut self, digest: Sha256Digest) {
+        if !self.visited.contains(&digest) && !self.pending.contains(&digest) {
+            self.pending.push(digest);
+        }
+    }
+
+    /// How many lookups the walk has performed.
+    const fn lookups(&self) -> usize {
+        self.visited.len()
+    }
+}
 
 const ADVANCE_SHARD_HEAD_SQL: &str = "UPDATE public.memory_evidence_shard_heads \
      SET last_committed_offset = $5, chain_digest = $6, advanced_at = $7 \
@@ -361,8 +430,14 @@ async fn append_in_transaction(
 
     // (e) Replay and integrity classification, strictly before any insert.
     match classify(transaction, scope, appendable, epoch_id, shard).await? {
-        Classification::Replay(position) => {
-            return Ok(AppendAttempt::Outcome(AppendOutcome::Replayed { position }));
+        Classification::Replay {
+            position,
+            accepted_event_id,
+        } => {
+            return Ok(AppendAttempt::Outcome(AppendOutcome::Replayed {
+                position,
+                accepted_event_id,
+            }));
         }
         Classification::Quarantine(reason, message) => {
             let quarantine_id =
@@ -437,7 +512,10 @@ async fn append_in_transaction(
 
 enum Classification {
     Fresh,
-    Replay(AppendPositionV1),
+    Replay {
+        position: AppendPositionV1,
+        accepted_event_id: AcceptedEventId,
+    },
     Quarantine(QuarantineReasonV1, String),
 }
 
@@ -460,7 +538,10 @@ async fn classify(
         if stored_canonical == appendable.canonical_event() {
             // EVENT-01: exact replay is a no-op. The projection already
             // committed with the original append, so it is not re-run.
-            return Ok(Classification::Replay(stored_position(&row)?));
+            return Ok(Classification::Replay {
+                position: stored_position(&row)?,
+                accepted_event_id,
+            });
         }
         // Two different byte strings under one accepted-event ID. The ID is a
         // digest of those very bytes, so this is a stored-ledger tamper or a
@@ -488,7 +569,26 @@ async fn classify(
             let stored_event_id = digest32(row.try_get("event_id")?).map_err(FleetError::from)?;
             // A different accepted-event ID means different canonical bytes by
             // construction, so the same semantic object was asserted twice with
-            // disagreeing preimages (EVENT-01).
+            // disagreeing preimages (EVENT-01) -- unless the stored rendering
+            // has since been superseded by one that attests exactly the
+            // presented content, in which case the presented event IS that
+            // successor's content re-presented under the predecessor's
+            // identity (a pre-profile-3 fact on a full walk after the at-rest
+            // supersession pass), and the successor stands for it. Only an
+            // `evidence.accepted` event carries the identity this walk keys
+            // on; every other kind still quarantines here. The walk costs
+            // nothing on the fresh and exact-replay paths above.
+            if appendable.evidence_identity().is_some()
+                && let Some(replay) = replay_through_successors(
+                    transaction,
+                    scope,
+                    appendable,
+                    appendable.semantic_object_digest(),
+                )
+                .await?
+            {
+                return Ok(replay);
+            }
             return Ok(Classification::Quarantine(
                 QuarantineReasonV1::PreimageDisagreement,
                 format!(
@@ -500,6 +600,52 @@ async fn classify(
         }
     }
     Ok(Classification::Fresh)
+}
+
+/// Walk the `supersedes` successors of `start` (the presented representation
+/// key digest) looking for one whose accepted statement attests the same
+/// governed content as the presented statement. Bounded by
+/// [`MAX_SUPERSESSION_DEPTH`] index seeks; `None` when no such successor
+/// exists within the bound.
+///
+/// Content equality is the whole test: the successor's representation key
+/// differs from the presented one by construction (its lineage names the
+/// predecessor), so what makes the presented event a replay of it is that
+/// both commit to one `canonical_content` identity, digest and length and
+/// media type included. A successor attesting different bytes is walked
+/// through, not accepted.
+async fn replay_through_successors(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: &TrustedControlScope,
+    appendable: &AppendableAcceptedEvent,
+    start: Sha256Digest,
+) -> Result<Option<Classification>> {
+    let presented: EvidenceStatementV2 = decode_strict(appendable.canonical_event())?;
+    let mut walk = SupersessionWalk::new(start);
+    while let Some(predecessor) = walk.next() {
+        let successors: Vec<PgRow> = sqlx::query(SELECT_SUCCESSORS_BY_PREDECESSOR_SQL)
+            .bind(scope.tenant_id())
+            .bind(scope.project())
+            .bind(bytes(predecessor))
+            .fetch_all(&mut **transaction)
+            .await?;
+        for row in &successors {
+            let canonical_event: Vec<u8> = row.try_get("canonical_event")?;
+            let successor: EvidenceStatementV2 = decode_strict(&canonical_event)?;
+            if successor.canonical_content == presented.canonical_content {
+                let accepted_event_id = AcceptedEventId::from_digest(
+                    digest32(row.try_get("event_id")?).map_err(FleetError::from)?,
+                );
+                return Ok(Some(Classification::Replay {
+                    position: stored_position(row)?,
+                    accepted_event_id,
+                }));
+            }
+            walk.push(digest32(row.try_get("semantic_object_digest")?).map_err(FleetError::from)?);
+        }
+    }
+    debug_assert!(walk.lookups() <= MAX_SUPERSESSION_DEPTH);
+    Ok(None)
 }
 
 fn stored_position(row: &PgRow) -> Result<AppendPositionV1> {
@@ -815,6 +961,12 @@ async fn insert_event(
         .bind(bytes(previous_chain_digest))
         .bind(bytes(chain_digest))
         .bind(accepted_at)
+        .bind(
+            appendable
+                .evidence_identity()
+                .and_then(|identity| identity.predecessor_representation_key)
+                .map(bytes),
+        )
         .execute(&mut **transaction)
         .await?;
     if result.rows_affected() != 1 {
@@ -1224,7 +1376,7 @@ mod tests {
 
     /// Every SQL statement this module can execute, by name. The two boundary
     /// tests below iterate this one list; add new statements here.
-    const ALL_SQL: [(&str, &str); 11] = [
+    const ALL_SQL: [(&str, &str); 12] = [
         ("SELECT_AUTHORITY_FENCE_SQL", SELECT_AUTHORITY_FENCE_SQL),
         ("SELECT_AUTHORITY_WITNESS_SQL", SELECT_AUTHORITY_WITNESS_SQL),
         ("SEED_SHARD_HEAD_SQL", SEED_SHARD_HEAD_SQL),
@@ -1235,11 +1387,59 @@ mod tests {
             "SELECT_EVENT_BY_SEMANTIC_OBJECT_SQL",
             SELECT_EVENT_BY_SEMANTIC_OBJECT_SQL,
         ),
+        (
+            "SELECT_SUCCESSORS_BY_PREDECESSOR_SQL",
+            SELECT_SUCCESSORS_BY_PREDECESSOR_SQL,
+        ),
         ("INSERT_EVENT_SQL", INSERT_EVENT_SQL),
         ("ADVANCE_SHARD_HEAD_SQL", ADVANCE_SHARD_HEAD_SQL),
         ("INSERT_QUARANTINE_SQL", INSERT_QUARANTINE_SQL),
         ("AUDIT_EVENT_PAGE_SQL", AUDIT_EVENT_PAGE_SQL),
     ];
+
+    /// The successor walk performs at most [`MAX_SUPERSESSION_DEPTH`] lookups
+    /// and never looks a digest up twice, so a stored chain that loops (a
+    /// tamper) or a fan-out wider than the bound exhausts the walk instead
+    /// of spinning it.
+    #[test]
+    fn the_successor_walk_is_bounded_and_never_revisits() {
+        let digest = |seed: u8| Sha256Digest::from_bytes([seed; 32]);
+
+        let mut walk = SupersessionWalk::new(digest(0));
+        assert_eq!(walk.next(), Some(digest(0)));
+        // A cycle back to the start is dropped, not followed.
+        walk.push(digest(0));
+        assert_eq!(walk.next(), None);
+        assert_eq!(walk.lookups(), 1);
+
+        let mut walk = SupersessionWalk::new(digest(0));
+        let budget = u8::try_from(MAX_SUPERSESSION_DEPTH).unwrap();
+        for seed in 0..budget {
+            assert_eq!(walk.next(), Some(digest(seed)), "lookup {seed}");
+            walk.push(digest(seed + 1));
+        }
+        assert_eq!(walk.lookups(), MAX_SUPERSESSION_DEPTH);
+        assert_eq!(walk.next(), None, "the ninth successor is out of budget");
+
+        let mut walk = SupersessionWalk::new(digest(0));
+        walk.next();
+        for seed in 1..=20 {
+            walk.push(digest(seed));
+        }
+        let mut looked_up = 0;
+        while walk.next().is_some() {
+            looked_up += 1;
+        }
+        assert_eq!(looked_up, MAX_SUPERSESSION_DEPTH - 1);
+        assert!(
+            SELECT_SUCCESSORS_BY_PREDECESSOR_SQL
+                .contains("predecessor_representation_key_digest = $3")
+        );
+        assert!(SELECT_SUCCESSORS_BY_PREDECESSOR_SQL.contains("event_kind = 'evidence.accepted'"));
+        assert!(SELECT_SUCCESSORS_BY_PREDECESSOR_SQL.ends_with("LIMIT 8"));
+        assert!(INSERT_EVENT_SQL.contains("predecessor_representation_key_digest"));
+        assert!(INSERT_EVENT_SQL.ends_with("$16)"));
+    }
 
     #[test]
     fn every_statement_stays_inside_the_runtime_grant_boundary() {

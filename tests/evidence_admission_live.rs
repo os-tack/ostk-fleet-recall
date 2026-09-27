@@ -912,7 +912,13 @@ async fn live_exact_replay_writes_no_second_content_row_when_configured() {
         )
         .await
         .unwrap();
-    assert_eq!(replay, AppendOutcome::Replayed { position });
+    assert_eq!(
+        replay,
+        AppendOutcome::Replayed {
+            position,
+            accepted_event_id: readmitted.statement().accepted_event_id().unwrap(),
+        }
+    );
     assert_eq!(
         scoped_count(&pool, "memory_evidence_events", &scope.physical_scope).await,
         1

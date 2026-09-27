@@ -76,6 +76,15 @@ pub const CLAIM_ITEM_LINKS_SCHEMA_VERSION: i64 = 35;
 /// `collect` step reads no hint, and readiness reports no
 /// `hints_awaiting_fetch`.
 pub const COLLECTOR_INGRESS_SCHEMA_VERSION: i64 = 36;
+/// First schema whose accepted evidence events carry their predecessor
+/// representation key as a seekable column (migration 0037, ADR 0006 D9
+/// amendment of 2026-09-27).
+///
+/// Below it a `supersedes` lineage is still stored inside `canonical_event`
+/// only: the append classifier cannot recognise a re-presented predecessor
+/// as a replay of its successor, the body projector cannot let an erased raw
+/// representation pass, and the at-rest supersession pass refuses to run.
+pub const EVIDENCE_PREDECESSOR_KEY_SCHEMA_VERSION: i64 = 37;
 
 /// Exact application tables reachable from public health/status/recall SQL.
 ///
@@ -415,6 +424,8 @@ const CLAIM_ITEM_LINKS_MIGRATION_SQL: &str =
     include_str!("../../migrations/0035_claim_item_links.sql");
 const COLLECTOR_INGRESS_MIGRATION_SQL: &str =
     include_str!("../../migrations/0036_collector_ingress.sql");
+const EVIDENCE_PREDECESSOR_KEY_MIGRATION_SQL: &str =
+    include_str!("../../migrations/0037_evidence_predecessor_key.sql");
 
 fn successor_transition_migrations() -> [Migration; 5] {
     [
@@ -457,7 +468,7 @@ fn successor_transition_migrations() -> [Migration; 5] {
 }
 
 #[allow(clippy::too_many_lines)] // one registration per migration file, in version order
-fn post_transactional_online_migrations() -> [Migration; 21] {
+fn post_transactional_online_migrations() -> [Migration; 22] {
     [
         Migration::new(
             15,
@@ -670,6 +681,18 @@ fn post_transactional_online_migrations() -> [Migration; 21] {
             // hint queue, ids and digests only) with no foreign key and one
             // index. Runs outside SQLx's transaction wrapper like migrations
             // 0018-0035; MINIMUM_RECALL_SCHEMA_VERSION stays 18.
+            true,
+        ),
+        Migration::new(
+            EVIDENCE_PREDECESSOR_KEY_SCHEMA_VERSION,
+            Cow::Borrowed("evidence predecessor representation key"),
+            MigrationType::Simple,
+            Cow::Borrowed(EVIDENCE_PREDECESSOR_KEY_MIGRATION_SQL),
+            // ADR 0006 D9 amendment. Additive: one nullable column on the
+            // accepted evidence envelope (written by INSERT only, never
+            // backfilled), its shape CHECK, and one scope-prefixed seek
+            // index. Runs outside SQLx's transaction wrapper like migrations
+            // 0018-0036; MINIMUM_RECALL_SCHEMA_VERSION stays 18.
             true,
         ),
     ]
