@@ -325,10 +325,17 @@ async fn live_the_pass_supersedes_a_raw_git_fact_and_its_replay_stops_quarantini
     );
 
     // (2) A full walk re-presents the fact redacted: quarantined, unresolved.
-    let report = fixture.worker(&pool, "ingest").await.run_tick().await;
+    // The same tick projects the fixture's own commits, so the body plane
+    // holds more than the raw body from here on.
+    let report = fixture
+        .worker(&pool, "ingest,project,embed")
+        .await
+        .run_tick()
+        .await;
     assert_eq!(status(&report, WorkerStepV1::Git), WorkerStepStatusV1::Ok);
     assert_eq!(counter(&report, WorkerStepV1::Git, "quarantined"), 1);
     assert_eq!(counter(&report, WorkerStepV1::Git, "facts_redacted"), 1);
+    assert_eq!(status(&report, WorkerStepV1::Bodies), WorkerStepStatusV1::Ok);
     let summary = quarantine_summary(
         &pool,
         fixture.installed.scope.tenant_id,

@@ -40,9 +40,12 @@ ALTER TABLE memory_evidence_events
 
 COMMIT;
 
+-- The primary-key columns (epoch_id, shard, committed_offset) are implicit in
+-- every secondary index, so the walk's position columns need no STORING
+-- clause of their own; the catalog renders only the two explicit ones.
 CREATE INDEX IF NOT EXISTS memory_evidence_events_predecessor_key_idx
     ON memory_evidence_events (tenant_id, project, predecessor_representation_key_digest)
-    STORING (event_id, epoch_id, shard, committed_offset, event_kind);
+    STORING (event_id, event_kind);
 
 COMMIT;
 
@@ -62,7 +65,7 @@ BEGIN
     INTO drifted
     FROM (VALUES
         ('memory_evidence_events',
-            'tenant_id:uuid:NO,project:text:NO,epoch_id:bytea:NO,shard:bigint:NO,committed_offset:bigint:NO,event_id:bytea:NO,event_schema_version:bigint:NO,event_kind:text:NO,semantic_object_digest:bytea:NO,consistency_family:text:NO,consistency_key_digest:bytea:NO,canonical_event:bytea:NO,previous_chain_digest:bytea:NO,chain_digest:bytea:NO,accepted_at:timestamp with time zone:NO,predecessor_representation_key_digest:bytea:YES')
+            'tenant_id:uuid:NO,project:text:NO,epoch_id:bytea:NO,shard:integer:NO,committed_offset:bigint:NO,event_id:bytea:NO,event_schema_version:integer:NO,event_kind:text:NO,semantic_object_digest:bytea:NO,consistency_family:text:NO,consistency_key_digest:bytea:NO,canonical_event:bytea:NO,previous_chain_digest:bytea:NO,chain_digest:bytea:NO,accepted_at:timestamp with time zone:NO,predecessor_representation_key_digest:bytea:YES')
     ) AS expected (relation_name, column_shape)
     WHERE expected.column_shape IS DISTINCT FROM (
         SELECT string_agg(column_object.column_name || ':' || column_object.data_type
@@ -91,7 +94,7 @@ BEGIN
     -- The public catalog renders the index with the current database name,
     -- exactly as migrations 0016 and 0017 assert their own indexes.
     expected_index := format(
-        'CREATE INDEX memory_evidence_events_predecessor_key_idx ON %I.public.memory_evidence_events USING btree (tenant_id ASC, project ASC, predecessor_representation_key_digest ASC) STORING (event_id, epoch_id, shard, committed_offset, event_kind)',
+        'CREATE INDEX memory_evidence_events_predecessor_key_idx ON %I.public.memory_evidence_events USING btree (tenant_id ASC, project ASC, predecessor_representation_key_digest ASC) STORING (event_id, event_kind)',
         pg_catalog.current_database()
     );
 
