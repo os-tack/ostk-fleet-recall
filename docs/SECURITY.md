@@ -445,7 +445,9 @@ derived from them (ADR 0006 D9). Every ingress redacts under one profile
 provider shapes, Stripe included): a transcript turn is redacted before the
 outbox, a git fact's message, author, committer, and path before its ingress
 is built, and the lexical recall text that evidence recall returns is
-redacted again before the row is written. Residual: facts are
+redacted again before the row is written: the recall text of a git fact is
+the fact's fields laid out message first, and it is redacted after
+rendering, before the row is written. Residual: facts are
 content-addressed, so a body admitted before profile 3 stays raw at rest;
 only its recall text is redacted, on the first worker tick after deploy,
 which re-projects every lexical row stored under an older normalization

@@ -252,16 +252,20 @@ merged at `891b1ff` (items), `16060f7` (recall answers), `6b445dd`
 **Decided against, with reasons.** Any-term lexical ranking (CockroachDB
 26.2 has no `ts_rank_cd`, "decide" and "decision" stem apart so it would
 not fix its own example, and one shared word would flip the lexical-anchored
-verdict); readable git snippets (another normalization bump; the auditor
-prefers the raw fact); display names and export permalinks (deliberate);
-replies listed on `get` (needs an index).
+verdict); display names and export permalinks (deliberate); replies listed
+on `get` (needs an index).
 
 **Done since:** `recall(brief)` (`575b971`): with a subject, every current
 claim whose key starts with it, the open conflicts on them, and the health
 of the sources they cite; without one, the scope at a glance (most recently
 changed claims, open conflicts, stale or failed sources, lag, legacy keys,
 quarantine, the absence contract). Its description tells an agent to call
-it first.
+it first. Readable git snippets, first decided against (another
+normalization bump; the auditor preferred the raw fact), then done:
+normalization version 4 renders a git fact message first (`commit <sha>
+<message> author … committer … parents … tree …`); the first tick
+re-projects and re-embeds every row, quarantines nothing, and the
+dense-vote exclusion for git facts stays until re-measured on the new text.
 
 **Next steps.** Replies on `get` behind an index
 on `thread_root_external_id`; the at-rest supersession pass that rewrites

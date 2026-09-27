@@ -71,7 +71,7 @@ question first and then a keyword retry, and graded the best of the two.
 | 5 | Which ticket tracks the absence verdict bug? | partial | 'ticket', 'tracks' and 'bug' are not in the text, so the natural question is lexically empty. The keyword retry is exact. |
 | 6 | Who said in Slack that Granola transcripts should stay off by default? | partial | The retry finds the right people, but only as Slack user ids. Display names are deliberately not kept and users.json is ignored, so 'who' needs an external lookup. |
 | 7 | Who proposed running migrate on every serve replica at startup? | good | Exact hit at rank 1 on the natural question (author id only). |
-| 8 | Which commit added the webhook ingress? | partial | The commit is found only on the keyword retry, behind docs (evidence search cannot filter to git). The git snippet is a raw flattened fact. |
+| 8 | Which commit added the webhook ingress? | partial | The commit is found only on the keyword retry, behind docs (evidence search cannot filter to git). The git snippet is a raw flattened fact. Fixed on 2026-09-26: normalization version 4 renders git facts message first. |
 | 9 | Why was redaction::secrets renamed? | good | Correct commit at #1 on the natural question. |
 | 10 | How often should the memory worker tick, every 5 or 15 minutes? | partial | The disagreement is visible only after a retry, and one side's argument (Priya) is missing because her message lacks the word 'worker'. |
 | 11 | Are there open conflicts between agents right now? | good | Exact, with members, values and lifecycle. |
@@ -149,7 +149,7 @@ question, so an agent cannot walk from the question to the answer (Q4).
 - The default `recall` kind is `chunk`, which searches the seed corpus and claims; docs, Slack, Linear and git need `kind=item` or `kind=evidence`, and an empty chunk answer gives no hint (Q20).
 - Evidence search has no `source` filter, so collected docs crowd out git commits (Q8, Q17).
 - Evidence search returns a superseded version next to the current one.
-- Git snippets are raw flattened facts (`recorded_parents <ts> <email> …`).
+- Git snippets are raw flattened facts (`recorded_parents <ts> <email> …`). Fixed on 2026-09-26: normalization version 4 renders git facts message first.
 - "Who said" answers carry Slack user ids only (display names are deliberately not kept, and the export's `users.json` is ignored).
 - Slack export imports have no permalink, so they cannot be cited by URL; pulled copies can.
 

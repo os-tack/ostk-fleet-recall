@@ -554,6 +554,12 @@ async fn live_evidence_source_filter_scopes_both_lanes_and_the_verdict_when_conf
     );
     assert_eq!(from_git.absence.verdict, AbsenceVerdictV1::Present);
     assert_eq!(from_git.absence.scope, Some(AbsenceScopeV1 { source: git }));
+    // Normalization version 4: a git snippet reads as a commit, its message
+    // within the first line rather than behind the record's identities.
+    let snippet = &from_git.hits[0].snippet;
+    assert!(snippet.starts_with("commit "), "{snippet}");
+    let opening: String = snippet.chars().take(120).collect();
+    assert!(opening.contains(COMMIT_WORD), "{snippet}");
     // The transcript's word is absent from git, and present in sessions.
     let turn_from_git = recall
         .search_from(TRANSCRIPT_WORD, None, 10, Some(git))

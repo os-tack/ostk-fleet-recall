@@ -57,6 +57,11 @@
 //! [`LEXICAL_NORMALIZATION_VERSION`] rises so the old and new texts can never
 //! claim the same identity. A media type this module does not declare is
 //! normalized from its raw bytes exactly as before.
+//!
+//! A git fact is not walked but laid out ([`render_git_fact`]): the kind and
+//! the object it names come first, the decoded message next, and every other
+//! field behind its key as a label, so a snippet of a commit reads
+//! `commit <sha> <message> author …` rather than a record.
 
 use std::borrow::Cow;
 
@@ -79,10 +84,21 @@ use super::error::{RecallProjectionError, RecallProjectionResult};
 /// version 2 added the media-type-aware rendering described above; version 3
 /// redacts with redaction profile 3 (`crate::redaction`), which adds the
 /// provider credential shapes and Stripe keys to the six shared shapes the
-/// recall text was scanned with before. A row stored at an older version is
-/// re-derived by the worker's lexical step (`rows_reprojected`), which is what
-/// redacts the served copy of a body admitted before profile 3.
-pub const LEXICAL_NORMALIZATION_VERSION: u32 = 3;
+/// recall text was scanned with before. Version 4 lays a git fact out instead
+/// of walking it: [`render_git_fact`] puts the kind and the object it names
+/// first (`commit <sha>`, `blob_source <path>`, `ref_observation <ref>`), the
+/// decoded message next, and every other field behind its key as a label
+/// (`author`, `committer`, `parents`, `tree`, `repository`, `ancestry`,
+/// `declared_links`), dropping only `schema_version`, `utc_offset_minutes`,
+/// and a link's constant `verification`. Under version 3 the canonical key
+/// order put the ancestry claim and both identities' timestamps, emails, and
+/// names before the message, so a 600-character snippet opened with some 200
+/// characters of record, and the dense vector was embedded from the same.
+/// Every other media type projects to the same text under a new digest. A row
+/// stored at an older version is re-derived by the worker's lexical step
+/// (`rows_reprojected`) and re-embedded by its dense step; the version-4 tick
+/// changes no body, so it quarantines nothing.
+pub const LEXICAL_NORMALIZATION_VERSION: u32 = 4;
 
 /// Media type of a canonical git provider fact.
 pub const GIT_FACT_MEDIA_TYPE: &str = "application.ostk-git-fact-v1";
@@ -97,8 +113,15 @@ pub const CANONICAL_JSON_MEDIA_TYPE: &str = "application.json";
 /// normalization rather than recursing.
 const MAX_RENDER_DEPTH: u32 = 32;
 
+/// The byte-string fields of a git fact: `GitCommitFactV1::message`,
+/// `GitIdentityV1::{name,email}`, `GitBlobSourceFactV1::path`. Sorted, so
+/// lookup is a binary search.
+const GIT_TEXT_FIELDS: &[&str] = &["email", "message", "name", "path"];
+
 /// A collected-item envelope ([`COLLECTED_ITEM_MEDIA_TYPE`]) is rendered by
 /// its own branch, [`render_collected_item`]: text first, identity skipped.
+/// A git fact of a known kind is laid out by [`render_git_fact`] with the
+/// same declared fields; only a body of an unknown kind reaches the walk.
 ///
 /// Keys whose JSON string value is lowercase hex of verbatim provider bytes,
 /// per media type, sorted so lookup is a binary search.
@@ -108,9 +131,7 @@ const MAX_RENDER_DEPTH: u32 = 32;
 /// object id and is never mangled into bytes it does not mean.
 fn declared_text_fields(media_type: &str) -> Option<&'static [&'static str]> {
     match media_type {
-        // GitCommitFactV1::message, GitIdentityV1::{name,email},
-        // GitBlobSourceFactV1::path.
-        GIT_FACT_MEDIA_TYPE => Some(&["email", "message", "name", "path"]),
+        GIT_FACT_MEDIA_TYPE => Some(GIT_TEXT_FIELDS),
         // Canonical JSON with no byte-string fields: rendering still strips the
         // JSON scaffolding so the turn text dominates its own index entry.
         CANONICAL_JSON_MEDIA_TYPE => Some(&[]),
@@ -240,12 +261,256 @@ fn render_collected_item(body_bytes: &[u8]) -> Option<String> {
     Some(rendered)
 }
 
+/// A parsed git fact: the JSON object one `GitFactV1` serializes to.
+type GitFactObject = serde_json::Map<String, serde_json::Value>;
+
+/// The top-level keys the commit layout places itself, in the order the
+/// layout emits them (`kind` first, `schema_version` dropped). Any other key
+/// is appended by the generic walk.
+const GIT_COMMIT_KEYS: &[&str] = &[
+    "kind",
+    "commit_id",
+    "message",
+    "author",
+    "committer",
+    "parents",
+    "tree_id",
+    "repository",
+    "ancestry",
+    "declared_links",
+    "schema_version",
+];
+/// The top-level keys the blob-source layout places itself.
+const GIT_BLOB_SOURCE_KEYS: &[&str] = &[
+    "kind",
+    "path",
+    "blob_id",
+    "mode",
+    "byte_length",
+    "commit_id",
+    "tree_id",
+    "committed_at",
+    "repository",
+    "schema_version",
+];
+/// The top-level keys the ref-observation layout places itself.
+const GIT_REF_OBSERVATION_KEYS: &[&str] = &[
+    "kind",
+    "ref_name",
+    "target",
+    "previous_target",
+    "observed_at",
+    "observation_seq",
+    "observer",
+    "repository",
+    "schema_version",
+];
+/// An identity (`author`, `committer`) reads name, email, timestamp; its UTC
+/// offset is a number that answers no query.
+const GIT_IDENTITY_FIRST: &[&str] = &["name", "email", "at"];
+const GIT_IDENTITY_SKIP: &[&str] = &["utc_offset_minutes"];
+/// A repository reads its id and installation; its schema version is a
+/// constant.
+const GIT_REPOSITORY_FIRST: &[&str] = &["repository_id", "installation_id"];
+const GIT_REPOSITORY_SKIP: &[&str] = &["schema_version"];
+/// A declared link reads its relation and turn; its verification is the
+/// constant `declared`.
+const GIT_LINK_FIRST: &[&str] = &["relation", "turn_id"];
+const GIT_LINK_SKIP: &[&str] = &["verification"];
+
+/// The leaves of one top-level git field, decoded like the walk decodes them;
+/// empty when the field is absent, `None` at the depth bound.
+fn git_field(fact: &GitFactObject, key: &str) -> Option<String> {
+    let mut leaves = String::new();
+    if let Some(value) = fact.get(key) {
+        render_value(value, GIT_TEXT_FIELDS, Some(key), 1, &mut leaves).then_some(())?;
+    }
+    Some(leaves)
+}
+
+/// Append `label` and `leaves`, or nothing when the field yielded no leaf: a
+/// root commit carries no `parents` label, a fact with no links no
+/// `declared_links` label.
+fn git_labelled(out: &mut String, label: &str, leaves: &str) {
+    if !leaves.is_empty() {
+        push_word(out, label);
+        push_word(out, leaves);
+    }
+}
+
+/// The leaves of one nested object: the keys in `first`, in that order, then
+/// every other key in canonical order except those in `skip`.
+fn git_entries(
+    entries: &GitFactObject,
+    first: &[&str],
+    skip: &[&str],
+    leaves: &mut String,
+) -> Option<()> {
+    for name in first {
+        if let Some(item) = entries.get(*name) {
+            render_value(item, GIT_TEXT_FIELDS, Some(name), 2, leaves).then_some(())?;
+        }
+    }
+    for (name, item) in entries {
+        if first.contains(&name.as_str()) || skip.contains(&name.as_str()) {
+            continue;
+        }
+        render_value(item, GIT_TEXT_FIELDS, Some(name), 2, leaves).then_some(())?;
+    }
+    Some(())
+}
+
+/// The leaves of one top-level field whose value is expected to be an object
+/// (or a list of objects) shaped by `first` and `skip`. A value of any other
+/// shape still contributes its leaves, exactly as the walk would render it.
+fn git_shaped(fact: &GitFactObject, key: &str, first: &[&str], skip: &[&str]) -> Option<String> {
+    let mut leaves = String::new();
+    match fact.get(key) {
+        None => {}
+        Some(serde_json::Value::Object(entries)) => {
+            git_entries(entries, first, skip, &mut leaves)?;
+        }
+        Some(serde_json::Value::Array(items)) => {
+            for item in items {
+                match item {
+                    serde_json::Value::Object(entries) => {
+                        git_entries(entries, first, skip, &mut leaves)?;
+                    }
+                    other => {
+                        render_value(other, GIT_TEXT_FIELDS, Some(key), 2, &mut leaves)
+                            .then_some(())?;
+                    }
+                }
+            }
+        }
+        Some(other) => {
+            render_value(other, GIT_TEXT_FIELDS, Some(key), 1, &mut leaves).then_some(())?;
+        }
+    }
+    Some(leaves)
+}
+
+/// `author <name> <email> <at>` or `committer <name> <email> <at>`.
+fn git_identity(fact: &GitFactObject, key: &str, out: &mut String) -> Option<()> {
+    let leaves = git_shaped(fact, key, GIT_IDENTITY_FIRST, GIT_IDENTITY_SKIP)?;
+    git_labelled(out, key, &leaves);
+    Some(())
+}
+
+/// `repository <repository_id> <installation_id>`.
+fn git_repository(fact: &GitFactObject, out: &mut String) -> Option<()> {
+    let leaves = git_shaped(
+        fact,
+        "repository",
+        GIT_REPOSITORY_FIRST,
+        GIT_REPOSITORY_SKIP,
+    )?;
+    git_labelled(out, "repository", &leaves);
+    Some(())
+}
+
+/// `declared_links <relation> <turn_id> [<relation> <turn_id>…]`.
+fn git_links(fact: &GitFactObject, out: &mut String) -> Option<()> {
+    let leaves = git_shaped(fact, "declared_links", GIT_LINK_FIRST, GIT_LINK_SKIP)?;
+    git_labelled(out, "declared_links", &leaves);
+    Some(())
+}
+
+/// `commit <commit_id> <message> author … committer … parents … tree …
+/// repository … ancestry … declared_links …`.
+fn render_git_commit(fact: &GitFactObject, out: &mut String) -> Option<&'static [&'static str]> {
+    push_word(out, &git_field(fact, "commit_id")?);
+    push_word(out, &git_field(fact, "message")?);
+    git_identity(fact, "author", out)?;
+    git_identity(fact, "committer", out)?;
+    git_labelled(out, "parents", &git_field(fact, "parents")?);
+    git_labelled(out, "tree", &git_field(fact, "tree_id")?);
+    git_repository(fact, out)?;
+    git_labelled(out, "ancestry", &git_field(fact, "ancestry")?);
+    git_links(fact, out)?;
+    Some(GIT_COMMIT_KEYS)
+}
+
+/// `blob_source <path> blob … mode … byte_length … commit … tree …
+/// committed_at … repository …`.
+fn render_git_blob_source(
+    fact: &GitFactObject,
+    out: &mut String,
+) -> Option<&'static [&'static str]> {
+    push_word(out, &git_field(fact, "path")?);
+    git_labelled(out, "blob", &git_field(fact, "blob_id")?);
+    git_labelled(out, "mode", &git_field(fact, "mode")?);
+    git_labelled(out, "byte_length", &git_field(fact, "byte_length")?);
+    git_labelled(out, "commit", &git_field(fact, "commit_id")?);
+    git_labelled(out, "tree", &git_field(fact, "tree_id")?);
+    git_labelled(out, "committed_at", &git_field(fact, "committed_at")?);
+    git_repository(fact, out)?;
+    Some(GIT_BLOB_SOURCE_KEYS)
+}
+
+/// `ref_observation <ref_name> target … previous_target … observed_at …
+/// observation_seq … observer … repository …` (`previous_target` is null
+/// for a first observation, and a null yields no leaf, so its label is
+/// omitted).
+fn render_git_ref_observation(
+    fact: &GitFactObject,
+    out: &mut String,
+) -> Option<&'static [&'static str]> {
+    push_word(out, &git_field(fact, "ref_name")?);
+    git_labelled(out, "target", &git_field(fact, "target")?);
+    git_labelled(out, "previous_target", &git_field(fact, "previous_target")?);
+    git_labelled(out, "observed_at", &git_field(fact, "observed_at")?);
+    git_labelled(out, "observation_seq", &git_field(fact, "observation_seq")?);
+    git_labelled(out, "observer", &git_field(fact, "observer")?);
+    git_repository(fact, out)?;
+    Some(GIT_REF_OBSERVATION_KEYS)
+}
+
+/// The searchable text of one git fact, laid out rather than walked.
+///
+/// A git fact's canonical key order puts its ancestry claim and both
+/// identities' timestamps, emails, and names before its message, so a walked
+/// commit opened with some 200 characters of record before a word a reader
+/// would type. The layout puts the kind and the object it names first
+/// (`commit <sha>`, `blob_source <path>`, `ref_observation <ref>`), the
+/// decoded message next, and every other field behind its key as a label, so
+/// a snippet reads as a commit and a query's word still finds every field.
+/// Only what answers no query is dropped: the constant `schema_version`s, an
+/// identity's `utc_offset_minutes`, and a link's constant `verification`.
+///
+/// Every top-level key the layout does not name is appended by the generic
+/// walk in canonical order, so a field this build does not know is indexed,
+/// not lost. `None` when the body is not an object of a known `kind`, or when
+/// a nested value reaches the depth bound; the caller then falls back to the
+/// walk, and from there to the raw bytes, so every body that indexed before
+/// still indexes.
+fn render_git_fact(value: &serde_json::Value) -> Option<String> {
+    let fact = value.as_object()?;
+    let kind = fact.get("kind")?.as_str()?;
+    let mut out = String::new();
+    push_word(&mut out, kind);
+    let placed = match kind {
+        "commit" => render_git_commit(fact, &mut out)?,
+        "blob_source" => render_git_blob_source(fact, &mut out)?,
+        "ref_observation" => render_git_ref_observation(fact, &mut out)?,
+        _ => return None,
+    };
+    for (name, item) in fact {
+        if placed.contains(&name.as_str()) {
+            continue;
+        }
+        render_value(item, GIT_TEXT_FIELDS, Some(name), 1, &mut out).then_some(())?;
+    }
+    Some(out)
+}
+
 /// The bytes the normalizer runs over for one body.
 ///
-/// A declared media type whose body parses as JSON is rendered; anything else —
-/// an undeclared media type, a body that is not JSON, a body deeper than
-/// [`MAX_RENDER_DEPTH`] — falls back to the raw body bytes, which is the
-/// version-1 behaviour and never loses a body.
+/// A declared media type whose body parses as JSON is rendered — a git fact of
+/// a known kind by its layout ([`render_git_fact`]), any other by the walk;
+/// anything else — an undeclared media type, a body that is not JSON, a body
+/// deeper than [`MAX_RENDER_DEPTH`] — falls back to the raw body bytes, which
+/// is the version-1 behaviour and never loses a body.
 fn searchable_source<'body>(media_type: &str, body_bytes: &'body [u8]) -> Cow<'body, [u8]> {
     if media_type == COLLECTED_ITEM_MEDIA_TYPE {
         return render_collected_item(body_bytes).map_or(Cow::Borrowed(body_bytes), |rendered| {
@@ -258,6 +523,11 @@ fn searchable_source<'body>(media_type: &str, body_bytes: &'body [u8]) -> Cow<'b
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(body_bytes) else {
         return Cow::Borrowed(body_bytes);
     };
+    if media_type == GIT_FACT_MEDIA_TYPE
+        && let Some(rendered) = render_git_fact(&value)
+    {
+        return Cow::Owned(rendered.into_bytes());
+    }
     let mut rendered = String::new();
     if render_value(&value, fields, None, 0, &mut rendered) {
         Cow::Owned(rendered.into_bytes())

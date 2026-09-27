@@ -743,8 +743,8 @@ and the writer login holds the Stage-5 grants (ADR 0006). A search runs the lexi
 and, when the process embeds with the model the dense tier was built with, the
 dense lane (a dense match below the chunk lane's 0.18 cosine floor does not
 count), and hydrates each hit with a bounded snippet of the lexical tier's
-redacted recall text, its media type, and the accepted event that first
-produced its body. Every answer carries readiness (accepted events the body
+redacted recall text (a git fact's snippet begins `commit <sha> <message>`),
+its media type, and the accepted event that first produced its body. Every answer carries readiness (accepted events the body
 projector has not consumed, transcript turns still in the outbox, whether the
 lexical and dense tiers cover every body), each active source's status row and
 newest coverage cursor, and an absence verdict. The verdict is `present` when

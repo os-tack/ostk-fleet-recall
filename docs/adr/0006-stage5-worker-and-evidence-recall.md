@@ -131,7 +131,7 @@ no foreign key and is never granted to the publication reader.
 lexical lane. A hit that matched the query's terms makes it `present`
 (`present_by: lexical`). A dense-only hit makes it `present` only when its
 cosine similarity reaches 0.45 (`present_by: dense`; `both` when a lexical
-hit stands beside it) and its body is not a raw git fact
+hit stands beside it) and its body is not a git fact
 (`application.ostk-git-fact-v1`), which never votes on a dense-only match.
 Any other hit is a *weak neighbour*: it is still listed, counted in
 `weak_neighbours`, and its similarity reported in
@@ -261,7 +261,7 @@ is deferred.
 
 Snippets and fetched text are the lexical tier's text, never the stored body
 bytes: that text is normalized and has every secret-shaped range replaced
-before it is written.
+before it is written. A git fact's text begins `commit <sha> <message>`.
 
 ## D6 — One embedding model per deployment
 
@@ -337,8 +337,11 @@ read bodies, not ciphertext. That table is readable by the writer login
   profile 3 stays raw at rest, and only its recall text is redacted, once the
   worker's lexical step re-projects every row stored under an older
   `LEXICAL_NORMALIZATION_VERSION` (`rows_reprojected` on the first tick after
-  deploy, zero afterwards; the dense step of the same tick re-embeds). On
-  that tick the git step re-walks each ref from the root, and every
+  deploy, zero afterwards; the dense step of the same tick re-embeds). The
+  same tick follows any later bump: version 4 (git facts rendered message
+  first) re-projects and re-embeds every row once, with no quarantine, since
+  the bodies are unchanged. On the profile-3 tick the git step re-walks each
+  ref from the root, and every
   historical commit whose text is now redacted re-presents with a different
   payload under the same source-fact identity and is quarantined as a
   `PreimageDisagreement`: a one-time `quarantined` count equal to the number

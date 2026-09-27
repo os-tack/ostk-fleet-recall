@@ -631,7 +631,7 @@ pub enum PresentByV1 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceSourceFilterV1 {
-    /// Raw git facts (`application.ostk-git-fact-v1`).
+    /// Git facts (`application.ostk-git-fact-v1`).
     Git,
     /// Collected item parts (`application.ostk-collected-item-v1`).
     Items,
