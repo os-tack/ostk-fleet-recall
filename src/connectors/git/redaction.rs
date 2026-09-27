@@ -29,11 +29,19 @@
 //! The fact is never dropped: a commit is still evidence that a commit was
 //! made. What changes is its rendering, and with it the content digest and
 //! the accepted-event identity of a fact whose text was redacted. A fact
-//! admitted before this redactor ran keeps its raw body at rest; when the
-//! worker re-walks it (a ref move re-walks from the root) it now re-presents
-//! with a different payload under the same source-fact identity and the
-//! ledger quarantines it as a preimage disagreement — a one-time, visible
-//! `quarantined` count, not a silent rewrite (ADR 0006 D9).
+//! admitted before this redactor ran keeps its raw body at rest until the
+//! at-rest supersession pass (`crate::evidence_supersession`,
+//! `ostk-evidence-supersede`) appends its redacted rendering as a
+//! `supersedes` successor and removes the raw body, its derived rows, and
+//! its content object. When the worker re-walks such a fact (the git step
+//! walks past its latest receipt, so only a full walk re-presents history)
+//! it re-presents with the redacted payload under the raw source-fact and
+//! representation identity; the ledger then looks the successor up by that
+//! identity and, finding one that attests the same content, reports the
+//! fact `replayed`. Until the pass has run, the same re-presentation is a
+//! preimage disagreement: a visible `quarantined` count, never a silent
+//! rewrite, and `recall(status)` reports how many of those disagreements a
+//! successor has since resolved (ADR 0006 D9, amendment of 2026-09-27).
 
 use crate::memory_contracts::common::HexBytes;
 use crate::redaction::{

@@ -325,7 +325,7 @@ fn outcome_output(
             position,
             chain_digest,
         } => ("appended", Some(*position), Some(*chain_digest)),
-        AppendOutcome::Replayed { position } => ("exact_replay", Some(*position), None),
+        AppendOutcome::Replayed { position, .. } => ("exact_replay", Some(*position), None),
         AppendOutcome::Quarantined { reason, .. } => {
             return json!({
                 "operation": "apply",

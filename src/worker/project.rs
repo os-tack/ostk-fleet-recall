@@ -85,6 +85,7 @@ pub(super) async fn run_bodies(worker: &MemoryWorker) -> WorkerStepReportV1 {
         Ok(summary) => WorkerStepReportV1::ok(WorkerCountersV1::from([
             ("events_projected", summary.events_projected),
             ("events_unprojectable", summary.events_unprojectable),
+            ("events_superseded_erased", summary.events_superseded_erased),
             ("occurrences_derived", summary.occurrences_derived),
             (
                 "shadow_generations_opened",

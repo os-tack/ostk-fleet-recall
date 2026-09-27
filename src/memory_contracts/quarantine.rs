@@ -131,8 +131,17 @@ pub enum QuarantineReasonV1 {
     /// Arrow transport boundary: two rows in the same batch claimed the same
     /// event position.
     DuplicatePosition,
-    /// Arrow transport boundary: a row's canonical statement bytes disagreed
-    /// with the digest cited by its content reference on revalidation.
+    /// EVENT-01 at the append seam: the presented event's semantic object
+    /// (for evidence, its representation key) is already accepted under a
+    /// different accepted-event ID, so the same source fact and representation
+    /// were asserted twice with disagreeing canonical bytes, and no
+    /// `supersedes` successor of that representation attests the presented
+    /// content. A pre-profile-3 git fact re-presented redacted on a full walk
+    /// lands here until the at-rest supersession pass has appended its
+    /// successor; afterwards the same delivery is a replay of that successor,
+    /// and `recall(status)` counts the rows a successor has resolved.
+    /// (Originally also the Arrow transport boundary's name for a row whose
+    /// canonical bytes disagreed with its content reference's digest.)
     PreimageDisagreement,
     /// EVID-05: redaction could not be confirmed complete before the durable
     /// outbox write, so the delivery never reached the outbox.

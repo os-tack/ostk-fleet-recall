@@ -5784,7 +5784,12 @@ async fn live_underscore_and_space_spellings_share_one_claim_key_when_configured
     );
     assert_eq!(
         status.data["quarantine"],
-        json!({ "by_reason": {}, "bound_exceeded": false, "preimage_disagreement_sample": [] })
+        json!({
+            "by_reason": {},
+            "bound_exceeded": false,
+            "preimage_disagreement_sample": [],
+            "resolved_preimage_disagreements": 0,
+        })
     );
     assert!(status.data.get("absence_contract").is_none());
     assert!(

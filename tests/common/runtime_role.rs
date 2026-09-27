@@ -130,6 +130,35 @@ pub const INGRESS_RECEIVER_GRANTS: [(&str, &str); 2] = [
 pub const CLAIM_ITEM_LINK_RUNTIME_GRANTS: [(&str, &str); 1] =
     [("SELECT, INSERT", "public.memory_claim_item_links_v1")];
 
+/// Exactly what `deploy/cockroach/supersession-role-grants.sql` gives
+/// `fleet_supersession` MINUS its DELETEs (ADR 0006 D9 amendment): the
+/// migration history and authority view, the ledger append surface, the
+/// content store's insert path, and the body plane read-only. A login
+/// holding this proves the pass fails closed (42501) at its first erase and
+/// appends nothing, since append and erase are one transaction. Keep the
+/// non-DELETE half in step with that file.
+pub const SUPERSESSION_WITHOUT_DELETE_GRANTS: [(&str, &str); 4] = [
+    (
+        "SELECT",
+        "public._sqlx_migrations, public.memory_writer_authority_v1",
+    ),
+    (
+        "SELECT, INSERT",
+        "public.memory_evidence_events, public.memory_evidence_quarantine",
+    ),
+    (
+        "SELECT, INSERT, UPDATE",
+        "public.memory_evidence_shard_heads, public.memory_content_objects",
+    ),
+    (
+        "SELECT",
+        "public.memory_body_objects_v1, public.memory_chunk_occurrences_v1, \
+         public.memory_chunk_occurrence_spans_v1, public.memory_parse_run_manifests_v1, \
+         public.memory_generation_pointers_v1, public.memory_body_lexical_projection_v1, \
+         public.memory_body_dense_projection_v1, public.memory_body_visibility_v1",
+    ),
+];
+
 /// The sequences the same policy lets `fleet_runtime` draw claim, support,
 /// and conflict IDs from.
 pub const RUNTIME_SEQUENCES: &str = "public.memory_claim_id_seq, \
@@ -185,6 +214,19 @@ impl RuntimeProbeRole {
             owned(&INGRESS_RECEIVER_GRANTS),
             false,
             true,
+        )
+        .await
+    }
+
+    /// A login holding exactly [`SUPERSESSION_WITHOUT_DELETE_GRANTS`]: the
+    /// supersession policy's surface with every DELETE withheld.
+    pub async fn create_supersession_without_delete(owner: &PgPool, database_url: &str) -> Self {
+        Self::create_with(
+            owner,
+            database_url,
+            owned(&SUPERSESSION_WITHOUT_DELETE_GRANTS),
+            false,
+            false,
         )
         .await
     }

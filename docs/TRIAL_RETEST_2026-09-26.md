@@ -268,11 +268,23 @@ re-projects and re-embeds every row, quarantines nothing, and the
 dense-vote exclusion for git facts stays until re-measured on the new text.
 
 **Next steps.** Replies on `get` behind an index
-on `thread_root_external_id`; the at-rest supersession pass that rewrites
-pre-profile-3 bodies, for which `redacted_at_read` and the quarantine
-sample are now the worklist (the same nine git facts were re-quarantined on
-every moved-tip tick until the walk became incremental; they now re-present
-only on a full walk).
+on `thread_root_external_id`; supersession of raw transcript turns (the
+git residual is closed by `ostk-evidence-supersede`; the same nine git facts
+were re-quarantined on every moved-tip tick until the walk became
+incremental, and now replay once superseded).
+
+**Done since (2026-09-27):** the at-rest supersession pass for git facts
+(`ostk-evidence-supersede apply --sources <file>`, module
+`evidence_supersession`, role `fleet_supersession`, migration 0037). It
+appends each raw fact's redacted rendering as a `supersedes` successor and
+removes the raw body, its derived rows, and its content object in one
+transaction; the nine re-quarantined git facts then replay through their
+successors on the next full walk, a full re-projection counts them under
+`events_superseded_erased`, and `recall(status)` reports
+`resolved_preimage_disagreements` instead of warning. Transcript turns
+admitted raw stay raw at rest (the pass counts them as
+`transcript_turns_raw_at_rest`); their `redacted_at_read` markers remain
+the worklist of a later pass.
 
 ## Self-ingest round, 2026-09-27: the repository in its own memory
 

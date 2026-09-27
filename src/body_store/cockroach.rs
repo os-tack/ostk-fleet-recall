@@ -77,6 +77,14 @@ const SELECT_WATERMARK_SQL: &str = "SELECT last_committed_offset FROM \
      public.memory_body_projection_watermarks_v1 \
      WHERE tenant_id = $1 AND project = $2 AND ledger_family = $3 AND shard = $4";
 
+/// Whether a `supersedes` successor of one representation exists: one seek
+/// on migration 0037's predecessor-key index. Consulted only when an event's
+/// content object is missing, so it costs nothing on the ordinary path.
+const SELECT_SUCCESSOR_EXISTS_SQL: &str = "SELECT EXISTS (\
+     SELECT 1 FROM public.memory_evidence_events \
+     WHERE tenant_id = $1 AND project = $2 AND predecessor_representation_key_digest = $3 \
+       AND event_kind = $4)";
+
 const INSERT_BODY_SQL: &str = "INSERT INTO public.memory_body_objects_v1 (\
      tenant_id, project, content_sha256, byte_length, body_bytes, media_type, \
      protection_domain_id, first_accepted_event_id, created_at\
@@ -174,6 +182,10 @@ struct EventOutcome {
     /// The event names a source this projector can never chunk, so it produced
     /// no body rows and only advanced the watermark past itself.
     unprojectable: bool,
+    /// The event's content object is gone and a `supersedes` successor of its
+    /// representation exists: the raw rendering the supersession pass erased.
+    /// No body row; the watermark advanced past it.
+    superseded_erased: bool,
 }
 
 /// Private body-projection repository bound once to physical scope and one
@@ -292,6 +304,8 @@ impl CockroachBodyProjectionRepository {
                 let outcome = self.project_one_event(shard, offset, canonical).await?;
                 if outcome.unprojectable {
                     summary.events_unprojectable += 1;
+                } else if outcome.superseded_erased {
+                    summary.events_superseded_erased += 1;
                 } else {
                     summary.events_projected += 1;
                 }
@@ -355,7 +369,35 @@ impl CockroachBodyProjectionRepository {
         canonical: &[u8],
     ) -> BodyProjectionResult<EventOutcome> {
         let statement: EvidenceStatementV2 = decode_strict(canonical)?;
-        let source_bytes = self.resolver.resolve(&statement).await?;
+        let source_bytes = match self.resolver.resolve(&statement).await {
+            Ok(bytes) => bytes,
+            // The content object is gone. If a `supersedes` successor of this
+            // representation exists, this is the raw rendering the at-rest
+            // supersession pass erased (ADR 0006 D9 amendment): the successor
+            // carries the content the read plane serves, and this event will
+            // never have a body again. Advance the watermark past it and count
+            // it, exactly as an unprojectable event is handled. Without a
+            // successor the absence is still the transient fault it always
+            // was: fail closed and leave the cursor where it is.
+            Err(BodyProjectionError::MissingSourceContent) => {
+                if !self.successor_exists(transaction, &statement).await? {
+                    return Err(BodyProjectionError::MissingSourceContent);
+                }
+                let now: DateTime<Utc> =
+                    sqlx::query_scalar("SELECT pg_catalog.statement_timestamp()")
+                        .fetch_one(&mut **transaction)
+                        .await?;
+                self.advance_watermark(transaction, shard, offset, now)
+                    .await?;
+                return Ok(EventOutcome {
+                    occurrences_derived: 0,
+                    shadow_opened: false,
+                    unprojectable: false,
+                    superseded_erased: true,
+                });
+            }
+            Err(error) => return Err(error),
+        };
         let derived = match derive_parse_run(&statement, &source_bytes, &self.parser_key) {
             Ok(derived) => derived,
             // An event whose canonical resource is not version-form names no
@@ -380,6 +422,7 @@ impl CockroachBodyProjectionRepository {
                     occurrences_derived: 0,
                     shadow_opened: false,
                     unprojectable: true,
+                    superseded_erased: false,
                 });
             }
             Err(error) => return Err(error),
@@ -431,7 +474,25 @@ impl CockroachBodyProjectionRepository {
             occurrences_derived,
             shadow_opened: generation.shadow_opened,
             unprojectable: false,
+            superseded_erased: false,
         })
+    }
+
+    /// Whether the ledger holds a `supersedes` successor of `statement`'s
+    /// representation: the seek that lets an erased raw rendering pass.
+    async fn successor_exists(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        statement: &EvidenceStatementV2,
+    ) -> BodyProjectionResult<bool> {
+        let exists: bool = sqlx::query_scalar(SELECT_SUCCESSOR_EXISTS_SQL)
+            .bind(self.tenant_id)
+            .bind(&self.project)
+            .bind(bytes(statement.representation_key.digest()))
+            .bind(EVIDENCE_ACCEPTED_EVENT_KIND)
+            .fetch_one(&mut **transaction)
+            .await?;
+        Ok(exists)
     }
 
     /// Read the current generation pointer FOR UPDATE and decide this event's

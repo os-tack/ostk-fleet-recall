@@ -238,6 +238,31 @@ role's conditional default cleanup or the cross-database audit. Remove
 membership and disable the login afterward. No Terraform, runtime, image, ECS,
 MCP, or HTTP wiring exists.
 
+The at-rest supersession pass has the same one-shot shape with a different
+surface. Only a cluster admin may apply the database-local
+[`fleet_supersession` policy](../deploy/cockroach/supersession-role-grants.sql),
+after successful prefix 1 through 37 and with the same three prior logical
+roles hardened; it is the conflict policy's gates with the name substituted
+and a thirty-one-row exact grant matrix: SELECT on the migration history,
+the authority view, the ledger, the quarantine, the content store, and the
+eight body-plane tables; INSERT on the ledger, the quarantine, the shard
+heads, and the content store; UPDATE on the shard heads and the content
+store (the `SELECT ... FOR UPDATE` locks); DELETE on the content store and
+the eight body-plane tables. `fleet_runtime` still holds no DELETE on any
+of them, and the accepted envelope is never deleted or updated by either
+role. A separately provisioned login may temporarily receive membership only
+in that `NOLOGIN` logical role for `ostk-evidence-supersede apply`, which
+reads only `FLEET_RECALL_SUPERSESSION_{DATABASE_URL,TENANT_ID,PROJECT}`
+(strict TLS, no local escape), the writer-authority pin group, and
+`FLEET_RECALL_CONTENT_KEK_HEX`: it appends under the active head and opens
+the raw content it rewrites, so it is as sensitive as the worker host. Quiesce
+members, freeze authority changes, and run the cross-database audit before
+every apply and use, as for reconciliation; remove membership and disable the
+login afterward. The local quickstart applies no such policy, and its
+insecure node cannot run the binary (no TLS URL to give it); there the pass
+is reachable only as the library call the connected proof makes as root. No
+Terraform, runtime, image, ECS, MCP, or HTTP wiring exists.
+
 All database URL surfaces require `postgres`/`postgresql`, a hostname, and a
 closed parameter set. Serving and Stage-2 control require exactly
 `sslmode=verify-full` outside the explicit local escape; that escape requires
@@ -451,12 +476,36 @@ rendering, before the row is written. Residual: facts are
 content-addressed, so a body admitted before profile 3 stays raw at rest;
 only its recall text is redacted, on the first worker tick after deploy,
 which re-projects every lexical row stored under an older normalization
-version (`rows_reprojected`). On that tick the git step also re-walks each
-ref from the root, and every historical commit whose text is now redacted
-re-presents with a different payload under the same source-fact identity
-and lands in quarantine as a `PreimageDisagreement`: expect a one-time
-`quarantined` count equal to the number of such commits. Closing that
-residual needs supersession or erasure. Until then it is visible per body
+version (`rows_reprojected`). The git step walks past its latest receipt,
+so a raw pre-profile-3 fact re-presents only on a full walk (a ref that
+moved, or a first tick on a fresh receipt); when it does, it re-presents
+with a different payload under the same source-fact identity and lands in
+quarantine as a `PreimageDisagreement`, a visible `quarantined` count
+rather than a silent rewrite. The at-rest supersession pass
+(`ostk-evidence-supersede apply --sources <file>`, run under the
+`fleet_supersession` role below) closes
+that residual for git facts: for every raw fact it appends the redacted
+rendering as a `supersedes` successor of the raw representation key
+through the same admission seam the git ingress uses, and, in the same
+transaction, removes the raw body, the occurrences, spans, lexical, dense,
+and visibility rows derived from it, its parse-run manifest and generation
+pointer, and its content object (when no other accepted event shares the
+digest). The raw accepted event row stays, digests only, as the tombstone.
+After the pass the same re-presentation is a `replayed` fact: the ledger
+finds the successor by the raw representation's digest (migration 0037's
+`predecessor_representation_key_digest`) and, seeing it attests the same
+content, stands it in; the body projector lets the erased raw event pass
+(`events_superseded_erased`); and `recall(status)` reports the
+disagreements a successor resolved (`quarantine.resolved_preimage_disagreements`),
+warns only about the rest, and drops the resolved ones from the sample.
+What remains: transcript turns (their revision closes over the body digest
+and `memory_transcript_outbox_v1.canonical_payload` keeps a copy; the pass
+counts them as `transcript_turns_raw_at_rest` and leaves them),
+`memory_source_commit_membership_v1` (the raw event's linkage, which names
+revisions and not text), and the raw content object's wrapped key, which is
+deleted with the row rather than nulled (the column is `NOT NULL`); none of
+this is the W0-ERASE fence, which erases by scope and subject rather than
+by profile. Until a fact is superseded the residual is visible per body
 rather than hidden: every text an answer carries runs through the recall
 plane's redaction again at read, and a body that pass removed something
 from says so (`redacted_at_read: {classes, ranges}` on an evidence body and

@@ -376,6 +376,28 @@ after ingest must not run the `project` step, which leaves evidence recall
 nothing to search. Only the owner can delete body rows; `fleet_runtime`
 holds no `DELETE` on them.
 
+**Amendment (2026-09-27).** Two corrections to the residual above. First,
+the git step walks past its latest receipt rather than from the root, so a
+raw pre-profile-3 fact re-presents only on a full walk (a ref that moved, or
+a first tick on a fresh receipt), not on every tick after deploy. Second,
+supersession is now provided, as a separately privileged one-shot pass
+rather than as a worker step: `ostk-evidence-supersede apply` (module
+`evidence_supersession`, role `fleet_supersession`,
+`deploy/cockroach/supersession-role-grants.sql`) appends, for every raw git
+fact, its redacted rendering as a `supersedes` successor of the raw
+representation key through the same admission seam the ingress uses, and in
+the same transaction removes the raw body, the rows derived from it, its
+manifest and generation pointer, and its content object when no other
+accepted event shares the digest; the raw accepted event row stays as the
+tombstone. Migration 0037 stores the predecessor representation key as a
+seekable column so that a re-presented raw fact replays through its
+successor instead of quarantining, the body projector lets the erased raw
+event pass (`events_superseded_erased`), and `recall(status)` counts the
+disagreements a successor resolved. `fleet_runtime` still holds no `DELETE`
+on any body-plane or content table: the DELETEs live only in the pass's
+role. Transcript turns remain raw at rest (counted, not rewritten): their
+revision closes over the body digest and the outbox keeps a copy.
+
 ## Consequences
 
 - An agent can ask whether the fleet's own history, transcripts, or CI runs

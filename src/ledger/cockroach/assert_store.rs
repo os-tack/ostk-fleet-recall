@@ -935,6 +935,7 @@ mod tests {
         let resolution = resolve_append(
             Ok(AppendOutcome::Replayed {
                 position: position(),
+                accepted_event_id: event_id(),
             }),
             None,
         );

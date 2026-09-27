@@ -214,9 +214,16 @@ pub async fn drain_git_facts(
                 report.appended += 1;
                 report.record_durable(fact, accepted_event_id)?;
             }
-            AppendOutcome::Replayed { .. } => {
+            // The ledger names the event that stands for this fact: the one
+            // just computed on an exact replay, or the redacted successor a
+            // re-presented pre-profile-3 fact resolved to. A receipt cites
+            // the ledger's id, never the connector's computation.
+            AppendOutcome::Replayed {
+                accepted_event_id: durable,
+                ..
+            } => {
                 report.replayed += 1;
-                report.record_durable(fact, accepted_event_id)?;
+                report.record_durable(fact, durable)?;
             }
             // No event row exists at `accepted_event_id`, so this fact is
             // recorded ONLY as a refusal count. Nothing a receipt reads is

@@ -106,6 +106,14 @@ pub struct ProjectionRunSummaryV1 {
     /// identity form — a deployment fact an operator must see, which is why it
     /// is a named field and not an absence.
     pub events_unprojectable: u64,
+    /// Accepted evidence events consumed in this pass whose governed content
+    /// object is gone AND whose representation has a `supersedes` successor
+    /// in the ledger: the raw rendering of a fact the at-rest supersession
+    /// pass rewrote (ADR 0006 D9 amendment). The successor carries the
+    /// content the read plane serves, so the raw event produces no body and
+    /// only advances the watermark past itself. A missing content object
+    /// WITHOUT a successor is still the fatal `MissingSourceContent`.
+    pub events_superseded_erased: u64,
     /// Occurrence rows the pass derived (including idempotent re-derivations).
     pub occurrences_derived: u64,
     /// Shadow generations opened in this pass (a parser upgrade per source).
