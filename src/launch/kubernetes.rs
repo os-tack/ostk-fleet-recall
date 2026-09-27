@@ -26,7 +26,7 @@ fn secret(spec: &SandboxSpecV1, suffix: &str, env: &BTreeMap<String, String>) ->
     json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":format!("{}-{suffix}",spec.name),"namespace":spec.namespace,"labels":{"app.kubernetes.io/managed-by":"fleet-recall-launch"}},"type":"Opaque","immutable":true,"data":data})
 }
 
-pub fn manifest(spec: &SandboxSpecV1) -> Value {
+pub fn manifest(spec: &SandboxSpecV1) -> anyhow::Result<Value> {
     let security = json!({"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}});
     let mut pod_spec = json!({
         "restartPolicy":"Never", "enableServiceLinks":false, "automountServiceAccountToken":false,
@@ -48,7 +48,27 @@ pub fn manifest(spec: &SandboxSpecV1) -> Value {
     if let Some(class) = &spec.runtime_class {
         pod_spec["runtimeClassName"] = json!(class);
     }
-    json!({"apiVersion":"v1","kind":"List","items":[secret(spec,"agent-env",&spec.env),secret(spec,"shipper-env",&spec.shipper_env),{"apiVersion":"v1","kind":"Pod","metadata":{"name":spec.name,"namespace":spec.namespace,"labels":{"app.kubernetes.io/managed-by":"fleet-recall-launch"}},"spec":pod_spec}]})
+    let mut items = vec![
+        secret(spec, "agent-env", &spec.env),
+        secret(spec, "shipper-env", &spec.shipper_env),
+    ];
+    if let Some(path) = &spec.ca_path {
+        let bytes = crate::client_tls::read_ca_bundle(path)?;
+        let config_name = format!("{}-recall-ca", spec.name);
+        pod_spec["volumes"]
+            .as_array_mut()
+            .expect("constructed volume array")
+            .push(json!({"name":"recall-ca","configMap":{"name":config_name,"defaultMode":292}}));
+        for container in ["containers", "initContainers"] {
+            pod_spec[container][0]["volumeMounts"]
+                .as_array_mut()
+                .expect("constructed mount array")
+                .push(json!({"name":"recall-ca","mountPath":"/etc/fleet-recall","readOnly":true}));
+        }
+        items.push(json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":config_name,"namespace":spec.namespace,"labels":{"app.kubernetes.io/managed-by":"fleet-recall-launch"}},"immutable":true,"binaryData":{"ca.pem":crate::encoding::base64::encode(&bytes)}}));
+    }
+    items.push(json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":spec.name,"namespace":spec.namespace,"labels":{"app.kubernetes.io/managed-by":"fleet-recall-launch"}},"spec":pod_spec}));
+    Ok(json!({"apiVersion":"v1","kind":"List","items":items}))
 }
 
 #[async_trait]
@@ -68,7 +88,7 @@ impl SandboxBackend for KubernetesBackend {
         process::checked(
             &self.program,
             &args,
-            Some(serde_json::to_vec(&manifest(spec))?),
+            Some(serde_json::to_vec(&manifest(spec)?)?),
         )
         .await?;
         Ok(SandboxHandle {
@@ -107,8 +127,21 @@ impl SandboxBackend for KubernetesBackend {
         ]
         .map(str::to_owned);
         let secrets = process::checked(&self.program, &secrets, None).await;
+        let config_name = format!("{}-recall-ca", handle.name);
+        let config = [
+            "delete",
+            "configmap",
+            &config_name,
+            "--namespace",
+            &handle.namespace,
+            "--ignore-not-found=true",
+            "--wait=true",
+            "--timeout=10s",
+        ]
+        .map(str::to_owned);
+        let config = process::checked(&self.program, &config, None).await;
         ensure!(
-            pod.is_ok() && secrets.is_ok(),
+            pod.is_ok() && secrets.is_ok() && config.is_ok(),
             "could not clean up all Kubernetes launch resources"
         );
         Ok(())

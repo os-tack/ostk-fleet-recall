@@ -16,6 +16,14 @@ use uuid::Uuid;
 use crate::auth::{grant::SessionGrant, jose::Ed25519Signer};
 use state::{LaunchState, StateFile};
 
+const SANDBOX_CA_PATH: &str = "/etc/fleet-recall/ca.pem";
+// Three sequential Docker operations each have a 240-second deadline. Grants
+// also cover the shipper's shutdown grace and the verifier's clock leeway.
+const STARTUP_MARGIN_SECONDS: u64 = 720;
+const FLUSH_MARGIN_SECONDS: u64 = 180;
+const CLOCK_MARGIN_SECONDS: u64 = 60;
+const ISSUANCE_MARGIN_SECONDS: u64 = 60;
+
 #[derive(Debug, Subcommand)]
 pub enum LaunchCommandV1 {
     /// Mint scoped grants and start an isolated agent plus transcript shipper.
@@ -87,6 +95,12 @@ pub struct LaunchUpV1 {
     /// MCP URL reachable from this launcher.
     #[arg(long, env = "FLEET_RECALL_URL")]
     pub url: String,
+    /// Additional trusted certificates for Recall only; copied into launch state.
+    #[arg(long, env = "FLEET_RECALL_CA_PATH")]
+    pub ca_path: Option<PathBuf>,
+    /// Permit unencrypted HTTP only for an explicitly chosen development endpoint.
+    #[arg(long, env = "FLEET_RECALL_ALLOW_HTTP")]
+    pub allow_http: bool,
     /// MCP audience; defaults to --url, even when --sandbox-url uses another route.
     #[arg(long)]
     pub resource_url: Option<String>,
@@ -140,6 +154,7 @@ pub struct SandboxSpecV1 {
     pub runtime_class: Option<String>,
     pub namespace: String,
     pub state_dir: PathBuf,
+    pub ca_path: Option<PathBuf>,
     pub shipper_args: Vec<String>,
 }
 
@@ -157,6 +172,22 @@ impl SandboxSpecV1 {
             self.transcript_volume == format!("{}-transcripts", self.name),
             "transcript volume does not match launch name"
         );
+        if let Some(path) = &self.ca_path {
+            ensure!(
+                path.is_absolute() && path == &self.state_dir.join("recall-ca.pem"),
+                "sandbox CA must be the retained launch bundle"
+            );
+            ensure!(
+                path.to_str()
+                    .is_some_and(|value| !value.contains([',', '\n', '\r', '\0'])),
+                "sandbox CA path is not safe for a bind mount"
+            );
+            ensure!(
+                std::fs::symlink_metadata(path)?.is_file(),
+                "retained CA must be a regular file"
+            );
+            crate::client_tls::read_ca_bundle(path)?;
+        }
         Ok(())
     }
 }
@@ -231,9 +262,15 @@ fn validate_up(args: &LaunchUpV1) -> anyhow::Result<(Uuid, String)> {
         args.backend == BackendKind::Kubernetes || args.runtime_class.is_none(),
         "runtime-class requires Kubernetes"
     );
-    validate_url(&args.url)?;
-    validate_url(args.resource_url.as_deref().unwrap_or(&args.url))?;
-    validate_url(args.sandbox_url.as_deref().unwrap_or(&args.url))?;
+    validate_url(&args.url, args.allow_http)?;
+    validate_url(
+        args.resource_url.as_deref().unwrap_or(&args.url),
+        args.allow_http,
+    )?;
+    validate_url(
+        args.sandbox_url.as_deref().unwrap_or(&args.url),
+        args.allow_http,
+    )?;
     ensure!(
         (1..=3600).contains(&args.timeout_seconds),
         "timeout must be 1..3600 seconds"
@@ -241,6 +278,11 @@ fn validate_up(args: &LaunchUpV1) -> anyhow::Result<(Uuid, String)> {
     ensure!(
         (1..=86400).contains(&args.ttl_seconds),
         "grant TTL must be 1..86400 seconds"
+    );
+    ensure!(
+        args.ttl_seconds
+            >= required_remaining_seconds(args.timeout_seconds) + ISSUANCE_MARGIN_SECONDS,
+        "grant TTL must cover the execution timeout plus 1020 seconds for startup, shipping, clock leeway, and issuance"
     );
     ensure!(
         args.task.len() <= 32_768 && !args.task.contains('\0'),
@@ -302,7 +344,7 @@ pub(crate) fn validate_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_url(value: &str) -> anyhow::Result<url::Url> {
+fn validate_url(value: &str, allow_http: bool) -> anyhow::Result<url::Url> {
     let url = url::Url::parse(value).context("invalid MCP URL")?;
     ensure!(
         matches!(url.scheme(), "http" | "https")
@@ -313,6 +355,10 @@ fn validate_url(value: &str) -> anyhow::Result<url::Url> {
             && url.fragment().is_none()
             && url.path() == "/mcp",
         "MCP URL must be http(s), end in /mcp, and contain no credentials, query, or fragment"
+    );
+    ensure!(
+        url.scheme() == "https" || allow_http,
+        "HTTP requires the explicit development option --allow-http"
     );
     Ok(url)
 }
@@ -352,14 +398,23 @@ struct GrantClient {
 }
 
 impl GrantClient {
-    fn new(url: &str, resource: String, anchor: AnchorArgs) -> anyhow::Result<Self> {
+    fn new(
+        url: &str,
+        resource: String,
+        anchor: AnchorArgs,
+        ca_path: Option<&std::path::Path>,
+        allow_http: bool,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
-            client: reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(30))
-                .build()?,
-            url: validate_url(url)?,
+            client: crate::client_tls::with_ca_bundle(
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(Duration::from_secs(30)),
+                ca_path,
+            )?
+            .build()?,
+            url: validate_url(url, allow_http)?,
             resource,
             anchor,
         })
@@ -466,6 +521,31 @@ fn valid_grant_lifetime(
         && lifetime <= chrono::Duration::seconds(i64::try_from(ttl_seconds).unwrap_or_default())
 }
 
+const fn required_remaining_seconds(timeout_seconds: u64) -> u64 {
+    timeout_seconds + STARTUP_MARGIN_SECONDS + FLUSH_MARGIN_SECONDS + CLOCK_MARGIN_SECONDS
+}
+
+fn sufficient_remaining_lifetime(
+    grants: &[GrantResponse],
+    timeout_seconds: u64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let required = chrono::Duration::seconds(
+        i64::try_from(required_remaining_seconds(timeout_seconds)).unwrap_or(i64::MAX),
+    );
+    grants.len() == 2
+        && grants
+            .iter()
+            .all(|response| response.grant.expires_at - now >= required)
+}
+
+fn sandbox_start_before(grants: &[GrantResponse], timeout_seconds: u64) -> i64 {
+    let earliest_expiry = grants[0].grant.expires_at.min(grants[1].grant.expires_at);
+    earliest_expiry.timestamp()
+        - i64::try_from(timeout_seconds + FLUSH_MARGIN_SECONDS + CLOCK_MARGIN_SECONDS)
+            .unwrap_or_default()
+}
+
 async fn launch_up(args: LaunchUpV1) -> anyhow::Result<()> {
     let runtime = backend(args.backend);
     launch_up_with_backend(args, runtime.as_ref()).await
@@ -482,13 +562,31 @@ async fn launch_up_with_backend(
         .resource_url
         .clone()
         .unwrap_or_else(|| args.url.clone());
-    let client = GrantClient::new(&args.url, resource.clone(), args.anchor.clone())?;
+    let ca_bundle = args
+        .ca_path
+        .as_deref()
+        .map(crate::client_tls::read_ca_bundle)
+        .transpose()?;
     // Check anchor and provider inputs before any grant is created.
     let _ = anchor_token(&args.anchor, &resource)?;
     let env = agent_environment(&args, &instance)?;
-    let (file, mut state) = StateFile::create(&args, &name, resource)?;
+    let (file, mut state) =
+        StateFile::create(&args, &name, resource.clone(), ca_bundle.as_deref())?;
+    let client = GrantClient::new(
+        &args.url,
+        resource,
+        args.anchor.clone(),
+        state.ca_path.as_deref(),
+        args.allow_http,
+    )
+    .with_context(|| {
+        format!(
+            "cannot prepare grant client; no grants issued; retained state: {}",
+            file.path().display()
+        )
+    })?;
     let result = async {
-        let mut tokens = Vec::new();
+        let mut grants = Vec::new();
         let mut principal = None;
         for kind in ["agent", "shipper"] {
             let response = client.issue(kind, &args, &instance).await?;
@@ -509,44 +607,19 @@ async fn launch_up_with_backend(
                 "launcher identity changed while issuing grants"
             );
             principal = Some(identity);
-            tokens.push(response.token);
+            grants.push(response);
         }
-        let mut env = env;
-        env.insert("FLEET_RECALL_TOKEN".into(), tokens[0].clone());
-        let shipper_env = BTreeMap::from([("FLEET_RECALL_TOKEN".into(), tokens[1].clone())]);
-        let spec = SandboxSpecV1 {
-            name: name.clone(),
-            image: args.image.clone(),
-            shipper_image: args
-                .shipper_image
-                .clone()
-                .unwrap_or_else(|| args.image.clone()),
-            env,
-            shipper_env,
-            transcript_volume: state.handle.transcript_volume.clone(),
-            runtime_class: args.runtime_class.clone(),
-            namespace: args.namespace.clone(),
-            state_dir: file.directory().to_path_buf(),
-            shipper_args: vec![
-                "ship".into(),
-                "transcripts".into(),
-                "--dir".into(),
-                "/transcripts".into(),
-                "--url".into(),
-                args.sandbox_url.clone().unwrap_or_else(|| args.url.clone()),
-                "--instance".into(),
-                instance,
-                "--format".into(),
-                if args.harness == Harness::Codex {
-                    "codex"
-                } else {
-                    "claude-code"
-                }
-                .into(),
-            ],
-        };
+        let spec = sandbox_spec(&args, &state, &file, env, &grants, &instance);
+        ensure!(
+            sufficient_remaining_lifetime(&grants, args.timeout_seconds, chrono::Utc::now()),
+            "grants do not have enough remaining lifetime for startup, execution, and final shipping"
+        );
         state.runtime_started = true; // Covers a partially completed create.
         file.save(&state)?;
+        ensure!(
+            sufficient_remaining_lifetime(&grants, args.timeout_seconds, chrono::Utc::now()),
+            "grants expired while persisting launch state"
+        );
         runtime.create(&spec).await?;
         state.phase = "running".into();
         file.save(&state)?;
@@ -554,7 +627,7 @@ async fn launch_up_with_backend(
     }
     .await;
     if let Err(error) = result {
-        let cleanup = cleanup(&mut state, &file, runtime, &client).await;
+        let cleanup = cleanup(&mut state, &file, runtime, Some(&client)).await;
         bail!(
             "launch failed: {error}; cleanup {}; retry with launch down --state {}",
             if cleanup.is_ok() {
@@ -567,6 +640,64 @@ async fn launch_up_with_backend(
     }
     println!("Launch running: {name}\nState: {}", file.path().display());
     Ok(())
+}
+
+fn sandbox_spec(
+    args: &LaunchUpV1,
+    state: &LaunchState,
+    file: &StateFile,
+    mut env: BTreeMap<String, String>,
+    grants: &[GrantResponse],
+    instance: &str,
+) -> SandboxSpecV1 {
+    // Kubernetes may leave a pod Pending after apply succeeds. The entrypoint
+    // refuses a delayed start at this absolute deadline, before provider use.
+    env.insert(
+        "FLEET_SANDBOX_START_BEFORE_UNIX".into(),
+        sandbox_start_before(grants, args.timeout_seconds).to_string(),
+    );
+    env.insert("FLEET_RECALL_TOKEN".into(), grants[0].token.clone());
+    let shipper_env = BTreeMap::from([("FLEET_RECALL_TOKEN".into(), grants[1].token.clone())]);
+    let mut shipper_args = vec![
+        "ship".into(),
+        "transcripts".into(),
+        "--dir".into(),
+        "/transcripts".into(),
+        "--url".into(),
+        args.sandbox_url.clone().unwrap_or_else(|| args.url.clone()),
+        "--instance".into(),
+        instance.into(),
+        "--format".into(),
+        if args.harness == Harness::Codex {
+            "codex"
+        } else {
+            "claude-code"
+        }
+        .into(),
+    ];
+    if args.allow_http {
+        shipper_args.push("--allow-http".into());
+    }
+    if state.ca_path.is_some() {
+        env.insert("FLEET_RECALL_CA_PATH".into(), SANDBOX_CA_PATH.into());
+        shipper_args.extend(["--ca-path".into(), SANDBOX_CA_PATH.into()]);
+    }
+    SandboxSpecV1 {
+        name: state.handle.name.clone(),
+        image: args.image.clone(),
+        shipper_image: args
+            .shipper_image
+            .clone()
+            .unwrap_or_else(|| args.image.clone()),
+        env,
+        shipper_env,
+        transcript_volume: state.handle.transcript_volume.clone(),
+        runtime_class: args.runtime_class.clone(),
+        namespace: args.namespace.clone(),
+        state_dir: file.directory().to_path_buf(),
+        ca_path: state.ca_path.clone(),
+        shipper_args,
+    }
 }
 
 fn agent_environment(
@@ -589,6 +720,9 @@ fn agent_environment(
             args.timeout_seconds.to_string(),
         ),
     ]);
+    if args.allow_http {
+        env.insert("FLEET_RECALL_ALLOW_HTTP".into(), "true".into());
+    }
     if let Some(model) = &args.model {
         env.insert("FLEET_SANDBOX_MODEL".into(), model.clone());
     }
@@ -621,9 +755,8 @@ fn agent_environment(
 
 async fn launch_down(args: LaunchDownV1) -> anyhow::Result<()> {
     let (file, mut state) = StateFile::load(&args.state)?;
-    let client = GrantClient::new(&state.url, state.resource.clone(), state.anchor.clone())?;
     let runtime = backend(state.backend);
-    cleanup(&mut state, &file, runtime.as_ref(), &client).await?;
+    launch_down_with_backend(&file, &mut state, runtime.as_ref()).await?;
     println!(
         "Launch stopped; both grants revoked. State: {}",
         file.path().display()
@@ -631,11 +764,29 @@ async fn launch_down(args: LaunchDownV1) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn launch_down_with_backend(
+    file: &StateFile,
+    state: &mut LaunchState,
+    runtime: &dyn SandboxBackend,
+) -> anyhow::Result<()> {
+    // Old state predates explicit HTTP permission. Honor its existing cleanup
+    // authority, while every newly created state records an explicit decision.
+    let client = GrantClient::new(
+        &state.url,
+        state.resource.clone(),
+        state.anchor.clone(),
+        state.ca_path.as_deref(),
+        state.allow_http.unwrap_or(true),
+    );
+    // A missing/invalid retained CA must not prevent stopping the sandbox.
+    cleanup(state, file, runtime, client.as_ref().ok()).await
+}
+
 async fn cleanup(
     state: &mut LaunchState,
     file: &StateFile,
     runtime: &dyn SandboxBackend,
-    client: &GrantClient,
+    client: Option<&GrantClient>,
 ) -> anyhow::Result<()> {
     let mut failures = Vec::new();
     if state.runtime_started && !state.runtime_stopped {
@@ -646,7 +797,12 @@ async fn cleanup(
     }
     for grant in &mut state.grants {
         if !grant.revoked {
-            match client.revoke(grant.id).await {
+            let revoked = if let Some(client) = client {
+                client.revoke(grant.id).await
+            } else {
+                Err(anyhow::anyhow!("grant client unavailable"))
+            };
+            match revoked {
                 Ok(()) => grant.revoked = true,
                 Err(_) => failures.push("grant revocation"),
             }

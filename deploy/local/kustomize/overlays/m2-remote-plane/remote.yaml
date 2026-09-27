@@ -46,6 +46,8 @@ spec:
             - {name: FLEET_RECALL_METRICS_ALLOW_NON_LOOPBACK, value: "true"}
             - {name: FLEET_RECALL_RESOURCE_URL, value: "http://localhost:8080/mcp"}
             - {name: FLEET_RECALL_OIDC_ISSUERS, value: "hydra=http://localhost:4444/,k8s=https://kubernetes.default.svc"}
+            - {name: FLEET_RECALL_OAUTH_ADVERTISED_ANCHORS, value: hydra}
+            - {name: FLEET_RECALL_OAUTH_SCOPES, value: "openid,offline_access,fleet-recall"}
             - {name: FLEET_RECALL_OIDC_SCOPE_SUBSTITUTES, value: "hydra=fleet-recall"}
             - {name: FLEET_RECALL_OIDC_LOCAL_TRANSPORTS, value: "hydra=http://hydra-public.ory.svc.cluster.local:4444/"}
             - {name: FLEET_RECALL_OIDC_CA_PATH, value: /etc/kubernetes/ca.crt}

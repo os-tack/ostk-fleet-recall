@@ -242,6 +242,15 @@ impl HttpBackend for Backend {
 
 #[tokio::test]
 async fn shipper_http_restart_partial_line_and_codex_provenance() {
+    exercise_shipper(false).await;
+}
+
+#[tokio::test]
+async fn shipper_https_restart_partial_line_and_codex_provenance() {
+    exercise_shipper(true).await;
+}
+
+async fn exercise_shipper(tls: bool) {
     let spool = tempfile::tempdir().unwrap();
     let source = tempfile::tempdir().unwrap();
     std::fs::create_dir(source.path().join("nested")).unwrap();
@@ -268,18 +277,36 @@ async fn shipper_http_restart_partial_line_and_codex_provenance() {
         }),
     )
     .unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    let config = ShipperConfig {
+    let (base, server, ca_path) = if tls {
+        use crate::client_tls::tests::{CA_FIRST, KEY_FIRST, SERVER_FIRST, serve_tls};
+        let path = spool.path().join("ca.pem");
+        std::fs::write(&path, CA_FIRST).unwrap();
+        let (base, server) = serve_tls(app, SERVER_FIRST, KEY_FIRST).await;
+        (base, server, Some(path))
+    } else {
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), server, None)
+    };
+    let mut config = ShipperConfig {
         dir: source.path().into(),
-        url,
+        url: format!("{base}/mcp"),
         instance: auth.sandbox_id.clone(),
         format: TranscriptFormat::Codex,
         token: "shipper".into(),
-        ca_path: None,
+        ca_path,
+        allow_http: false,
         once: true,
     };
+    if tls {
+        let ca = config.ca_path.take();
+        assert!(ship_once(&config).await.is_err());
+        config.ca_path = ca;
+    } else {
+        assert!(ship_once(&config).await.is_err());
+        config.allow_http = true;
+    }
     assert_eq!(ship_once(&config).await.unwrap().files, 1);
     let name = stable_file_name(
         &auth.sandbox_id,
@@ -304,15 +331,21 @@ async fn shipper_http_restart_partial_line_and_codex_provenance() {
     let parsed = parse_codex_transcript("rollout", &stored, 0, 0).unwrap();
     assert_eq!(parsed.turns[0].session_id, "codex-session");
     assert_eq!(parsed.turns[0].text, "sandbox marker");
-    let response = reqwest::Client::new()
-        .put(format!(
-            "http://{address}/v1/transcripts/{}/file.jsonl",
-            auth.sandbox_id
-        ))
-        .body("untrusted")
-        .send()
-        .await
-        .unwrap();
+    let response = crate::client_tls::with_ca_bundle(
+        reqwest::Client::builder().no_proxy(),
+        config.ca_path.as_deref(),
+    )
+    .unwrap()
+    .build()
+    .unwrap()
+    .put(format!(
+        "{base}/v1/transcripts/{}/file.jsonl",
+        auth.sandbox_id
+    ))
+    .body("untrusted")
+    .send()
+    .await
+    .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     server.abort();
 }

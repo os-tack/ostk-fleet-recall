@@ -1,6 +1,6 @@
 //! Bounded, sequential stdio-to-HTTP MCP client for sandbox harnesses.
 
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 use anyhow::{Context as _, ensure};
 use reqwest::{Client, StatusCode, Url, header::HeaderValue};
@@ -22,14 +22,16 @@ pub struct Shim {
 
 impl Shim {
     pub fn new(endpoint: &str, token: &str, allow_http: bool) -> anyhow::Result<Self> {
+        Self::new_with_ca(endpoint, token, allow_http, None)
+    }
+
+    pub fn new_with_ca(
+        endpoint: &str,
+        token: &str,
+        allow_http: bool,
+        ca_path: Option<&Path>,
+    ) -> anyhow::Result<Self> {
         let url = Url::parse(endpoint).context("invalid MCP endpoint URL")?;
-        let loopback = url.host_str().is_some_and(|host| {
-            host == "localhost"
-                || host
-                    .trim_matches(['[', ']'])
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        });
         ensure!(
             url.has_host()
                 && url.username().is_empty()
@@ -38,7 +40,7 @@ impl Shim {
             "MCP URL must have a host and no credentials or fragment"
         );
         ensure!(
-            url.scheme() == "https" || (url.scheme() == "http" && (loopback || allow_http)),
+            url.scheme() == "https" || (url.scheme() == "http" && allow_http),
             "MCP requires HTTPS; --allow-http explicitly permits a private development endpoint"
         );
         ensure!(
@@ -50,12 +52,12 @@ impl Shim {
         let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
             .context("invalid FLEET_RECALL_TOKEN")?;
         authorization.set_sensitive(true);
-        let client = Client::builder()
+        let builder = Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(35))
-            .build()?;
+            .timeout(Duration::from_secs(35));
+        let client = crate::client_tls::with_ca_bundle(builder, ca_path)?.build()?;
         Ok(Self {
             client,
             url,
@@ -222,8 +224,10 @@ mod tests {
     #[test]
     fn secrets_and_http_need_explicit_configuration() {
         assert!(Shim::new("http://example.com/mcp", "test", false).is_err());
+        assert!(Shim::new("http://127.0.0.1/mcp", "test", false).is_err());
+        assert!(Shim::new("http://localhost/mcp", "test", false).is_err());
         assert!(Shim::new("https://user:pass@example.com/mcp", "test", false).is_err());
-        assert!(Shim::new("http://127.0.0.1/mcp", "test\r\nfoo", false).is_err());
+        assert!(Shim::new("http://127.0.0.1/mcp", "test\r\nfoo", true).is_err());
         assert_eq!(header_name("recall"), "recall");
         assert_eq!(
             header_name(" λ "),
@@ -236,6 +240,48 @@ mod tests {
         .unwrap();
         assert!(encoded.len() < MAX_MCP_FRAME_BYTES);
         assert!(serde_json::from_slice::<Value>(&encoded).unwrap()["id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn private_ca_shim_sends_bearer_only_after_verified_tls() {
+        use crate::client_tls::tests::{CA_FIRST, KEY_FIRST, SERVER_FIRST, serve_tls};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let requests = seen.clone();
+        let app = Router::new().route("/mcp", post(move |headers: HeaderMap, Json(body): Json<Value>| {
+            assert_eq!(headers["authorization"], "Bearer test-tls-grant");
+            requests.fetch_add(1, Ordering::SeqCst);
+            async move { Json(serde_json::json!({"jsonrpc":"2.0","id":body["id"],"result":{}})) }
+        }));
+        let (base, task) = serve_tls(app, SERVER_FIRST, KEY_FIRST).await;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ca.pem");
+        std::fs::write(&path, CA_FIRST).unwrap();
+        let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\"}\n";
+        for (base, trust, accepted) in [
+            (base.clone(), None, false),
+            (
+                base.replace("localhost", "127.0.0.1"),
+                Some(path.as_path()),
+                false,
+            ),
+            (base, Some(path.as_path()), true),
+        ] {
+            let shim =
+                Shim::new_with_ca(&format!("{base}/mcp"), "test-tls-grant", false, trust).unwrap();
+            let mut output = Vec::new();
+            shim.serve(input.as_slice(), &mut output).await.unwrap();
+            let response: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(response.get("result").is_some(), accepted);
+            assert!(
+                !String::from_utf8(output)
+                    .unwrap()
+                    .contains("test-tls-grant")
+            );
+        }
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+        task.abort();
     }
 
     #[tokio::test]
@@ -265,7 +311,7 @@ mod tests {
         let task = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
-        let shim = Shim::new(&format!("http://{addr}/mcp"), "test-only", false).unwrap();
+        let shim = Shim::new(&format!("http://{addr}/mcp"), "test-only", true).unwrap();
         let input = concat!(
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
@@ -320,7 +366,7 @@ mod tests {
         let task = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
-        let shim = Shim::new(&format!("http://{addr}/mcp"), "never-forward-me", false).unwrap();
+        let shim = Shim::new(&format!("http://{addr}/mcp"), "never-forward-me", true).unwrap();
         let mut input = vec![b'x'; MAX_MCP_FRAME_BYTES + 10];
         input.extend_from_slice(b"\n{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"tools/call\",\"params\":{\"name\":\"remember\"}}\n");
         let mut output = Vec::new();

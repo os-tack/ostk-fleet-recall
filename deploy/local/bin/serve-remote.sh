@@ -102,6 +102,8 @@ try:
             "FLEET_RECALL_CONTENT_KEK_HEX": hex_value(passwords.get("CONTENT_KEK_HEX", ""), 64, "content key"),
             "FLEET_RECALL_RESOURCE_URL": "http://localhost:8080/mcp",
             "FLEET_RECALL_OIDC_ISSUERS": "hydra=http://localhost:4444/",
+            "FLEET_RECALL_OAUTH_ADVERTISED_ANCHORS": "hydra",
+            "FLEET_RECALL_OAUTH_SCOPES": "openid,offline_access,fleet-recall",
             "FLEET_RECALL_OIDC_SCOPE_SUBSTITUTES": "hydra=fleet-recall",
             "FLEET_RECALL_GRANT_SIGNING_KEY_HEX": signing_key,
         })

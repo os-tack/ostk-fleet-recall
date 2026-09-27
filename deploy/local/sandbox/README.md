@@ -25,7 +25,7 @@ audience, and `--sandbox-url` for the container's network route:
 ostk-fleet-recall launch up --backend docker --anchor local-key \
   --key-id launcher --scope TENANT_UUID/local-k0s --agent sandbox-one \
   --image ostk-sandbox:local --url http://localhost:8080/mcp \
-  --sandbox-url http://host.docker.internal:8080/mcp
+  --sandbox-url http://host.docker.internal:8080/mcp --allow-http
 ```
 
 Set `FLEET_RECALL_LAUNCHER_KEY_HEX` in the launcher process only. Enrollment
@@ -34,6 +34,27 @@ scope. The launcher rejects a grant with another tenant, project, agent or
 sandbox ID. `--anchor kubernetes` reads the projected token from
 `--service-account-token-file` instead. It never mounts that token into the
 workload.
+
+HTTP, including loopback, requires the explicit development option
+`--allow-http`. For HTTPS, use the same canonical resource hostname from the
+workstation and each container. Pass `--ca-path /absolute/path/ca.pem` when
+that endpoint uses an additional trust root. The launcher keeps a public CA
+copy for retries and teardown, and mounts it read-only into both containers
+at `/etc/fleet-recall/ca.pem`. The CA bundle must contain only PEM certificates
+and be at most 256 KiB. Existing public roots remain trusted.
+
+The launcher sets `FLEET_RECALL_CA_PATH` and, only for explicit development
+opt-in, `FLEET_RECALL_ALLOW_HTTP=true`. Codex and Claude pass those settings
+only to the Recall shim; they do not replace the provider's TLS trust store.
+The shim receives the CA path as an argument and strips provider credentials
+from its environment. It never enables HTTP by inspecting the URL alone.
+
+New launches also carry an absolute latest-start deadline derived from the
+shorter grant lifetime, reserving the execution timeout, final shipping, and
+clock margin. Immediately before invoking any harness, the entrypoint rejects
+a reached or malformed deadline. A Pod that spends too long pending therefore
+cannot start a provider run with expired startup allowance. The deadline is
+consumed by the entrypoint and never passed to the provider process.
 
 Docker starts two containers sharing a named transcript volume; the shipper
 mount is read-only. Kubernetes uses two containers in one Pod, with a native
@@ -50,7 +71,7 @@ For Codex, explicitly supply only the saved login file:
 ostk-fleet-recall launch up --backend docker --anchor local-key \
   --scope TENANT_UUID/local-k0s --agent sandbox-codex --image ostk-sandbox:local \
   --url http://localhost:8080/mcp \
-  --sandbox-url http://host.docker.internal:8080/mcp \
+  --sandbox-url http://host.docker.internal:8080/mcp --allow-http \
   --harness codex --codex-auth-file "$HOME/.codex/auth.json" \
   --task 'Check Recall status, record a short note, and read it back.'
 ```

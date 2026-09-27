@@ -333,6 +333,89 @@ fn assert_remote_telemetry(log: &TelemetryLog) {
 }
 
 #[tokio::test]
+async fn configured_human_discovery_and_refresh_scopes_are_served_without_authentication() {
+    let settings = [
+        ("FLEET_RECALL_RESOURCE_URL", "https://recall.example/mcp"),
+        (
+            "FLEET_RECALL_GRANT_SIGNING_KEY_HEX",
+            "unused-in-router-test",
+        ),
+        (
+            "FLEET_RECALL_OIDC_ISSUERS",
+            "human=https://id.example/,k8s=https://kubernetes.default.svc",
+        ),
+        ("FLEET_RECALL_OAUTH_ADVERTISED_ANCHORS", "human"),
+        (
+            "FLEET_RECALL_OAUTH_SCOPES",
+            "openid,offline_access,fleet-recall",
+        ),
+    ];
+    let configured = crate::remote::RemoteConfig::from_lookup(|name| {
+        settings
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| (*value).into())
+    })
+    .unwrap();
+    let backend = Backend::new(Arc::new(Memory::default()));
+    let app = router(configured.http, backend.clone()).unwrap();
+    for path in [
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::get(path)
+                    .header("host", "attacker.example")
+                    .header("x-forwarded-host", "attacker.example")
+                    .header("x-forwarded-proto", "http")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let body = json_body(response).await;
+        assert_eq!(body["resource"], "https://recall.example/mcp");
+        assert_eq!(
+            body["authorization_servers"],
+            json!(["https://id.example/"])
+        );
+        assert_eq!(
+            body["scopes_supported"],
+            json!(["openid", "offline_access", "fleet-recall"])
+        );
+        assert!(!body.to_string().contains("kubernetes"));
+    }
+    assert_eq!(backend.authentications.load(Ordering::SeqCst), 0);
+    let response = app.oneshot(modern_request(&modern("ping"))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(backend.authentications.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn machine_only_metadata_has_no_advertised_authorization_servers() {
+    let mut settings = config();
+    settings.authorization_servers.clear();
+    settings.scopes_supported.clear();
+    let app = router(settings, Backend::new(Arc::new(Memory::default()))).unwrap();
+    let response = app
+        .oneshot(
+            HttpRequest::get("/.well-known/oauth-protected-resource/mcp")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["authorization_servers"], json!([]));
+    assert_eq!(body["scopes_supported"], json!([]));
+}
+
+#[tokio::test]
 async fn metadata_authentication_and_origin_protection() {
     let backend = Backend::new(Arc::new(Memory::default()));
     let app = router(config(), backend.clone()).unwrap();
@@ -782,4 +865,51 @@ fn invalid_configuration_fails_before_listening() {
     let mut settings = config();
     settings.max_inflight = 0;
     assert!(router(settings, backend).is_err());
+}
+
+#[test]
+fn invalid_oauth_metadata_fails_before_listening() {
+    let backend = Backend::new(Arc::new(Memory::default()));
+    for issuer in [
+        "file:///issuer",
+        "https://user:pass@id.example/",
+        "https://id.example/?tenant=x",
+        "https://id.example/#fragment",
+        " https://id.example/",
+        "https://id.example/\n",
+        "https://id.example/\0",
+    ] {
+        let mut settings = config();
+        settings.authorization_servers = vec![issuer.into()];
+        assert!(router(settings, backend.clone()).is_err(), "{issuer:?}");
+    }
+    let mut settings = config();
+    settings
+        .authorization_servers
+        .push("https://id.example/".into());
+    assert!(router(settings, backend.clone()).is_err());
+    for scopes in [
+        vec![""],
+        vec!["read write"],
+        vec!["read\n"],
+        vec!["read\\write"],
+        vec!["read\"write"],
+        vec!["read", "read"],
+        vec!["mémoire"],
+    ] {
+        let mut settings = config();
+        settings.scopes_supported = scopes.into_iter().map(str::to_owned).collect();
+        assert!(router(settings, backend.clone()).is_err());
+    }
+    let mut settings = config();
+    settings.scopes_supported = [
+        "openid",
+        "offline_access",
+        "fleet-recall",
+        "urn:example:scope",
+        "!#[]~",
+    ]
+    .map(str::to_owned)
+    .into();
+    assert!(router(settings, backend).is_ok());
 }

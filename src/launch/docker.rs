@@ -67,6 +67,22 @@ fn container_args(spec: &SandboxSpecV1, agent: bool) -> anyhow::Result<Vec<Strin
         "--mount",
         &volume,
     ]);
+    if let Some(path) = &spec.ca_path {
+        let source = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("CA path must be UTF-8"))?;
+        ensure!(
+            !source.contains([',', '\n', '\r', '\0']),
+            "CA path contains a mount separator"
+        );
+        args.extend([
+            "--mount".into(),
+            format!(
+                "type=bind,src={source},dst={},readonly",
+                super::SANDBOX_CA_PATH
+            ),
+        ]);
+    }
     if agent {
         args.push(spec.image.clone());
     } else {

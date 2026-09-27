@@ -77,6 +77,81 @@ fn pairs(value: &str) -> Result<BTreeMap<String, String>> {
     Ok(pairs)
 }
 
+fn metadata_list(value: &str, setting: &str) -> Result<Vec<String>> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut seen = BTreeSet::new();
+    value
+        .split(',')
+        .map(|entry| {
+            if entry.is_empty() || entry.trim() != entry || !seen.insert(entry) {
+                return Err(configuration(&format!(
+                    "{setting} requires unique, nonempty comma-separated values"
+                )));
+            }
+            Ok(entry.to_owned())
+        })
+        .collect()
+}
+
+fn advertised_issuers(
+    configured: Option<&str>,
+    oidc: &BTreeMap<String, String>,
+    discovery_token_paths: &BTreeMap<String, String>,
+) -> Result<Vec<String>> {
+    let Some(configured) = configured else {
+        return match oidc.len() {
+            // Preserve single-human-issuer configurations. Authenticated
+            // discovery is commonly a machine anchor, so require an opt-in.
+            1 if discovery_token_paths.is_empty() => Ok(oidc.values().cloned().collect()),
+            0 | 1 => Ok(Vec::new()),
+            _ => Err(configuration(
+                "FLEET_RECALL_OAUTH_ADVERTISED_ANCHORS is required with multiple OIDC anchors; use an empty value for no human OAuth",
+            )),
+        };
+    };
+    metadata_list(configured, "FLEET_RECALL_OAUTH_ADVERTISED_ANCHORS")?
+        .iter()
+        .map(|anchor| {
+            oidc.get(anchor).cloned().ok_or_else(|| {
+                configuration(
+                    "FLEET_RECALL_OAUTH_ADVERTISED_ANCHORS must name configured OIDC anchors",
+                )
+            })
+        })
+        .collect()
+}
+
+fn http_config(
+    resource: String,
+    oidc: &BTreeMap<String, String>,
+    discovery_token_paths: &BTreeMap<String, String>,
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+) -> Result<HttpConfig> {
+    let mut http = HttpConfig::new(
+        resource,
+        advertised_issuers(
+            lookup("FLEET_RECALL_OAUTH_ADVERTISED_ANCHORS").as_deref(),
+            oidc,
+            discovery_token_paths,
+        )?,
+    );
+    if let Some(scopes) = lookup("FLEET_RECALL_OAUTH_SCOPES") {
+        http.scopes_supported = metadata_list(&scopes, "FLEET_RECALL_OAUTH_SCOPES")?;
+    }
+    http.validate_oauth_metadata()?;
+    http.allowed_origins = lookup("FLEET_RECALL_HTTP_ALLOWED_ORIGINS")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    http.max_inflight = number(lookup, "FLEET_RECALL_HTTP_MAX_INFLIGHT", 64, 1, 1024)?;
+    http.request_deadline = Duration::from_secs(30);
+    Ok(http)
+}
+
 impl RemoteConfig {
     pub fn from_env() -> Result<Self> {
         Self::from_lookup(|name| std::env::var(name).ok())
@@ -109,15 +184,7 @@ impl RemoteConfig {
                 "issuer and audience-policy mappings conflict with configured trust roots",
             ));
         }
-        let mut http = HttpConfig::new(resource, oidc.values().cloned().collect());
-        http.allowed_origins = lookup("FLEET_RECALL_HTTP_ALLOWED_ORIGINS")
-            .unwrap_or_default()
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect();
-        http.max_inflight = number(&mut lookup, "FLEET_RECALL_HTTP_MAX_INFLIGHT", 64, 1, 1024)?;
-        http.request_deadline = Duration::from_secs(30);
+        let http = http_config(resource, &oidc, &oidc_discovery_token_paths, &mut lookup)?;
         let scope_cache_max = number(&mut lookup, "FLEET_RECALL_SCOPE_CACHE_MAX", 64, 1, 4096)?;
         let agent_cache_max = number(&mut lookup, "FLEET_RECALL_AGENT_CACHE_MAX", 256, 1, 16384)?;
         let grant_ttl_seconds = number(
@@ -584,6 +651,134 @@ mod tests {
                 "human=https://id.example/".into(),
             ),
         ])
+    }
+
+    #[test]
+    fn oauth_discovery_defaults_preserve_one_human_issuer_but_hide_machine_discovery() {
+        let mut values = settings();
+        let config = RemoteConfig::from_lookup(|name| values.get(name).cloned()).unwrap();
+        assert_eq!(config.http.authorization_servers, ["https://id.example/"]);
+        assert_eq!(config.http.scopes_supported, ["fleet-recall"]);
+
+        values.insert(
+            "FLEET_RECALL_OIDC_DISCOVERY_TOKEN_PATHS".into(),
+            "human=/var/run/oidc/token".into(),
+        );
+        let config = RemoteConfig::from_lookup(|name| values.get(name).cloned()).unwrap();
+        assert!(config.http.authorization_servers.is_empty());
+        assert_eq!(config.oidc.len(), 1);
+        assert_eq!(config.oidc["human"], "https://id.example/");
+
+        values.insert("FLEET_RECALL_OIDC_ISSUERS".into(), String::new());
+        values.insert(
+            "FLEET_RECALL_OIDC_DISCOVERY_TOKEN_PATHS".into(),
+            String::new(),
+        );
+        values.insert(
+            "FLEET_RECALL_LOCAL_KEY_ANCHOR_PATH".into(),
+            "/keys.json".into(),
+        );
+        let config = RemoteConfig::from_lookup(|name| values.get(name).cloned()).unwrap();
+        assert!(config.http.authorization_servers.is_empty());
+    }
+
+    #[test]
+    fn multiple_anchors_require_explicit_human_discovery_without_changing_verification() {
+        let mut values = settings();
+        values.insert(
+            "FLEET_RECALL_OIDC_ISSUERS".into(),
+            "human=https://id.example/,k8s=https://kubernetes.default.svc".into(),
+        );
+        let error = RemoteConfig::from_lookup(|name| values.get(name).cloned())
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("FLEET_RECALL_OAUTH_ADVERTISED_ANCHORS")
+        );
+        values.insert(
+            "FLEET_RECALL_OAUTH_ADVERTISED_ANCHORS".into(),
+            "human".into(),
+        );
+        values.insert(
+            "FLEET_RECALL_OAUTH_SCOPES".into(),
+            "openid,offline_access,fleet-recall".into(),
+        );
+        values.insert(
+            "FLEET_RECALL_OIDC_SCOPE_SUBSTITUTES".into(),
+            "human=fleet-recall".into(),
+        );
+        let config = RemoteConfig::from_lookup(|name| values.get(name).cloned()).unwrap();
+        assert_eq!(config.http.authorization_servers, ["https://id.example/"]);
+        assert_eq!(
+            config.http.scopes_supported,
+            ["openid", "offline_access", "fleet-recall"]
+        );
+        assert_eq!(config.oidc.len(), 2);
+        assert_eq!(config.oidc["k8s"], "https://kubernetes.default.svc");
+        assert_eq!(config.scope_substitutes["human"], "fleet-recall");
+
+        values.insert(
+            "FLEET_RECALL_OAUTH_ADVERTISED_ANCHORS".into(),
+            String::new(),
+        );
+        values.insert("FLEET_RECALL_OAUTH_SCOPES".into(), String::new());
+        let config = RemoteConfig::from_lookup(|name| values.get(name).cloned()).unwrap();
+        assert!(config.http.authorization_servers.is_empty());
+        assert!(config.http.scopes_supported.is_empty());
+        assert_eq!(config.oidc.len(), 2);
+    }
+
+    #[test]
+    fn oauth_metadata_rejects_unknown_duplicate_and_malformed_configuration() {
+        let base = settings();
+        for anchors in [
+            "unknown",
+            "https://id.example/",
+            "human,human",
+            "human,",
+            ",human",
+            " human",
+            "human\n",
+        ] {
+            let mut values = base.clone();
+            values.insert(
+                "FLEET_RECALL_OAUTH_ADVERTISED_ANCHORS".into(),
+                anchors.into(),
+            );
+            assert!(
+                RemoteConfig::from_lookup(|name| values.get(name).cloned()).is_err(),
+                "{anchors:?}"
+            );
+        }
+        for scopes in [
+            "fleet-recall,fleet-recall",
+            "fleet-recall,",
+            " fleet-recall",
+            "read write",
+            "bad\"scope",
+            "bad\\scope",
+            "bad\tscope",
+            "mémoire",
+        ] {
+            let mut values = base.clone();
+            values.insert("FLEET_RECALL_OAUTH_SCOPES".into(), scopes.into());
+            assert!(
+                RemoteConfig::from_lookup(|name| values.get(name).cloned()).is_err(),
+                "{scopes:?}"
+            );
+        }
+        let mut values = base;
+        values.insert(
+            "FLEET_RECALL_OIDC_ISSUERS".into(),
+            "human=https://id.example/,alias=https://id.example/".into(),
+        );
+        values.insert(
+            "FLEET_RECALL_OAUTH_ADVERTISED_ANCHORS".into(),
+            "human,alias".into(),
+        );
+        assert!(RemoteConfig::from_lookup(|name| values.get(name).cloned()).is_err());
     }
 
     #[test]

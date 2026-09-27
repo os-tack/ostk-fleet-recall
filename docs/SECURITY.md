@@ -709,6 +709,22 @@ history. Only native Claude/Codex transcript directories are shared with the
 shipper. Launcher state and credential files are private and excluded from
 Git and Docker build contexts.
 
+The M4.1 clients require explicit HTTP development opt-in, including loopback.
+Additional Recall trust roots use bounded, certificates-only PEM bundles;
+TLS hostname verification and default roots remain enabled. Launcher-owned
+CA snapshots mount read-only into the sandbox and shipper and remain available
+for grant revocation. Recall CA settings never override the provider client's
+trust or enter the provider's credential store. A failed CA load during cleanup
+still permits runtime teardown; grant revocation remains pending for retry.
+
+Before creating a runtime, the launcher verifies that both grants cover the
+execution timeout plus startup and final-shipping margins. Its matching
+sandbox image also enforces an absolute latest start time before provider
+invocation, accounting for delayed Kubernetes scheduling. These controls bound
+new jobs; they do not renew grants or stop existing runtimes merely on expiry.
+Deploy the launcher and sandbox image from the same release to obtain the
+startup check. Older saved launch state remains usable for cleanup.
+
 Raw transcript uploads are untrusted reported evidence. Authentication binds
 tenant/project/agent/sandbox; a manifest additionally binds source path,
 format and first-line digest. The receiver uses directory-relative no-follow
@@ -726,6 +742,12 @@ with a local transport override. Its explicit Hydra transport override is restri
 a loopback issuer and that issuer's exact original origin. Production uses
 ordinary HTTPS discovery and TLS for MCP/embedding traffic. Metrics listeners
 remain private and do not receive authentication tokens or transcript text.
+
+Human OAuth discovery advertises an explicitly selected subset when multiple
+OIDC anchors are configured. Internal verification anchors remain accepted but
+need not be offered to browser clients. Advertised request scopes, including
+`offline_access`, do not change principal authorization or the issuer-specific
+audience exception.
 
 ## Dependency audit exception
 

@@ -26,6 +26,10 @@ pub(super) struct LaunchState {
     pub anchor: AnchorArgs,
     pub url: String,
     pub resource: String,
+    #[serde(default)]
+    pub ca_path: Option<PathBuf>,
+    #[serde(default)]
+    pub allow_http: Option<bool>,
     pub handle: SandboxHandle,
     pub grants: Vec<GrantState>,
     pub runtime_started: bool,
@@ -43,6 +47,7 @@ impl StateFile {
         args: &LaunchUpV1,
         name: &str,
         resource: String,
+        ca_bundle: Option<&[u8]>,
     ) -> anyhow::Result<(Self, LaunchState)> {
         private_directory(&args.state_dir)?;
         let directory = args.state_dir.canonicalize()?.join(name);
@@ -52,12 +57,28 @@ impl StateFile {
             path: directory.join("launch-state.json"),
             directory,
         };
+        let ca_path = ca_bundle
+            .map(|bytes| {
+                let path = file.directory.join("recall-ca.pem");
+                write_private_new(&path, bytes)?;
+                // The bundle contains public certificates only. Docker's UID 10001
+                // must be able to read its bind mount; the parent stays mode 0700.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))?;
+                }
+                anyhow::Ok(path)
+            })
+            .transpose()?;
         let state = LaunchState {
             version: 1,
             backend: args.backend,
             anchor: args.anchor.clone(),
             url: args.url.clone(),
             resource,
+            ca_path,
+            allow_http: Some(args.allow_http),
             handle: SandboxHandle {
                 name: name.into(),
                 namespace: args.namespace.clone(),
@@ -102,6 +123,13 @@ impl StateFile {
             "launch directory does not match resource identity"
         );
         let path = directory.join("launch-state.json");
+        ensure!(
+            state
+                .ca_path
+                .as_ref()
+                .is_none_or(|ca| ca == &directory.join("recall-ca.pem")),
+            "state CA path must identify the retained launch bundle"
+        );
         Ok((Self { path, directory }, state))
     }
 

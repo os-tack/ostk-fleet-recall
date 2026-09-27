@@ -10,24 +10,31 @@ and its original suspension state is restored. Test Jobs are not deleted.
 
 import argparse
 import base64
-from contextlib import contextmanager
 import copy
 import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import secrets
 import signal
+import ssl
 import stat
 import subprocess
 import sys
 import time
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlsplit, urlunsplit
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
-import uuid
+from urllib.request import (
+    HTTPRedirectHandler,
+    HTTPSHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
+)
 
 
 class SmokeFailure(RuntimeError):
@@ -42,6 +49,39 @@ class NoRedirect(HTTPRedirectHandler):
 def require(condition, message):
     if not condition:
         raise SmokeFailure(message)
+
+
+def client_tls(ca_path):
+    """Add a bounded public PEM bundle while preserving normal trust roots."""
+    context = ssl.create_default_context()
+    if ca_path is None:
+        return context
+    # Follow projected-volume symlinks, but reject nonregular descriptors before
+    # reading. NONBLOCK prevents a misconfigured FIFO from hanging this helper.
+    descriptor = os.open(ca_path, os.O_RDONLY | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as source:
+        require(stat.S_ISREG(os.fstat(source.fileno()).st_mode), "CA bundle must be a regular file")
+        data = source.read(262145)
+    require(0 < len(data) <= 262144, "CA bundle is empty or exceeds 256 KiB")
+    remaining = data.decode("ascii").strip()
+    require(remaining, "CA bundle is empty")
+    end_marker = "-----END CERTIFICATE-----"
+    while remaining:
+        require(remaining.startswith("-----BEGIN CERTIFICATE-----"),
+                "CA bundle must contain only PEM certificates")
+        end = remaining.find(end_marker)
+        require(end >= 0, "CA certificate is incomplete")
+        end += len(end_marker)
+        context.load_verify_locations(cadata=remaining[:end])
+        remaining = remaining[end:].lstrip()
+    return context
+
+
+def transport_arguments(args):
+    result = ["--allow-http"] if args.allow_http else []
+    if args.ca_path is not None:
+        result += ["--ca-path", str(args.ca_path)]
+    return result
 
 
 def private_bytes(path, data):
@@ -93,7 +133,8 @@ class Smoke:
         require(re.fullmatch(r"[0-9a-f]{64}", key), "invalid launcher key file")
         self.launch_environment = dict(self.environment, FLEET_RECALL_LAUNCHER_KEY_HEX=key)
         self.kube = ["kubectl", "--request-timeout=30s", "-n", args.namespace]
-        self.opener = build_opener(ProxyHandler({}), NoRedirect())
+        self.opener = build_opener(ProxyHandler({}), NoRedirect(),
+                                   HTTPSHandler(context=client_tls(args.ca_path)))
         self.cronjob = None
         self.worker_job = None
         self.suspended = False
@@ -375,6 +416,7 @@ done'''
                 "--resource-url", self.args.resource_url or self.args.url, "--sandbox-url", sandbox_url,
                 "--harness", "synthetic", "--timeout-seconds", str(self.args.timeout),
                 "--ttl-seconds", "3600", "--state-dir", str(launch_dir), "--namespace", self.args.namespace]
+        argv += transport_arguments(self.args)
         if self.args.shipper_image:
             argv += ["--shipper-image", self.args.shipper_image]
         if self.args.runtime_class and backend == "kubernetes":
@@ -409,7 +451,7 @@ done'''
         return result
 
 
-def arguments():
+def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     repo = Path(__file__).resolve().parents[3]
     parser.add_argument("--backend", choices=("docker", "kubernetes", "both"), default="both")
@@ -419,8 +461,15 @@ def arguments():
     parser.add_argument("--state", type=Path, default=Path(os.environ.get("FLEET_LOCAL_STATE", repo / "deploy/local/.state")))
     parser.add_argument("--url", default="http://localhost:8080/mcp")
     parser.add_argument("--resource-url")
-    parser.add_argument("--docker-url", default="http://host.docker.internal:8080/mcp")
-    parser.add_argument("--kubernetes-url", default="http://recall.fleet-recall.svc.cluster.local:8080/mcp")
+    parser.add_argument("--docker-url", help="defaults to --url, or the existing Docker route for the localhost development profile")
+    parser.add_argument("--kubernetes-url", help="defaults to --url, or the existing cluster route for the localhost development profile")
+    parser.add_argument("--ca-path", type=Path, default=os.environ.get("FLEET_RECALL_CA_PATH"),
+                        help="additional certificate-only PEM bundle for probes and launched clients")
+    http_opt_in = os.environ.get("FLEET_RECALL_ALLOW_HTTP")
+    if http_opt_in not in (None, "true", "false"):
+        parser.error("FLEET_RECALL_ALLOW_HTTP must be true or false")
+    parser.add_argument("--allow-http", action="store_true", default=http_opt_in == "true",
+                        help="explicitly permit the HTTP development profile")
     parser.add_argument("--namespace", default="fleet-recall")
     parser.add_argument("--runtime-class")
     parser.add_argument("--worker", default="worker")
@@ -429,8 +478,13 @@ def arguments():
     parser.add_argument("--scope", default="0198a849-f6ae-7d61-9800-000000000001/local-k0s")
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--worker-timeout", type=int, default=600)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     args.state, args.bin = args.state.resolve(), args.bin.resolve()
+    local = args.url == "http://localhost:8080/mcp"
+    args.docker_url = args.docker_url or ("http://host.docker.internal:8080/mcp" if local else args.url)
+    args.kubernetes_url = args.kubernetes_url or ("http://recall.fleet-recall.svc.cluster.local:8080/mcp" if local else args.url)
+    if args.ca_path is not None:
+        args.ca_path = args.ca_path.resolve()
     try:
         args.tenant, args.project = args.scope.split("/", 1)
         require(str(uuid.UUID(args.tenant)) == args.tenant and re.fullmatch(r"[a-z][a-z0-9_.-]{0,127}", args.project), "invalid scope")
@@ -441,6 +495,13 @@ def arguments():
             parsed = urlsplit(value)
             require(parsed.scheme in {"http", "https"} and parsed.hostname and not parsed.username
                     and not parsed.password and parsed.path == "/mcp" and not parsed.query and not parsed.fragment, "invalid MCP URL")
+        selected_urls = [args.url, args.resource_url or args.url]
+        if args.backend in {"docker", "both"}:
+            selected_urls.append(args.docker_url)
+        if args.backend in {"kubernetes", "both"}:
+            selected_urls.append(args.kubernetes_url)
+        require(args.allow_http or all(urlsplit(value).scheme == "https" for value in selected_urls),
+                "HTTP requires --allow-http for the development profile")
     except (ValueError, SmokeFailure) as error:
         parser.error(str(error))
     return args

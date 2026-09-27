@@ -4,7 +4,7 @@
 //! supplies a trusted scope. Every POST independently resolves its bearer to
 //! a scoped MCP edge, including legacy clients that use `initialize`.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
@@ -72,7 +72,9 @@ pub trait HttpBackend: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
     pub resource_url: String,
+    /// Human OAuth discovery only; identity verification may accept more issuers.
     pub authorization_servers: Vec<String>,
+    /// Advertised authorization-request scopes, not an authorization policy.
     pub scopes_supported: Vec<String>,
     /// Additional exact serialized origins; the resource's origin is always
     /// allowed. Requests without Origin are allowed for native MCP clients.
@@ -92,6 +94,37 @@ impl HttpConfig {
             max_inflight: 64,
             request_deadline: REQUEST_DEADLINE,
         }
+    }
+
+    pub(crate) fn validate_oauth_metadata(&self) -> Result<()> {
+        let mut issuers = BTreeSet::new();
+        for issuer in &self.authorization_servers {
+            if configured_url(issuer)?.query().is_some()
+                || issuer
+                    .chars()
+                    .any(|ch| ch.is_whitespace() || ch.is_control())
+                || !issuers.insert(issuer)
+            {
+                return Err(configuration(
+                    "advertised OAuth issuers must be unique URLs without whitespace or query",
+                ));
+            }
+        }
+        let mut scopes = BTreeSet::new();
+        for scope in &self.scopes_supported {
+            // RFC 6749 section 3.3: scope-token = 1*(%x21 / %x23-5B / %x5D-7E).
+            if scope.is_empty()
+                || !scope
+                    .bytes()
+                    .all(|byte| matches!(byte, 0x21 | 0x23..=0x5b | 0x5d..=0x7e))
+                || !scopes.insert(scope)
+            {
+                return Err(configuration(
+                    "advertised OAuth scopes must be unique, nonempty RFC 6749 scope tokens",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -118,9 +151,7 @@ pub fn router(mut config: HttpConfig, backend: Arc<dyn HttpBackend>) -> Result<R
             "the HTTP resource URL must end in /mcp without a query",
         ));
     }
-    for issuer in &config.authorization_servers {
-        configured_url(issuer)?;
-    }
+    config.validate_oauth_metadata()?;
     for origin in &config.allowed_origins {
         if configured_url(origin)?.origin().ascii_serialization() != *origin {
             return Err(configuration(

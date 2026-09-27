@@ -3,10 +3,31 @@
 import base64
 import json
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
+import time
+from pathlib import Path
+
+RECALL_ENVIRONMENT = ("FLEET_RECALL_TOKEN", "FLEET_RECALL_URL",
+                      "FLEET_RECALL_CA_PATH", "FLEET_RECALL_ALLOW_HTTP")
+
+
+def harness_environment(source):
+    """Keep Recall trust settings separate from provider keys and trust stores."""
+    allowed = {*RECALL_ENVIRONMENT, "FLEET_SANDBOX_HARNESS",
+               "FLEET_SANDBOX_INSTANCE", "FLEET_SANDBOX_TASK_B64", "FLEET_SANDBOX_MODEL",
+               "FLEET_SANDBOX_TIMEOUT_SECONDS", "FLEET_SANDBOX_CODEX_AUTH_B64",
+               "FLEET_SANDBOX_START_BEFORE_UNIX"}
+    env = {key: value for key, value in source.items() if key in allowed}
+    if env.get("FLEET_RECALL_ALLOW_HTTP") not in (None, "true", "false"):
+        raise ValueError("invalid Recall HTTP opt-in")
+    harness = env.get("FLEET_SANDBOX_HARNESS", "synthetic")
+    provider = {"codex": "CODEX_API_KEY", "claude": "ANTHROPIC_API_KEY"}.get(harness)
+    if provider and provider in source:
+        env[provider] = source[provider]
+    env.update(PATH="/usr/local/bin:/usr/bin:/bin", HOME="/home/sandbox", LANG="C.UTF-8")
+    return env
 
 
 def private_json(path, value):
@@ -34,13 +55,14 @@ def configure(home, transcripts, env):
         private_json(codex / "auth.json", value)
     env["CODEX_HOME"] = str(codex)
     env["CLAUDE_CONFIG_DIR"] = str(claude)
+    recall_keys = [key for key in RECALL_ENVIRONMENT if key in env]
     # Fresh home has no inherited hooks, plugins, skills or other MCP servers.
     (codex / "config.toml").write_text(
         'cli_auth_credentials_store = "file"\n'
         'approval_policy = "never"\n'
         '[mcp_servers.recall]\n'
         'command = "/usr/local/bin/recall-shim"\n'
-        'env_vars = ["FLEET_RECALL_TOKEN", "FLEET_RECALL_URL"]\n'
+        f'env_vars = {json.dumps(recall_keys)}\n'
         'required = true\n'
         'enabled_tools = ["recall", "remember"]\n'
         'default_tools_approval_mode = "prompt"\n'
@@ -52,8 +74,7 @@ def configure(home, transcripts, env):
         'approval_mode = "approve"\n', encoding="utf-8")
     private_json(work / ".mcp.json", {"mcpServers": {"recall": {
         "command": "/usr/local/bin/recall-shim", "args": [],
-        "env": {"FLEET_RECALL_TOKEN": "${FLEET_RECALL_TOKEN}",
-                "FLEET_RECALL_URL": "${FLEET_RECALL_URL}"},
+        "env": {key: "${" + key + "}" for key in recall_keys},
     }}})
     return work
 
@@ -76,17 +97,26 @@ def harness_argv(harness, task, model, work):
     raise ValueError("unknown sandbox harness")
 
 
+def start_harness(args, work, env, log):
+    """Recheck the grant-derived deadline after scheduling and setup delays."""
+    raw = env.pop("FLEET_SANDBOX_START_BEFORE_UNIX", None)
+    if raw is not None:
+        if (not isinstance(raw, str) or not 1 <= len(raw) <= 12 or not raw.isascii()
+                or not raw.isdecimal() or raw.startswith("0") or int(raw) > 253402300799):
+            raise ValueError("invalid sandbox startup deadline")
+        if time.time() >= int(raw):
+            raise ValueError("sandbox startup deadline has passed")
+    # Older launchers did not supply a deadline. New launchers always do.
+    # Consume the control value here so the provider and its MCP children never
+    # inherit it. Keep this check immediately adjacent to process creation.
+    return subprocess.Popen(args, cwd=work, env=env, stdout=log, stderr=log,
+                            stdin=subprocess.DEVNULL, start_new_session=True)
+
+
 def run():
     os.umask(0o077)
-    allowed = {"FLEET_RECALL_TOKEN", "FLEET_RECALL_URL", "FLEET_SANDBOX_HARNESS",
-               "FLEET_SANDBOX_INSTANCE", "FLEET_SANDBOX_TASK_B64", "FLEET_SANDBOX_MODEL",
-               "FLEET_SANDBOX_TIMEOUT_SECONDS", "FLEET_SANDBOX_CODEX_AUTH_B64"}
-    env = {key: value for key, value in os.environ.items() if key in allowed}
+    env = harness_environment(os.environ)
     harness = env.get("FLEET_SANDBOX_HARNESS", "synthetic")
-    provider = {"codex": "CODEX_API_KEY", "claude": "ANTHROPIC_API_KEY"}.get(harness)
-    if provider and provider in os.environ:
-        env[provider] = os.environ[provider]
-    env.update(PATH="/usr/local/bin:/usr/bin:/bin", HOME="/home/sandbox", LANG="C.UTF-8")
     home = Path(env["HOME"])
     work = configure(home, Path("/transcripts"), env)
     task = base64.b64decode(env.pop("FLEET_SANDBOX_TASK_B64", ""), validate=True).decode("utf-8")
@@ -97,8 +127,7 @@ def run():
     # Provider logs can contain credentials or prompt text. Keep them in the
     # private home, not Docker logs or the transcript volume.
     with (home / "harness.log").open("xb") as log:
-        child = subprocess.Popen(args, cwd=work, env=env, stdout=log, stderr=log,
-                                 stdin=subprocess.DEVNULL, start_new_session=True)
+        child = start_harness(args, work, env, log)
 
         def stop(_signum, _frame):
             if child.poll() is None:

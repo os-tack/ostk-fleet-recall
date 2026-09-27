@@ -21,6 +21,7 @@ pub struct ShipperConfig {
     pub format: TranscriptFormat,
     pub token: String,
     pub ca_path: Option<PathBuf>,
+    pub allow_http: bool,
     pub once: bool,
 }
 
@@ -44,7 +45,7 @@ impl Client {
     fn new(config: &ShipperConfig) -> Result<Self> {
         let mut base =
             reqwest::Url::parse(&config.url).map_err(|_| invalid("invalid transcript URL"))?;
-        if !matches!(base.scheme(), "https" | "http")
+        if !(base.scheme() == "https" || (base.scheme() == "http" && config.allow_http))
             || base.host_str().is_none()
             || !base.username().is_empty()
             || base.password().is_some()
@@ -59,19 +60,12 @@ impl Client {
             return Err(invalid("invalid transcript shipper configuration"));
         }
         base.set_path("/");
-        let mut builder = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(40));
-        if let Some(path) = &config.ca_path {
-            let bytes = std::fs::read(path).map_err(|_| invalid("cannot read transcript CA"))?;
-            builder = builder.add_root_certificate(
-                reqwest::Certificate::from_pem(&bytes)
-                    .map_err(|_| invalid("invalid transcript CA"))?,
-            );
-        }
-        let http = builder
+        let http = crate::client_tls::with_ca_bundle(builder, config.ca_path.as_deref())?
             .build()
             .map_err(|_| invalid("cannot build transcript client"))?;
         let root = File::from(

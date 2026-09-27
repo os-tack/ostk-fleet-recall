@@ -10,6 +10,7 @@
 pub mod application;
 pub mod auth;
 pub mod body_store;
+pub mod client_tls;
 pub mod collectors;
 pub mod config;
 pub mod connectors;

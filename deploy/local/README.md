@@ -343,7 +343,7 @@ Run the provider-free end-to-end checkpoint after importing the sandbox image:
 
 ```sh
 python3 deploy/local/bin/sandbox-smoke.py --image ostk-sandbox:m3-local \
-  --bin target/debug/ostk-fleet-recall
+  --bin target/debug/ostk-fleet-recall --allow-http
 ```
 
 The helper tests Docker with the local launcher key and Kubernetes with a

@@ -176,8 +176,11 @@ enum Command {
         #[arg(long, env = "FLEET_RECALL_URL")]
         url: String,
         /// Permit unencrypted HTTP for a private development endpoint.
-        #[arg(long)]
+        #[arg(long, env = "FLEET_RECALL_ALLOW_HTTP")]
         allow_http: bool,
+        /// Additional trusted CA certificates (PEM bundle, at most 256 KiB).
+        #[arg(long, env = "FLEET_RECALL_CA_PATH")]
+        ca_path: Option<PathBuf>,
     },
     /// Serve the Recall MCP protocol over stdin/stdout, or authenticated HTTP.
     Serve {
@@ -279,8 +282,11 @@ enum ShipSubcommand {
         instance: String,
         #[arg(long, default_value = "claude-code", value_parser = ["claude-code", "codex"])]
         format: String,
-        #[arg(long)]
+        #[arg(long, env = "FLEET_RECALL_CA_PATH")]
         ca_path: Option<PathBuf>,
+        /// Permit unencrypted HTTP only in an explicit development profile.
+        #[arg(long, env = "FLEET_RECALL_ALLOW_HTTP")]
+        allow_http: bool,
         #[arg(long)]
         once: bool,
     },
@@ -542,6 +548,7 @@ async fn run_without_database(command: Command) -> anyhow::Result<()> {
                     instance,
                     format,
                     ca_path,
+                    allow_http,
                     once,
                 },
         } => {
@@ -559,6 +566,7 @@ async fn run_without_database(command: Command) -> anyhow::Result<()> {
                     format,
                     token,
                     ca_path,
+                    allow_http,
                     once,
                 },
             )
@@ -569,12 +577,21 @@ async fn run_without_database(command: Command) -> anyhow::Result<()> {
             ostk_fleet_recall::launch::run_launch_command(command).await?;
         }
         Command::ModelDigest { bundle } => println!("{}", model_bundle_sha256(&bundle)?),
-        Command::Shim { url, allow_http } => {
+        Command::Shim {
+            url,
+            allow_http,
+            ca_path,
+        } => {
             let token =
                 std::env::var("FLEET_RECALL_TOKEN").context("FLEET_RECALL_TOKEN is required")?;
-            ostk_fleet_recall::shim::Shim::new(&url, &token, allow_http)?
-                .serve(tokio::io::stdin(), tokio::io::stdout())
-                .await?;
+            ostk_fleet_recall::shim::Shim::new_with_ca(
+                &url,
+                &token,
+                allow_http,
+                ca_path.as_deref(),
+            )?
+            .serve(tokio::io::stdin(), tokio::io::stdout())
+            .await?;
         }
         Command::Embed {
             command:

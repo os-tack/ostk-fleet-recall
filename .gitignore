@@ -23,6 +23,8 @@
 /deploy/aws/backend.hcl
 **/.DS_Store
 *.pem
+# Public test-only TLS certificates and server keys; never deployment material.
+!/tests/fixtures/tls/*.pem
 *.key
 /deploy/local/.state/
 /deploy/local/bin/__pycache__/

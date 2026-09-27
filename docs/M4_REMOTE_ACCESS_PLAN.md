@@ -1,9 +1,36 @@
 # M4: dependable remote access for daily Codex use
 
-Status: proposed implementation plan, 2026-09-27. Baseline: `ea6d43d` on
-`main`, including M3 and the merged Prometheus/Grafana telemetry work. This
-document plans the next milestone; it does not record an M4 deployment.
+Status: implementation in progress, 2026-09-27. M4.1 implements the shared
+client and discovery contract; M4.2–M4.5 remain pending. Baseline: `ea6d43d`
+on `main`, including M3 and the merged Prometheus/Grafana telemetry work. This
+document does not record an M4 deployment.
 The original remote plan ended at M3. M4 is the follow-on described here.
+
+## M4.1 checkpoint
+
+The shared implementation adds bounded CA bundles to shim, shipper, and
+launcher; read-only sandbox trust mounts and retained cleanup trust; explicit
+HTTP development opt-in; human authorization-server and scope metadata
+configuration; and grant lifetime/startup checks. The matching sandbox image
+checks an absolute grant-derived last-start time before invoking a provider,
+including after Kubernetes scheduling delays. Existing launch state remains
+readable for teardown. See [client instructions](REMOTE_PLANE.md) and
+[local/cloud profile examples](../deploy/remote/profiles/README.md).
+
+Automated coverage includes real TLS trust/hostname/expiry/rotation checks,
+shim and transcript transport, grant mint/revoke and failed-launch cleanup,
+metadata boundaries, sandbox credential isolation, and delayed-start refusal.
+Actual image mounts, native Codex OAuth refresh, canonical DNS/edge routing,
+and the second-machine journey still require M4.2/release qualification. The
+running M3 deployment has not been upgraded by this implementation checkpoint.
+
+Validation on Rust 1.94: locked build, strict all-target Clippy, formatting,
+and the standard suite (2,789 passed, 19 ignored); 10 Python sandbox/TLS tests,
+CLI transport checks, local manifest rendering, and `cargo deny check` passed.
+Database-gated tests had no connected database, so this is not new live-SQL
+evidence. UBS's staged-file scan remained partial because its shadow workspace
+lacks unchanged Rust modules; changed-path findings were reviewed, and the
+existing dependency exceptions remain documented in [SECURITY.md](SECURITY.md).
 
 ## Outcome and scope
 

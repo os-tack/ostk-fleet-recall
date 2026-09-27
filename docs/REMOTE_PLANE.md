@@ -6,9 +6,10 @@ server continues to use its deployment identity. M3 adds a pinned embedding
 service, stdio shim, Docker/Kubernetes launcher, and scoped transcript spool
 for Claude Code and Codex. Local in-process embedding remains supported.
 
-The next milestone is planned in [M4: dependable remote access](M4_REMOTE_ACCESS_PLAN.md),
-covering canonical HTTPS identity, local LAN/VPN access, and a separate AWS
-remote deployment. It is a plan, not a completed deployment checkpoint.
+M4 is tracked in [dependable remote access](M4_REMOTE_ACCESS_PLAN.md), covering
+canonical HTTPS identity, local LAN/VPN access, and a separate AWS remote
+deployment. M4.1 implements the client/discovery contract; deployment and
+end-to-end qualification remain pending.
 
 ## Prepare the database and enrollment login
 
@@ -74,6 +75,8 @@ Configure the ordinary writer URL, model, and pinned default scope, plus:
 ```sh
 export FLEET_RECALL_RESOURCE_URL=http://localhost:8080/mcp
 export FLEET_RECALL_OIDC_ISSUERS=human=http://localhost:4444/
+export FLEET_RECALL_OAUTH_ADVERTISED_ANCHORS=human
+export FLEET_RECALL_OAUTH_SCOPES=openid,offline_access,fleet-recall
 export FLEET_RECALL_OIDC_SCOPE_SUBSTITUTES=human=fleet-recall
 # Supply FLEET_RECALL_GRANT_SIGNING_KEY_HEX from a private secret store.
 ostk-fleet-recall serve --http 127.0.0.1:8080
@@ -84,6 +87,18 @@ Then use Claude Code's `/mcp` authentication flow. Discovery is available at
 `/.well-known/oauth-protected-resource/mcp` and its root alias. An
 unauthenticated `/mcp` request returns a Bearer challenge naming that metadata.
 An identity must both verify at a configured anchor and have an enrolled row.
+Set `FLEET_RECALL_OAUTH_ADVERTISED_ANCHORS` to the comma-separated OIDC
+anchor IDs intended for human login, such as `hydra`; other configured anchors
+still verify identities but are omitted from discovery. The setting is required
+with multiple OIDC anchors. An explicit empty value advertises none. Without
+the setting, a single issuer retains its previous behavior unless its discovery
+uses a bearer-token file, in which case it is hidden by default.
+
+`FLEET_RECALL_OAUTH_SCOPES` sets the advertised request scopes (default
+`fleet-recall`). For Hydra/Codex, use `openid,offline_access,fleet-recall` and
+verify refresh-token issuance with the installed client. Both settings reject
+duplicates, unknown advertised anchors, and malformed values. These are
+discovery settings; they do not grant permissions or relax audience policy.
 The stock client may negotiate legacy initialization; the server also accepts
 modern `server/discover` and validates the protocol metadata and mirrored
 headers before dispatch. Responses use JSON, without SSE or HTTP sessions.
@@ -264,7 +279,48 @@ the Recall plane. Only the selected model harness receives provider auth.
 preserving initialization, IDs and notifications. It mirrors the protocol,
 method and encoded name headers and emits diagnostics only on stderr. It
 never retries a mutation after an ambiguous transport failure. Use
-`--allow-http` explicitly for a private non-loopback development endpoint.
+`--allow-http` explicitly for every HTTP development endpoint, including
+loopback. The same opt-in is required by `launch up` and `ship transcripts`;
+`FLEET_RECALL_ALLOW_HTTP=true` is the environment equivalent. Omit it for HTTPS.
+
+All three clients accept `--ca-path PATH` or `FLEET_RECALL_CA_PATH` for an
+additional certificates-only PEM bundle (at most 256 KiB and 256 certificates).
+Default roots remain available and TLS hostname/certificate checks stay on.
+Malformed, empty, oversized, or non-regular files fail before sending a token;
+operator-controlled symlinks are followed to support projected CA volumes.
+Multiple certificates support CA overlap. Clients load trust at startup;
+restart them for a changed bundle. This setting is separate from server-side
+`FLEET_RECALL_OIDC_CA_PATH` and provider-specific trust settings.
+
+The launcher retains a validated public CA snapshot in its private state and
+mounts it read-only into both runtimes. `launch down` uses that snapshot even
+if the original CA file changes. Keep the private state directory until cleanup
+finishes; if trust has rotated, restore a valid retained bundle before retrying
+revocation. Runtime teardown still runs if the bundle is unavailable, and
+pending revocations remain recorded. Existing M3 state remains readable;
+its legacy HTTP allowance is used only for cleanup, not new launches.
+
+Choose `--ttl-seconds` at least `--timeout-seconds + 1020`: this reserves
+720 seconds for bounded runtime startup, 180 for transcript flushing, 60 for
+clock tolerance, and 60 for grant issuance. The default TTL of 3600 covers
+the default 300-second run; use at least 4620 (for example 7200) for a one-hour
+run. Both grants must still have execution time plus 960 seconds remaining
+immediately before runtime creation. A short grant causes cleanup and
+revocation without starting the runtime. This is bounded-job support, not
+automatic renewal of a continuously running sandbox.
+
+New launchers also supply an absolute last-start time derived from the earlier
+grant expiry. The sandbox checks it immediately before invoking the harness,
+after scheduling and configuration delays. A delayed Kubernetes pod therefore
+cannot start a provider session after the safe interval has elapsed. Deploy
+the matching updated sandbox image with the updated launcher to enforce this
+guard and new shipper flags; older M3 images are incompatible with these new
+launches. Rebuild the sandbox image from the same release before using the
+updated launcher. Existing launches remain available for `launch down`.
+
+See the [HTTPS profile examples](../deploy/remote/profiles/README.md) for local
+and cloud canonical URLs. They describe configuration inputs; edge routing,
+certificate provisioning, and Ory URL cutover land in later M4 slices.
 
 With `FLEET_RECALL_TRANSCRIPT_SPOOL_DIR` set, the remote server accepts
 `PUT /v1/transcripts/{sandbox_uuid}/{file}?offset=N` from a matching shipper
