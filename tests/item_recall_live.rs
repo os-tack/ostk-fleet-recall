@@ -69,8 +69,10 @@ use sqlx::PgPool;
 
 use common::authority::retry_policy;
 use common::runtime_role::RuntimeProbeRole;
-use common::worker::{RecordedCi, STUB_MODEL_DIGEST, StubEmbedder, WorkerFixture, vector_toward};
-use ostk_fleet_recall::evidence_recall::LagByKindV1;
+use common::worker::{
+    RecordedCi, STUB_MODEL_DIGEST, StubEmbedder, WorkerFixture, seed_body, vector_toward,
+};
+use ostk_fleet_recall::evidence_recall::{LagByKindV1, LexicalLagBySourceV1};
 
 const SLACK_TEAM: &str = "T07ACME0001";
 const SLACK_CHANNEL: &str = "C07PLATENG1";
@@ -1067,6 +1069,7 @@ async fn live_absence_is_absent_only_over_complete_idle_sources_when_configured(
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // body lag by provider, then lexical lag by source
 async fn live_projection_lag_is_scoped_to_the_provider_asked_for_when_configured() {
     let Some(database_url) = common::test_database_url() else {
         return;
@@ -1160,6 +1163,44 @@ async fn live_projection_lag_is_scoped_to_the_provider_asked_for_when_configured
     let every = search(&recall, "unfindable marmoset").await;
     assert_eq!(lag(&every), (0, LagByKindV1 { items: 0, other: 0 }));
     assert!(!lags(&every), "{:?}", every.absence);
+
+    // A transcript turn's body the lexical projector has not reached is
+    // reported, and does not lag an item answer: only an item's own body can
+    // hold an item.
+    let scope = &fixture.installed.scope;
+    seed_body(
+        &pool,
+        scope.tenant_id,
+        &scope.project,
+        "application.json",
+        br#"{"role":"user","text":"a seeded transcript turn"}"#,
+    )
+    .await;
+    let every = search(&recall, "unfindable marmoset").await;
+    assert!(every.readiness.lexical_current, "{:?}", every.readiness);
+    assert_eq!(
+        every.readiness.lexical_lag_by_source,
+        LexicalLagBySourceV1 {
+            git: 0,
+            items: 0,
+            sessions: 1,
+            other: 0,
+        }
+    );
+    assert!(
+        !every
+            .absence
+            .reasons
+            .contains(&AbsenceReasonV1::LexicalProjectionLag),
+        "{:?}",
+        every.absence
+    );
+    drain(&fixture, &pool, "project").await;
+    let every = search(&recall, "unfindable marmoset").await;
+    assert_eq!(
+        every.readiness.lexical_lag_by_source,
+        LexicalLagBySourceV1::default()
+    );
 }
 
 #[tokio::test]

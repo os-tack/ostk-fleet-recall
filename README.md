@@ -1079,9 +1079,8 @@ ADRs 0005 to 0008 record everything else deferred. The main items are:
   redacted); transcript tool-use,
   tool-result, and thinking records; publication-plane evidence recall (and
   the publication grant on migration 23's filtered views); fusing evidence
-  into chunk recall; registering the coverage labels in a package; scoping
-  the body-projection lag count to the searched kind; a body plane that
-  stays encrypted after
+  into chunk recall; registering the coverage labels in a package; a body
+  plane that stays encrypted after
   projection; a re-embed step; content-bearing webhooks (Slack Socket Mode,
   Linear history), a public relay, and Arrow transport.
 - **Spec conformance.** `ostk-spec retire` and `inspect`; episode

@@ -90,9 +90,9 @@ pub use lexical::{
     lexical_text_digest, redact_for_recall, redact_for_recall_marked,
 };
 pub use repository::{
-    BodyPositionV1, DenseProjector, LexicalProjector, ProjectionCursorV1, ProjectionPassSummaryV1,
-    ProjectorKindV1, RecallCompletenessV1, RecallHitV1, RecallLanesV1, RecallProjectionSnapshotV1,
-    RecallResultV1, RecallTierV1,
+    BodyPositionV1, DenseProjector, LexicalLagBySourceV1, LexicalProjector, ProjectionCursorV1,
+    ProjectionPassSummaryV1, ProjectorKindV1, RecallCompletenessV1, RecallHitV1, RecallLanesV1,
+    RecallProjectionSnapshotV1, RecallResultV1, RecallTierV1,
 };
 pub use visibility::{
     BODY_VISIBILITY_TABLE, BodyVisibilityV1, PRIVATE_PLANE_RECALL_TABLES, PUBLICATION_PLANE_VIEWS,

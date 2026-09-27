@@ -17,7 +17,7 @@ use ostk_fleet_recall::connectors::ci::scan::{
 use ostk_fleet_recall::connectors::ci::{CiRunProvider, CiScanResult};
 use ostk_fleet_recall::control_log::TrustedControlScope;
 use ostk_fleet_recall::coverage_runtime::CockroachCoverageRuntimeRepository;
-use ostk_fleet_recall::memory_contracts::digest::Sha256Digest;
+use ostk_fleet_recall::memory_contracts::digest::{Sha256Digest, body_digest};
 use ostk_fleet_recall::projectors::{ChunkEmbedderProvider, CockroachRecallReader};
 use ostk_fleet_recall::store::cockroach::RetryPolicy;
 use ostk_fleet_recall::worker::{
@@ -26,6 +26,7 @@ use ostk_fleet_recall::worker::{
 use ostk_recall_core::ChunkEmbedder;
 use sha2::{Digest as _, Sha256};
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use ostk_fleet_recall::registry_activation::install::InstallTargetV1;
 
@@ -453,4 +454,35 @@ impl WorkerFixture {
             self.installed.scope.project.clone(),
         )
     }
+}
+
+/// Insert one content-addressed body of `media_type` directly into the body
+/// plane, with no evidence event and no lexical row: a body the lexical
+/// projector has yet to reach, standing in for a backlog of that source.
+/// Returns its content address.
+pub async fn seed_body(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    project: &str,
+    media_type: &str,
+    bytes: &[u8],
+) -> Sha256Digest {
+    let content_id = body_digest(bytes);
+    sqlx::query(
+        "INSERT INTO public.memory_body_objects_v1 (\
+             tenant_id, project, content_sha256, byte_length, body_bytes, media_type, \
+             protection_domain_id, first_accepted_event_id, created_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,'project.fixture',$7,pg_catalog.statement_timestamp())",
+    )
+    .bind(tenant_id)
+    .bind(project)
+    .bind(content_id.as_bytes().to_vec())
+    .bind(i64::try_from(bytes.len()).unwrap())
+    .bind(bytes.to_vec())
+    .bind(media_type)
+    .bind(vec![0x66_u8; 32])
+    .execute(pool)
+    .await
+    .expect("the seeded body inserts");
+    content_id
 }

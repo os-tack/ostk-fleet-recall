@@ -70,7 +70,12 @@
 //! collected items or the project's own; a scoped verdict reads that split
 //! (`items` for `items`, `other` for `git` and `sessions`, so a pending
 //! transcript turn still blocks "absent from git"), and the total when the
-//! split cannot be read.
+//! split cannot be read. The lexical tier's lag is split the same way
+//! (`lexical_lag_by_source`: `git`, `items`, `sessions`, `other`, by the
+//! media type of each body still to be projected); a scoped verdict reads
+//! its own bucket, the unscoped verdict reads `lexical_current`, and every
+//! scope reads `lexical_current` when the split cannot be read. Only a
+//! truncated listing blocks every scope.
 //!
 //! "Complete" is the newest coverage cursor of each source. For git that is
 //! the latest observed ref target; for CI, the latest window of runs; for a
@@ -173,6 +178,8 @@ use crate::memory_contracts::coverage::CoverageCompletenessV1;
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::projectors::lexical::{CANONICAL_JSON_MEDIA_TYPE, GIT_FACT_MEDIA_TYPE};
 use crate::projectors::{RowVisibilityClassV1, fold_lexical_characters};
+
+pub use crate::projectors::LexicalLagBySourceV1;
 use crate::store::cockroach::MEMORY_WORKER_SCHEMA_VERSION;
 use crate::worker::{WorkerSourceKindV1, WorkerSourceOutcomeV1};
 
@@ -315,6 +322,12 @@ pub struct EvidenceReadinessV1 {
     pub collector_state_unreadable: bool,
     /// Every body has been through the lexical projector.
     pub lexical_current: bool,
+    /// The bodies still to go through it, split by the source their media
+    /// type belongs to; absent when the split cannot be read. A scoped
+    /// verdict reads its own bucket, the unscoped verdict reads
+    /// `lexical_current`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lexical_lag_by_source: Option<LexicalLagBySourceV1>,
     /// Every lexically searchable body also has an embedding.
     pub dense_current: bool,
     pub dense_lane: EvidenceDenseLaneV1,
@@ -585,7 +598,9 @@ pub enum AbsenceReasonV1 {
     BodyProjectionLag,
     /// Transcript turns or collected items are waiting in an outbox.
     IngestOutboxPending,
-    /// Some body has not been through the lexical projector.
+    /// Some body has not been through the lexical projector: of the scoped
+    /// source when `lexical_lag_by_source` is readable, of any source
+    /// otherwise.
     LexicalProjectionLag,
     /// No source is active in this scope.
     NoSourcesRegistered,
@@ -1015,6 +1030,7 @@ mod tests {
             hints_unreadable: false,
             collector_state_unreadable: false,
             lexical_current: true,
+            lexical_lag_by_source: None,
             dense_current: true,
             dense_lane: EvidenceDenseLaneV1::NoQueryVector,
             as_of: DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
@@ -1044,6 +1060,44 @@ mod tests {
             serde_json::to_value(&collapsed).unwrap()["duplicates_collapsed"],
             2
         );
+    }
+
+    #[test]
+    fn lexical_lag_by_source_is_serialized_only_when_read() {
+        let unsplit = EvidenceReadinessV1 {
+            events_awaiting_body_projection: 0,
+            lag_by_kind: None,
+            transcript_turns_awaiting_admission: 0,
+            items_awaiting_admission: None,
+            hints_awaiting_fetch: None,
+            hints_unreadable: false,
+            collector_state_unreadable: false,
+            lexical_current: false,
+            lexical_lag_by_source: None,
+            dense_current: false,
+            dense_lane: EvidenceDenseLaneV1::NoQueryVector,
+            as_of: DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
+        };
+        let value = serde_json::to_value(&unsplit).unwrap();
+        assert_eq!(value["lexical_current"], false);
+        assert!(
+            value.get("lexical_lag_by_source").is_none(),
+            "no split read, no field: {value}"
+        );
+        let split = EvidenceReadinessV1 {
+            lexical_lag_by_source: Some(LexicalLagBySourceV1 {
+                git: 0,
+                items: 0,
+                sessions: 2,
+                other: 1,
+            }),
+            ..unsplit
+        };
+        assert_eq!(
+            serde_json::to_value(&split).unwrap()["lexical_lag_by_source"],
+            serde_json::json!({ "git": 0, "items": 0, "sessions": 2, "other": 1 })
+        );
+        assert_eq!(split.lexical_lag_by_source.unwrap().total(), 3);
     }
 
     #[test]

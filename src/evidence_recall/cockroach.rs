@@ -544,7 +544,11 @@ impl CockroachEvidenceRecall {
     /// Ingestion and projection lag. Read after the sources and before the
     /// lanes, and upstream first: hints, the collector outbox, the evidence
     /// awaiting projection, then the lexical tier (see the module
-    /// documentation).
+    /// documentation). The lexical tier is read twice, its completeness and
+    /// its backlog split by source; a body projected between the two reads
+    /// can make them disagree by one row, which the verdict tolerates
+    /// (each scope trusts its own bucket, the unscoped verdict the
+    /// completeness).
     async fn read_readiness(
         &self,
         dense_lane: EvidenceDenseLaneV1,
@@ -582,6 +586,7 @@ impl CockroachEvidenceRecall {
             .fetch_one(&self.pool)
             .await?;
         let completeness = self.reader(state).completeness().await?;
+        let lexical_lag_by_source = self.reader(state).lexical_backlog_by_media().await?;
         let events_awaiting_body_projection = count(&row, "events_awaiting_bodies")?;
         let lag_by_kind = if state.readable() {
             let items = count(&row, "items_awaiting_bodies")?;
@@ -601,6 +606,7 @@ impl CockroachEvidenceRecall {
             hints_unreadable: hints.unreadable(),
             collector_state_unreadable: state == CollectorStateV1::Unreadable,
             lexical_current: completeness.lexical_complete(),
+            lexical_lag_by_source: Some(lexical_lag_by_source),
             dense_current: completeness.dense_complete(),
             dense_lane,
             as_of: row.try_get::<DateTime<Utc>, _>("as_of")?,

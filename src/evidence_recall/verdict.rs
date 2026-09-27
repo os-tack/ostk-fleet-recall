@@ -207,8 +207,10 @@ fn strongest_neighbour(votes: &[HitVoteV1]) -> Option<(usize, f32)> {
 /// unscoped verdict; and body projection lag is read from `lag_by_kind`
 /// (`items` for `items`, `other` for `git` and `sessions`, so a pending
 /// transcript turn still blocks "absent from git") when the split is
-/// readable, and from the total otherwise. The lexical tier's lag and a
-/// truncated listing block every scope.
+/// readable, and from the total otherwise. Lexical projection lag is read
+/// from `lexical_lag_by_source` the same way (each filter its own bucket)
+/// when that split is readable, and from `lexical_current` otherwise. A
+/// truncated listing blocks every scope.
 #[must_use]
 pub fn absence_verdict(
     votes: &[HitVoteV1],
@@ -325,7 +327,15 @@ fn readiness_reasons(
     if judges_items && (readiness.collector_state_unreadable || readiness.hints_unreadable) {
         reasons.insert(AbsenceReasonV1::CollectorStateUnreadable);
     }
-    if !readiness.lexical_current {
+    // The lexical backlog is split by source the same way; without the split
+    // (or without a scope) the whole tier must be current.
+    let lexical_projection_lag = match (scope, readiness.lexical_lag_by_source) {
+        (Some(EvidenceSourceFilterV1::Git), Some(lag)) => lag.git > 0,
+        (Some(EvidenceSourceFilterV1::Items), Some(lag)) => lag.items > 0,
+        (Some(EvidenceSourceFilterV1::Sessions), Some(lag)) => lag.sessions > 0,
+        (None, _) | (_, None) => !readiness.lexical_current,
+    };
+    if lexical_projection_lag {
         reasons.insert(AbsenceReasonV1::LexicalProjectionLag);
     }
 }
@@ -356,7 +366,7 @@ mod tests {
 
     use super::super::{
         EvidenceCoverageV1, EvidenceDenseLaneV1, EvidenceSourceKindV1, EvidenceSourceV1,
-        EvidenceSourcesV1, LagByKindV1,
+        EvidenceSourcesV1, LagByKindV1, LexicalLagBySourceV1,
     };
     use super::*;
 
@@ -374,6 +384,7 @@ mod tests {
             hints_unreadable: false,
             collector_state_unreadable: false,
             lexical_current: true,
+            lexical_lag_by_source: None,
             dense_current: true,
             dense_lane: EvidenceDenseLaneV1::NoQueryVector,
             as_of: instant(100),
@@ -1162,6 +1173,71 @@ mod tests {
         for reasons in scoped_reasons(&unsplit, &every_kind()) {
             assert_eq!(reasons, lag);
         }
+    }
+
+    #[test]
+    fn lexical_projection_lag_follows_the_kind_the_filter_covers() {
+        let lag = [AbsenceReasonV1::LexicalProjectionLag];
+        let split = |git, items, sessions, other| {
+            let mut readiness = current();
+            readiness.lexical_current = false;
+            readiness.lexical_lag_by_source = Some(LexicalLagBySourceV1 {
+                git,
+                items,
+                sessions,
+                other,
+            });
+            readiness
+        };
+
+        // A transcript backlog blocks sessions and the unscoped verdict only.
+        let [from_git, from_items, from_sessions, unscoped] =
+            scoped_reasons(&split(0, 0, 2, 0), &every_kind());
+        assert!(
+            from_git.is_empty(),
+            "a transcript backlog does not block git"
+        );
+        assert!(from_items.is_empty());
+        assert_eq!(from_sessions, lag);
+        assert_eq!(unscoped, lag);
+
+        let [from_git, from_items, from_sessions, unscoped] =
+            scoped_reasons(&split(1, 0, 0, 0), &every_kind());
+        assert_eq!(from_git, lag);
+        assert!(from_items.is_empty());
+        assert!(from_sessions.is_empty());
+        assert_eq!(unscoped, lag);
+
+        let [from_git, from_items, from_sessions, unscoped] =
+            scoped_reasons(&split(0, 1, 0, 0), &every_kind());
+        assert!(from_git.is_empty());
+        assert_eq!(from_items, lag);
+        assert!(from_sessions.is_empty());
+        assert_eq!(unscoped, lag);
+
+        // A body of a media type no filter covers lags the unscoped verdict
+        // alone.
+        let [from_git, from_items, from_sessions, unscoped] =
+            scoped_reasons(&split(0, 0, 0, 1), &every_kind());
+        assert!(from_git.is_empty() && from_items.is_empty() && from_sessions.is_empty());
+        assert_eq!(unscoped, lag);
+
+        // Without the split, the tier's completeness counts for every scope.
+        let mut unsplit = current();
+        unsplit.lexical_current = false;
+        unsplit.lexical_lag_by_source = None;
+        for reasons in scoped_reasons(&unsplit, &every_kind()) {
+            assert_eq!(reasons, lag);
+        }
+
+        // The split and the completeness are two reads of one tier: a body
+        // projected between them leaves the split empty and the tier not yet
+        // current. Each scope trusts its own bucket; the unscoped verdict
+        // trusts the completeness.
+        let [from_git, from_items, from_sessions, unscoped] =
+            scoped_reasons(&split(0, 0, 0, 0), &every_kind());
+        assert!(from_git.is_empty() && from_items.is_empty() && from_sessions.is_empty());
+        assert_eq!(unscoped, lag);
     }
 
     #[test]
