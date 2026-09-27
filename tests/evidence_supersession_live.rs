@@ -335,7 +335,10 @@ async fn live_the_pass_supersedes_a_raw_git_fact_and_its_replay_stops_quarantini
     assert_eq!(status(&report, WorkerStepV1::Git), WorkerStepStatusV1::Ok);
     assert_eq!(counter(&report, WorkerStepV1::Git, "quarantined"), 1);
     assert_eq!(counter(&report, WorkerStepV1::Git, "facts_redacted"), 1);
-    assert_eq!(status(&report, WorkerStepV1::Bodies), WorkerStepStatusV1::Ok);
+    assert_eq!(
+        status(&report, WorkerStepV1::Bodies),
+        WorkerStepStatusV1::Ok
+    );
     let summary = quarantine_summary(
         &pool,
         fixture.installed.scope.tenant_id,
