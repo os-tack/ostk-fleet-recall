@@ -230,6 +230,24 @@ Migrations 19 onward follow the same resumable pattern: each carries the
 close with catalog-shape assertions that fail with SQLSTATE `55000` on a
 same-name object of another shape.
 
+Migration 37 (ADR 0006 D9, amendment of 2026-09-27) is the first change to
+`memory_evidence_events` since 18: one nullable column,
+`predecessor_representation_key_digest`, its `octet_length = 32` CHECK
+installed by a separate `ADD CONSTRAINT IF NOT EXISTS` (resumable, exactly as
+18's columns), and one scope-prefixed index
+`memory_evidence_events_predecessor_key_idx` `STORING (event_id, event_kind)`
+(the primary-key position columns are implicit in every secondary index, so
+the catalog renders only those two). Each step commits on its own. No row is
+backfilled: every event stored before 37 keeps `NULL`, which is exact, since
+no connector ever appended a `supersedes` lineage; the ledger fills the
+column from the statement's lineage on INSERT only, and the accepted
+envelope is still never updated. The closing assertion pins the exact
+sixteen-column shape of the table, the constraint definition, and the
+`pg_indexes.indexdef` of the index (formatted with `current_database()`,
+like 16 and 17). The runtime, publication, and ingress policies gate on the
+bounded prefix 1 through 36 and stay valid; only the supersession policy
+below requires 37.
+
 Resumability is an operational constraint, not permission to run migration
 casually:
 
@@ -873,6 +891,54 @@ runtime credential, MCP method, or HTTP route. The successor and
 reconciliation policies do not self-compose: the cluster admin still performs
 the conditional cleanup and cross-database/PUBLIC audit before each policy
 apply and exclusive member window.
+
+### At-rest supersession gate
+
+The at-rest supersession pass (ADR 0006 D9, amendment of 2026-09-27) rewrites
+every git fact admitted before redaction profile 3: it appends the redacted
+rendering as a `supersedes` successor of the raw representation key and, in
+the same serializable transaction, removes the raw body plane and content
+object. It needs migration 37's predecessor-key column, so the pass and the
+role policy both require the complete successful prefix 1 through 37 (25
+unused); a later successful migration is compatible but cannot mask a missing
+or failed prerequisite. Before applying
+[`supersession-role-grants.sql`](../deploy/cockroach/supersession-role-grants.sql),
+apply the control and genesis-activation role policies and confirm their three
+logical roles are hardened, exactly as for reconciliation; the policy is the
+reconciliation policy's gates with the name substituted, and it additionally
+refuses either direction of membership with the reconciliation role. Run it in
+the dedicated `fleet_recall` database as a cluster admin only. Its exact
+postcondition is a thirty-one-row grant matrix: SELECT on `_sqlx_migrations`,
+`memory_writer_authority_v1`, `memory_evidence_events`,
+`memory_evidence_quarantine`, `memory_evidence_shard_heads`,
+`memory_content_objects`, and the eight body-plane tables; INSERT on the
+events, the quarantine, the shard heads, and the content store; UPDATE on the
+shard heads and the content store; DELETE on the content store and the eight
+body-plane tables. `fleet_runtime` keeps its exact 144-row matrix and gains no
+DELETE.
+
+The operator preflight, quiescence, cross-database audit, and PUBLIC-default
+cleanup are the reconciliation gate's, applied to `fleet_supersession`.
+Provision a separate login externally and grant it membership only in that
+`NOLOGIN` role while every other member credential is quiesced. The CLI reads
+only `FLEET_RECALL_SUPERSESSION_{DATABASE_URL,TENANT_ID,PROJECT}` (strict TLS,
+no local escape) plus the writer-authority pin group and
+`FLEET_RECALL_CONTENT_KEK_HEX`, which it needs to append under the active head
+and to open the raw content it rewrites:
+
+```bash
+cargo run --locked --bin ostk-evidence-supersede -- apply --sources sources.json --dry-run
+cargo run --locked --bin ostk-evidence-supersede -- apply --sources sources.json
+```
+
+The command is apply-only, prints one JSON report (`superseded`,
+`skipped_with_successor`, `unchanged_under_profile`, `source_unbound`,
+`content_shared_skipped`, `transcript_turns_raw_at_rest`, `quarantined`,
+`rows_removed` per table), is idempotent, and exits 1 when the ledger
+quarantined a successor. Remove membership or disable the login immediately
+afterward. The local quickstart applies no such policy and its insecure node
+cannot run the binary; there the pass is reachable only as the library call
+the connected proof makes as root.
 
 ## Failure and interruption recovery
 

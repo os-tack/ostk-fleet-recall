@@ -244,7 +244,7 @@ schema. These return an error or are unused today; see the
 
 `src/bin` holds private workstation tools. None is copied into the production
 image or wired into Terraform, ECS, the public HTTP service, or normal
-MCP/runtime startup. Each of the first seven below reads a dedicated private
+MCP/runtime startup. Each of the first eight below reads a dedicated private
 database URL instead of the serving one. The last two,
 `ostk-authority-install` and `ostk-spec`, read `FLEET_RECALL_DATABASE_URL`
 like the `ostk-fleet-recall` commands: the installer as the migrator, like
@@ -260,6 +260,13 @@ like the `ostk-fleet-recall` commands: the installer as the migrator, like
   `N -> N+1` registry transition.
 - `ostk-conflict-reconcile` is apply-only and materializes a new v2 conflict
   lineage for one immutable legacy conflict revision.
+- `ostk-evidence-supersede` is apply-only (`apply --sources <file>
+  [--dry-run]`) and closes the pre-profile-3 residual for git facts: it
+  appends each raw fact's redacted rendering as a `supersedes` successor and
+  removes the raw body, its derived rows, and its content object in the same
+  transaction, leaving the raw event row as the tombstone; see
+  [closing the pre-profile-3 residual](#closing-the-pre-profile-3-residual)
+  and the [security notes](docs/SECURITY.md#residual-sql-authority-and-recovery).
 - `ostk-bootstrap-manifest-import` admits legacy chunks, claims, conflicts, and
   receipts as one signed, content-addressed bootstrap-manifest event.
 - `ostk-observer-run` runs the exhaustive observer over one enum at one exact
@@ -1045,6 +1052,47 @@ the collectors and the webhook receiver for real takes.
    file names, behind a relay you run for the providers. The next worker tick
    whose steps include `collect` settles what it received.
 
+### Closing the pre-profile-3 residual
+
+A git fact admitted before redaction profile 3 keeps its raw rendering at
+rest (its content object under the key, and its projected body in
+plaintext), and every full walk re-presents it redacted and quarantines it
+as a preimage disagreement: `recall(status).quarantine` names them, and
+`recall(brief)` and the trial notes call that set the worklist. One pass
+rewrites them:
+
+```bash
+export FLEET_RECALL_SUPERSESSION_DATABASE_URL='postgresql://root@127.0.0.1:26257/fleet_recall?sslmode=verify-full&sslrootcert=/path/ca.crt'
+export FLEET_RECALL_SUPERSESSION_TENANT_ID=<tenant uuid>
+export FLEET_RECALL_SUPERSESSION_PROJECT=<project>
+# plus the writer-authority pins and FLEET_RECALL_CONTENT_KEK_HEX the worker uses
+cargo run --locked --bin ostk-evidence-supersede -- apply --sources sources.json --dry-run
+cargo run --locked --bin ostk-evidence-supersede -- apply --sources sources.json
+```
+
+The dry run prints the decisions (`superseded`, `unchanged_under_profile`,
+`skipped_with_successor`, `source_unbound`, `transcript_turns_raw_at_rest`)
+and writes nothing. The apply appends, for each raw fact, its redacted
+rendering as a `supersedes` successor through the same admission seam the
+git ingress uses, and in the same transaction removes the raw body, the
+occurrences, spans, lexical, dense, and visibility rows derived from it, its
+manifest and generation pointer, and its content object when no other
+accepted event shares the digest; `rows_removed` counts them per table and
+the raw event row stays as the tombstone. It is idempotent (a second run
+reports `skipped_with_successor`), exits 1 if the ledger quarantined a
+successor, and runs under the separately privileged `fleet_supersession`
+role (`deploy/cockroach/supersession-role-grants.sql`). Like the other
+one-shot ceremonies the binary refuses a URL without `sslmode=verify-full`
+and has no insecure-local escape, so the insecure quickstart node applies
+no policy and cannot run the binary at all: there the pass is reachable only
+as the library call (`evidence_supersession::run_supersession`) the
+connected proof in `tests/evidence_supersession_live.rs` makes as root.
+Afterwards the next full walk reports the facts
+`replayed`, a full re-projection counts them under
+`events_superseded_erased`, and `recall(status)` reports
+`resolved_preimage_disagreements` and stops warning about them. Transcript
+turns are counted, not rewritten.
+
 ## Not built yet
 
 The design in
@@ -1074,9 +1122,12 @@ ADRs 0005 to 0008 record everything else deferred. The main items are:
   conflict projections.
 - **Worker and evidence recall.** A long-running `--interval` loop and
   managed scheduling; `git` and `gh` in the production image; changed-path and
-  incremental git scans; supersession or erasure of bodies admitted before
-  redaction profile 3 (their bodies stay raw at rest; only the recall text is
-  redacted); transcript tool-use,
+  incremental git scans; supersession of transcript turns admitted before
+  redaction profile 3 (the git residual is closed by
+  `ostk-evidence-supersede`; a raw transcript turn's body stays raw at rest,
+  counted by the pass as `transcript_turns_raw_at_rest`, with only its recall
+  text redacted, because its revision closes over the body digest and the
+  outbox keeps a copy); transcript tool-use,
   tool-result, and thinking records; publication-plane evidence recall (and
   the publication grant on migration 23's filtered views); fusing evidence
   into chunk recall; registering the coverage labels in a package; scoping
