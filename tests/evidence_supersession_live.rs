@@ -32,7 +32,7 @@ use ostk_fleet_recall::body_store::{
 };
 use ostk_fleet_recall::connectors::git::{
     GitConnectorBindingV1, GitFactV1, GitIngressClocksV1, GitRepositoryReader, GitScanRequestV1,
-    GitTreeScanModeV1,
+    GitTreeScanModeV1, redact_git_fact,
 };
 use ostk_fleet_recall::evidence_ledger::{
     AcceptedEventRepository as _, AppendOutcome, EvidenceAdmissionRequestV1,
@@ -49,6 +49,7 @@ use ostk_fleet_recall::memory_contracts::evidence_v2::{
     EvidenceStatementV2, RepresentationLineageV2,
 };
 use ostk_fleet_recall::memory_contracts::generation2_registry::GIT_CONNECTOR;
+use ostk_fleet_recall::redaction::RedactionGuaranteeV1;
 use ostk_fleet_recall::registry_witness::WriterAuthorityRuntime;
 use ostk_fleet_recall::worker::{WorkerStepStatusV1, WorkerStepV1, WorkerTickReportV1};
 use sqlx::PgPool;
@@ -168,6 +169,8 @@ struct RawFact {
     statement: EvidenceStatementV2,
     event_id: AcceptedEventId,
     storage_identity: Sha256Digest,
+    /// The planted commit's id, for presenting it again.
+    commit_hex: String,
 }
 
 /// Commit a message quoting the token on top of main and admit its commit
@@ -270,7 +273,94 @@ async fn admit_raw_commit(
         statement: admitted.statement().clone(),
         event_id: appendable.accepted_event_id(),
         storage_identity: ingress.candidate.canonical_payload.storage_identity,
+        commit_hex: raw_commit,
     }
+}
+
+/// Present the planted commit again the way a full walk does after the
+/// upgrade: scanned from the root, redacted under the active guarantee, and
+/// admitted with `Origin` lineage, whose representation key is the raw
+/// event's. Returns the ledger's outcome for that presentation.
+async fn present_redacted_commit(
+    pool: &PgPool,
+    fixture: &Fixture,
+    runtime: &WriterAuthorityRuntime,
+    raw_commit: &str,
+) -> AppendOutcome {
+    let verified = runtime.verify().await.unwrap();
+    let active = verified
+        .bind_connector(&ContractId::new(GIT_CONNECTOR.connector_schema).unwrap())
+        .unwrap();
+    let guarantee = RedactionGuaranteeV1::from_active_package(&active).unwrap();
+    let binding = GitConnectorBindingV1::resolve(
+        &active,
+        ContractId::new("connector.git").unwrap(),
+        ContractId::new(GIT_INSTANCE).unwrap(),
+        INSTALLATION_ID,
+    )
+    .unwrap();
+    let sources = fixture.sources();
+    let source = &sources.git[0];
+    let reader =
+        GitRepositoryReader::new(&source.git_dir, source.repository().unwrap(), None).unwrap();
+    let scan = reader
+        .scan(&GitScanRequestV1 {
+            ref_name: source.ref_name().unwrap(),
+            max_commits: source.max_commits,
+            max_facts: source.max_facts,
+            tree_mode: GitTreeScanModeV1::CommitsOnly,
+            exclude: Vec::new(),
+        })
+        .unwrap();
+    let raw_fact = scan
+        .facts
+        .iter()
+        .find(|fact| matches!(fact, GitFactV1::Commit(commit) if commit.commit_id.to_hex() == raw_commit))
+        .expect("the planted commit is still in a full walk")
+        .clone();
+    let (redacted, redaction) = redact_git_fact(&guarantee, &raw_fact).unwrap();
+    assert!(
+        redaction.redacted(),
+        "the guarantee rewrites the planted token"
+    );
+
+    let now: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT pg_catalog.statement_timestamp()")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let ingress = binding
+        .build_ingress(
+            &redacted,
+            &GitIngressClocksV1 {
+                received_at: CanonicalTimestamp::from_datetime(&now).unwrap(),
+            },
+            1,
+        )
+        .unwrap();
+    let admitted = admit_evidence(
+        &active,
+        EvidenceAdmissionRequestV1 {
+            candidate: &ingress.candidate,
+            locators: &ingress.locators,
+            canonical_payload: &ingress.canonical_payload,
+            delivery: ingress.delivery.clone(),
+            lineage: RepresentationLineageV2::Origin,
+        },
+    )
+    .unwrap();
+    let projection = GovernedContentProjection::new(
+        runtime.control_scope(),
+        admitted.content(),
+        &fixture.installed.kek(),
+    )
+    .unwrap();
+    let appendable = admitted.appendable(verified.append_witness()).unwrap();
+    runtime
+        .ledger()
+        .append(verified.append_witness(), &appendable, Arc::new(projection))
+        .await
+        .unwrap()
 }
 
 fn body_projector(pool: &PgPool, fixture: &Fixture) -> CockroachBodyProjectionRepository {
@@ -517,8 +607,10 @@ async fn live_the_pass_supersedes_a_raw_git_fact_and_its_replay_stops_quarantini
         events_before + 1
     );
 
-    // (6) The next full walk (the ref moved) replays the fact through its
-    // successor instead of quarantining it, and the body step is fine.
+    // (6) The next tick (the ref moved) walks only past the last receipt,
+    // so the superseded commit is not even re-presented; the body step is
+    // fine. A full walk would re-present it: done by hand below, the ledger
+    // answers with a replay that cites the successor, not a quarantine.
     let head = fixture.repository.head();
     fixture
         .repository
@@ -531,10 +623,21 @@ async fn live_the_pass_supersedes_a_raw_git_fact_and_its_replay_stops_quarantini
     assert_eq!(status(&report, WorkerStepV1::Git), WorkerStepStatusV1::Ok);
     assert_eq!(counter(&report, WorkerStepV1::Git, "quarantined"), 0);
     assert_eq!(
-        counter(&report, WorkerStepV1::Git, "replayed"),
-        3,
-        "the two fixture commits and the superseded one: {report:?}"
+        counter(&report, WorkerStepV1::Git, "commits_walked"),
+        1,
+        "an incremental walk touches the new commit only: {report:?}"
     );
+    assert_eq!(counter(&report, WorkerStepV1::Git, "replayed"), 0);
+    let successor_id = successor.accepted_event_id().unwrap();
+    match present_redacted_commit(&pool, &fixture, &runtime, &raw.commit_hex).await {
+        AppendOutcome::Replayed {
+            accepted_event_id, ..
+        } => assert_eq!(
+            accepted_event_id, successor_id,
+            "a full walk's presentation stands for the successor"
+        ),
+        other => panic!("a superseded fact must replay, not {other:?}"),
+    }
     assert_eq!(
         status(&report, WorkerStepV1::Bodies),
         WorkerStepStatusV1::Ok
