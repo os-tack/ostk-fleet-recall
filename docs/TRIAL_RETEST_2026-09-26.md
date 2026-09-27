@@ -270,5 +270,54 @@ dense-vote exclusion for git facts stays until re-measured on the new text.
 **Next steps.** Replies on `get` behind an index
 on `thread_root_external_id`; the at-rest supersession pass that rewrites
 pre-profile-3 bodies, for which `redacted_at_read` and the quarantine
-sample are now the worklist; scoping worker-ingested lag per kind on
-evidence searches.
+sample are now the worklist (the same nine git facts are re-quarantined on
+every full tick until then); scoping the lexical-tier lag per kind (the
+body-projection lag is scoped since the self-ingest round below).
+
+## Self-ingest round, 2026-09-27: the repository in its own memory
+
+The stack was pointed at this repository: every tracked Markdown and text
+file, the git history, and a snapshot of both Claude Code sessions with
+their 209 subagent and workflow transcripts (165 MB, 213 files). One tick
+admitted 5,423 text turns, skipped 57,711 tool and bookkeeping records,
+redacted 9 turns, walked 541 commits, and staged 190 document sections;
+projection and embedding took about an hour on a laptop.
+
+**What it says about the project.** Asked as a fresh agent, the memory
+answers with the right sources on top: what absence means (the debate's
+coding-agent argument, FR-127, the 0.18-floor finding), what the trial
+found, which tokens the transcript connector redacts (the plan, the fix
+record, the briefs), how claim keys are normalized (the debate position,
+the commit, the fixed finding). The scope brief read 222 active sources,
+2 open conflicts, 0 legacy keys, 19 quarantined facts. "What is this
+project" still finds compaction summaries before the README's own opening,
+and "what is unfinished" finds coverage prose before the follow-up list:
+abstract questions still lose to the small model's flat similarities.
+
+**What it exposed, and the fixes** (`425dc9b`, `fe2c92d`, `6d4ffed`):
+
+| Finding | Fix |
+| --- | --- |
+| The parser refused a file from the first record of an unknown `type` (`agent-name`, `started`); this session's transcript stopped at line 1377 of 3744 | Parser generation 4 admits the nine kinds local sessions carry; an unknown kind without a `message` is skipped, counted (`records_unknown_skipped`), and named on the source (`skipped_kinds`); one with a `message` still refuses |
+| A subagent file was refused whole for a U+FFFF in a prompt | Noncharacters and private-use scalars fold to a space before canonical encoding (rule `forbidden_scalar_fold`) |
+| After a document edit, evidence search listed the old and new version of every unchanged section (tied scores, the old one `current: false`) | Identical recall text of one item collapses to its presented head before the cut; the answer reports `duplicates_collapsed` |
+| Three failed transcript sources put `source_failed` on every verdict, including `source=git` | The verdict judges only the sources the filter covers (git, items, sessions); listing, readiness and warnings stay scope-wide; body-projection lag follows `lag_by_kind` |
+| A git snippet was the alphabetical leaf walk of the fact | Normalization version 4 lays a git fact out message first (`commit <sha> <message> author … parents … tree …`) |
+
+**Re-measured on the stack** after one full tick (all three refused files
+`ok`, 114 more turns admitted, 6,787 rows re-projected and re-embedded, a
+second tick re-projects 0): the top git hit for "brief" reads `commit
+b06db64… feat(recall): brief, one call to orient an agent`; the edited
+README section returns one hit, current, `duplicates_collapsed: 1`; the
+never-discussed "GraphQL schema stitching federation gateway" reads
+`absent` with `source: git` (the scope's first genuine absent), `unknown
+[dense_neighbour_below_bound]` on items, `unknown [incomplete_coverage]` on
+sessions, and nothing says `source_failed`; the second half of this session
+is now in memory, so the blind-trust framing is found in the transcript's
+own compaction summary and not only in the briefs that quoted it.
+
+**Two things the round burned.** The memory now holds the discussion of its
+own absent probes, so "kubernetes helm chart" reads `present` on the turn
+that proposed it: probes for this scope must be new words. And a session
+transcript quotes its own tool output, so the `evidence_source_failed`
+warning text and the failing file names are themselves recallable.
