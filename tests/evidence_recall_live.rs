@@ -34,13 +34,13 @@ use common::authority::retry_policy;
 use common::runtime_role::RuntimeProbeRole;
 use common::worker::{
     COMMIT_WORD, FAILING_STEP_WORD, GIT_INSTANCE, STUB_MODEL_DIGEST, StubEmbedder,
-    TRANSCRIPT_PREFIX, TRANSCRIPT_WORD, WorkerFixture, vector_toward,
+    TRANSCRIPT_PREFIX, TRANSCRIPT_WORD, WorkerFixture, seed_body, vector_toward,
 };
 use ostk_fleet_recall::evidence_recall::{
     ABSENCE_DENSE_MIN_COSINE_SIMILARITY, ABSENCE_NEIGHBOUR_BAND_FLOOR, AbsenceReasonV1,
     AbsenceScopeV1, AbsenceVerdictV1, CockroachEvidenceRecall, DENSE_VOTE_EXCLUDED_MEDIA_TYPES,
     EvidenceDenseLaneV1, EvidenceMatchV1, EvidenceRecall, EvidenceSearchV1, EvidenceSourceFilterV1,
-    LagByKindV1, PresentByV1, probe_evidence_recall, start_evidence_recall,
+    LagByKindV1, LexicalLagBySourceV1, PresentByV1, probe_evidence_recall, start_evidence_recall,
 };
 use ostk_fleet_recall::ledger::CockroachClaimLedger;
 use ostk_fleet_recall::mcp::{McpServer, tool_list, tool_list_for_surfaces};
@@ -148,6 +148,7 @@ async fn event_exists(pool: &PgPool, fixture: &WorkerFixture, event_id: Sha256Di
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // three sources, both lanes, status, and a foreign model
 async fn live_evidence_search_hydrates_hits_when_configured() {
     let Some(database_url) = common::test_database_url() else {
         return;
@@ -204,6 +205,11 @@ async fn live_evidence_search_hydrates_hits_when_configured() {
 
     let status = recall.status().await.unwrap();
     assert!(status.readiness.lexical_current && status.readiness.dense_current);
+    assert_eq!(
+        status.readiness.lexical_lag_by_source,
+        Some(LexicalLagBySourceV1::default()),
+        "every source's bodies are lexically projected"
+    );
     assert_eq!(status.readiness.dense_lane, EvidenceDenseLaneV1::Available);
     assert!(!status.sources.truncated);
     assert!(
@@ -446,6 +452,9 @@ async fn live_evidence_absent_only_when_current_covered_and_fresh_when_configure
     for query in [NONSENSE, LATE_WORD] {
         let answer = search(&recall, query).await;
         assert_unknown_because(&answer, &[AbsenceReasonV1::BodyProjectionLag]);
+        // An unprojected event is body lag, not lexical lag: it has no body
+        // for the lexical tier to be behind on.
+        assert!(answer.readiness.lexical_current, "{:?}", answer.readiness);
         // The lag is the project's own evidence (the commit and its blob),
         // not a collected part.
         let pending = answer.readiness.events_awaiting_body_projection;
@@ -724,6 +733,94 @@ async fn live_a_failed_source_of_another_kind_leaves_a_scoped_verdict_absent_whe
     let unscoped = search(&recall, NONSENSE).await;
     assert_unknown_because(&unscoped, &[AbsenceReasonV1::SourceFailed]);
     assert_eq!(unscoped.absence.scope, None);
+}
+
+#[tokio::test]
+async fn live_lexical_projection_lag_follows_the_kind_the_filter_covers_when_configured() {
+    let Some(database_url) = common::test_database_url() else {
+        return;
+    };
+    let pool = common::migrated_pool(&database_url).await;
+    let capabilities = capabilities(&database_url).await;
+    let fixture = WorkerFixture::install(&pool, "evidence-lexical-lag-by-source").await;
+    tick(&fixture, &pool, "all").await;
+    let recall = evidence(&pool, &capabilities, &fixture.installed.scope).await;
+    let answer = search(&recall, NONSENSE).await;
+    assert_absent(&answer);
+    assert_eq!(
+        answer.readiness.lexical_lag_by_source,
+        Some(LexicalLagBySourceV1::default())
+    );
+
+    // A transcript turn's body the lexical projector has not reached yet.
+    let scope = &fixture.installed.scope;
+    seed_body(
+        &pool,
+        scope.tenant_id,
+        &scope.project,
+        "application.json",
+        br#"{"role":"user","text":"a seeded transcript turn"}"#,
+    )
+    .await;
+    let lag = LexicalLagBySourceV1 {
+        git: 0,
+        items: 0,
+        sessions: 1,
+        other: 0,
+    };
+
+    // Unscoped, the tier is behind and the answer says by which source.
+    let unscoped = search(&recall, NONSENSE).await;
+    assert_unknown_because(&unscoped, &[AbsenceReasonV1::LexicalProjectionLag]);
+    assert!(
+        !unscoped.readiness.lexical_current,
+        "{:?}",
+        unscoped.readiness
+    );
+    assert_eq!(unscoped.readiness.lexical_lag_by_source, Some(lag));
+
+    // Absent from git: no git fact is waiting.
+    let from_git = recall
+        .search_from(NONSENSE, None, 10, Some(EvidenceSourceFilterV1::Git))
+        .await
+        .unwrap();
+    assert_absent(&from_git);
+    assert_eq!(
+        from_git.absence.scope,
+        Some(AbsenceScopeV1 {
+            source: EvidenceSourceFilterV1::Git
+        })
+    );
+
+    // The sessions scope owns the waiting body.
+    let from_sessions = recall
+        .search_from(NONSENSE, None, 10, Some(EvidenceSourceFilterV1::Sessions))
+        .await
+        .unwrap();
+    assert_unknown_because(&from_sessions, &[AbsenceReasonV1::LexicalProjectionLag]);
+
+    // No collector is registered in this scope, and nothing of its kind lags.
+    let from_items = recall
+        .search_from(NONSENSE, None, 10, Some(EvidenceSourceFilterV1::Items))
+        .await
+        .unwrap();
+    assert_unknown_because(&from_items, &[AbsenceReasonV1::NoSourcesRegistered]);
+
+    // Readiness stays scope-wide: every answer reports the same lag.
+    for scoped in [&from_git, &from_sessions, &from_items] {
+        let mut readiness = scoped.readiness.clone();
+        readiness.as_of = unscoped.readiness.as_of;
+        assert_eq!(readiness, unscoped.readiness);
+    }
+
+    // Projected, nothing lags anywhere.
+    tick(&fixture, &pool, "project").await;
+    let answer = search(&recall, NONSENSE).await;
+    assert_absent(&answer);
+    assert_eq!(
+        answer.readiness.lexical_lag_by_source,
+        Some(LexicalLagBySourceV1::default())
+    );
 }
 
 #[tokio::test]
@@ -1192,6 +1289,10 @@ async fn live_serve_recall_evidence_end_to_end_when_configured() {
     let evidence = &status["data"]["evidence"];
     assert_eq!(evidence["served"], true);
     assert_eq!(evidence["readiness"]["lexical_current"], true);
+    assert_eq!(
+        evidence["readiness"]["lexical_lag_by_source"],
+        json!({ "git": 0, "items": 0, "sessions": 0, "other": 0 })
+    );
     assert!(
         evidence["sources"]["active"]
             .as_array()

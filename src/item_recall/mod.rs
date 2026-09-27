@@ -66,9 +66,13 @@
 //! body is lexically projected, and at least one such source is active,
 //! healthy, fresh, and complete; otherwise `unknown` with every reason that
 //! applies (a provider with no source is `no_sources_registered`). The
-//! events awaiting the body projector are counted over the scope, not the
-//! kind searched: an unprojected git commit makes an empty item answer
-//! `unknown` too (scoping that count is deferred). Absence covers enumerated
+//! events awaiting the body projector are counted over the scope for an
+//! unfiltered search, not the kind searched: an unprojected git commit makes
+//! an empty item answer `unknown` too (a provider filter counts only that
+//! provider's pending parts). The lexical tier's lag is items-only: every
+//! source's backlog is reported in `lexical_lag_by_source`, and only the
+//! `items` bucket blocks `absent`, so a transcript backlog does not make an
+//! empty item answer `unknown`. Absence covers enumerated
 //! sources only: an agent capture never establishes coverage, though an
 //! `enabled` capture projects what it admits in the call, so its own items
 //! never leave the scope lagging.
@@ -95,7 +99,7 @@ use serde::Serialize;
 use crate::error::Result;
 use crate::evidence_recall::{
     AbsenceV1, ContentTrustV1, EVIDENCE_SNIPPET_CHARS, EvidenceDenseLaneV1, EvidenceMatchV1,
-    EvidenceReadinessV1, EvidenceSourcesV1, HitVoteV1, LagByKindV1,
+    EvidenceReadinessV1, EvidenceSourcesV1, HitVoteV1, LagByKindV1, LexicalLagBySourceV1,
 };
 use crate::memory_contracts::collected_item::{
     CollectionModeV1, ItemLifecycleV1, MAX_PROVIDER_URL_BYTES, ObjectKindV1, ProviderKindV1,
@@ -416,8 +420,13 @@ pub struct ItemReadinessV1 {
     /// The same count split by kind: collected parts against the rest. With
     /// a provider filter, `other` is zero by definition.
     pub lag_by_kind: LagByKindV1,
-    /// Every body has been through the lexical projector.
+    /// Every collected item body has been through the lexical projector
+    /// (`lexical_lag_by_source.items == 0`); other evidence's lexical lag is
+    /// reported in the split and never blocks an item answer.
     pub lexical_current: bool,
+    /// The bodies still to go through the lexical projector, split by the
+    /// source their media type belongs to, over the whole scope.
+    pub lexical_lag_by_source: LexicalLagBySourceV1,
     /// Every lexically searchable body also has an embedding.
     pub dense_current: bool,
     pub dense_lane: EvidenceDenseLaneV1,
@@ -439,6 +448,7 @@ impl ItemReadinessV1 {
             hints_unreadable: self.hints_unreadable,
             collector_state_unreadable: false,
             lexical_current: self.lexical_current,
+            lexical_lag_by_source: Some(self.lexical_lag_by_source),
             dense_current: self.dense_current,
             dense_lane: self.dense_lane,
             as_of: self.as_of,
@@ -749,6 +759,12 @@ mod tests {
             events_awaiting_body_projection: 1,
             lag_by_kind: LagByKindV1 { items: 1, other: 0 },
             lexical_current: true,
+            lexical_lag_by_source: LexicalLagBySourceV1 {
+                git: 0,
+                items: 0,
+                sessions: 3,
+                other: 0,
+            },
             dense_current: false,
             dense_lane: EvidenceDenseLaneV1::Used,
             as_of: DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
@@ -767,6 +783,17 @@ mod tests {
             serde_json::to_value(&readiness).unwrap()["lag_by_kind"],
             serde_json::json!({ "items": 1, "other": 0 })
         );
+        // A transcript backlog is reported and does not make the items lag.
+        assert!(evidence.lexical_current);
+        assert_eq!(
+            evidence.lexical_lag_by_source,
+            Some(readiness.lexical_lag_by_source),
+            "an item search always knows the lexical split too"
+        );
+        assert_eq!(
+            serde_json::to_value(&readiness).unwrap()["lexical_lag_by_source"],
+            serde_json::json!({ "git": 0, "items": 0, "sessions": 3, "other": 0 })
+        );
         assert!(!evidence.collector_state_unreadable);
         assert!(!evidence.hints_unreadable);
         let unreadable = ItemReadinessV1 {
@@ -775,5 +802,21 @@ mod tests {
             ..readiness
         };
         assert!(unreadable.as_evidence().hints_unreadable);
+        // An item backlog is the one lexical lag an item answer judges.
+        let items_lagging = ItemReadinessV1 {
+            lexical_current: false,
+            lexical_lag_by_source: LexicalLagBySourceV1 {
+                git: 0,
+                items: 2,
+                sessions: 0,
+                other: 0,
+            },
+            ..readiness
+        };
+        assert!(!items_lagging.as_evidence().lexical_current);
+        assert_eq!(
+            serde_json::to_value(&items_lagging).unwrap()["lexical_lag_by_source"]["items"],
+            2
+        );
     }
 }

@@ -169,6 +169,15 @@ readable, and from the total otherwise. `lexical_projection_lag` and
 `evidence_source_failed` warning stay scope-wide. Before this a failed
 transcript source made "absent from git" `unknown`.
 
+Amended 2026-09-27: `lexical_projection_lag` follows the filter too.
+Readiness carries `lexical_lag_by_source` (`git`, `items`, `sessions`,
+`other`: bodies of each source's media type with no lexical row); a scoped
+verdict reads its own bucket, the unscoped verdict the total
+(`lexical_current`), and every scope the total when the split cannot be
+read. Only `listing_truncated` now blocks every scope. An item search judges
+the `items` bucket, so a transcript backlog no longer makes an empty item
+answer `unknown`.
+
 Each transcript file is its own source (D1), so a transcript directory with
 more than 256 session files makes every empty answer `unknown`
 (`listing_truncated`), and every search answer carries the full listing, up

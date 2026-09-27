@@ -59,6 +59,7 @@ use uuid::Uuid;
 
 use crate::FleetError;
 use crate::collectors::cockroach::suppressed_body_predicate;
+use crate::memory_contracts::collected_item::COLLECTED_ITEM_MEDIA_TYPE;
 use crate::memory_contracts::digest::Sha256Digest;
 use crate::store::cockroach::{
     RetryPolicy, is_retryable, is_retryable_fleet_error, serialize_vector,
@@ -69,11 +70,14 @@ use super::dense::{
     distance_metric_label,
 };
 use super::error::{RecallProjectionError, RecallProjectionResult};
-use super::lexical::{LexicalProjectionV1, LexicalStateV1, derive_lexical_projection};
+use super::lexical::{
+    CANONICAL_JSON_MEDIA_TYPE, GIT_FACT_MEDIA_TYPE, LexicalProjectionV1, LexicalStateV1,
+    derive_lexical_projection,
+};
 use super::repository::{
-    BodyPositionV1, DenseProjector, LexicalProjector, ProjectionCursorV1, ProjectionPassSummaryV1,
-    ProjectorKindV1, RecallCompletenessV1, RecallHitV1, RecallLanesV1, RecallProjectionSnapshotV1,
-    RecallResultV1, RecallTierV1,
+    BodyPositionV1, DenseProjector, LexicalLagBySourceV1, LexicalProjector, ProjectionCursorV1,
+    ProjectionPassSummaryV1, ProjectorKindV1, RecallCompletenessV1, RecallHitV1, RecallLanesV1,
+    RecallProjectionSnapshotV1, RecallResultV1, RecallTierV1,
 };
 use super::visibility::{RecallPlaneV1, RowVisibilityClassV1};
 
@@ -434,6 +438,24 @@ const COMPLETENESS_PUBLICATION_SQL: &str = "SELECT \
         AS lexically_unindexable, \
      (SELECT count(*) FROM public.memory_body_dense_publication_v1 \
         WHERE tenant_id = $1 AND project = $2) AS densely_embedded";
+
+// Bodies with no lexical row at all, split by the media type bound at
+// `$3` (git facts), `$4` (collected items), and `$5` (canonical JSON:
+// transcript turns and CI runs). A lexical row exists exactly when its state
+// is indexed or unindexable, which is what `lexically_projected()` counts, so
+// this total is the complement of COMPLETENESS_SQL's lexical completeness.
+// Private plane only: it reads the body table, which the publication plane
+// cannot reach.
+const LEXICAL_BACKLOG_BY_MEDIA_SQL: &str = "SELECT count(*) AS total, \
+     count(CASE WHEN body.media_type = $3 THEN 1 END) AS git, \
+     count(CASE WHEN body.media_type = $4 THEN 1 END) AS items, \
+     count(CASE WHEN body.media_type = $5 THEN 1 END) AS sessions \
+     FROM public.memory_body_objects_v1 AS body \
+     LEFT JOIN public.memory_body_lexical_projection_v1 AS lexical \
+       ON lexical.tenant_id = body.tenant_id AND lexical.project = body.project \
+      AND lexical.body_content_id = body.content_sha256 \
+     WHERE body.tenant_id = $1 AND body.project = $2 \
+       AND lexical.body_content_id IS NULL";
 
 /// One body row the lexical projector consumes.
 #[derive(Debug, Clone)]
@@ -1316,6 +1338,41 @@ impl CockroachRecallReader {
         })
     }
 
+    /// Read how many bodies of each source have no lexical row yet.
+    ///
+    /// Private plane only: the split reads the body table's media type,
+    /// which the publication plane cannot reach, so a publication reader
+    /// refuses before issuing any statement rather than answer with a count
+    /// it cannot take through its views.
+    pub async fn lexical_backlog_by_media(&self) -> RecallProjectionResult<LexicalLagBySourceV1> {
+        if self.plane == RecallPlaneV1::Publication {
+            return Err(RecallProjectionError::InvalidRequest(
+                "the publication plane cannot split the lexical backlog by source".into(),
+            ));
+        }
+        let row: PgRow = sqlx::query(LEXICAL_BACKLOG_BY_MEDIA_SQL)
+            .bind(self.scope.tenant_id)
+            .bind(&self.scope.project)
+            .bind(GIT_FACT_MEDIA_TYPE)
+            .bind(COLLECTED_ITEM_MEDIA_TYPE)
+            .bind(CANONICAL_JSON_MEDIA_TYPE)
+            .fetch_one(&self.scope.pool)
+            .await?;
+        let total = count(&row, "total")?;
+        let git = count(&row, "git")?;
+        let items = count(&row, "items")?;
+        let sessions = count(&row, "sessions")?;
+        Ok(LexicalLagBySourceV1 {
+            git,
+            items,
+            sessions,
+            other: total
+                .saturating_sub(git)
+                .saturating_sub(items)
+                .saturating_sub(sessions),
+        })
+    }
+
     /// Recall bodies for `query_text`, optionally topped up by a dense lane.
     ///
     /// The lexical lane always runs. The dense lane runs only when a query
@@ -1646,14 +1703,15 @@ mod tests {
                 "statement must bind scope first: {statement}"
             );
         }
-        // The body scan and the two demotions qualify their scope columns with
-        // a table alias, because they join a second relation; the binding is
-        // the same equality pair.
+        // The body scan, the two demotions, and the lexical backlog split
+        // qualify their scope columns with a table alias, because they join a
+        // second relation; the binding is the same equality pair.
         for statement in [
             SELECT_BODIES_FROM_START_SQL,
             SELECT_BODIES_AFTER_SQL,
             DEMOTE_LEXICAL_SQL,
             DEMOTE_DENSE_SQL,
+            LEXICAL_BACKLOG_BY_MEDIA_SQL,
         ] {
             assert!(
                 statement.contains(".tenant_id = $1") && statement.contains(".project = $2"),
@@ -1768,12 +1826,48 @@ mod tests {
         assert!(COMPLETENESS_PUBLICATION_SQL.contains("memory_body_dense_publication_v1"));
         // The private plane keeps reading the base tables and therefore still
         // sees both classes: it carries no visibility predicate at all.
-        for statement in [LEXICAL_RECALL_SQL, DENSE_RECALL_SQL, COMPLETENESS_SQL] {
+        for statement in [
+            LEXICAL_RECALL_SQL,
+            DENSE_RECALL_SQL,
+            COMPLETENESS_SQL,
+            LEXICAL_BACKLOG_BY_MEDIA_SQL,
+        ] {
             assert!(
                 !statement.contains("publication_safe"),
                 "the private plane must not filter by class: {statement}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_lexical_backlog_split_reads_the_body_table_on_the_private_plane_only() {
+        // The split is the complement of lexical completeness: bodies with no
+        // lexical row at all, bucketed by the media type bound after the
+        // scope. It names the body table, so it is a private-plane statement.
+        let statement = LEXICAL_BACKLOG_BY_MEDIA_SQL;
+        assert!(statement.contains("FROM public.memory_body_objects_v1 AS body"));
+        assert!(statement.contains("LEFT JOIN public.memory_body_lexical_projection_v1"));
+        assert!(statement.contains("lexical.body_content_id IS NULL"));
+        for placeholder in [
+            "body.media_type = $3",
+            "body.media_type = $4",
+            "body.media_type = $5",
+        ] {
+            assert!(statement.contains(placeholder), "{statement}");
+        }
+        assert!(!statement.contains("publication"), "{statement}");
+        // A publication reader refuses before it touches the pool: the lazy
+        // pool below has nothing to connect to, so any query would fail
+        // with a connection error, not the typed refusal.
+        let publication = CockroachRecallReader::publication(
+            PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
+            Uuid::nil(),
+            "p".to_owned(),
+        );
+        assert!(matches!(
+            publication.lexical_backlog_by_media().await,
+            Err(RecallProjectionError::InvalidRequest(_))
+        ));
     }
 
     #[test]

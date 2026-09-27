@@ -857,7 +857,9 @@ impl CockroachItemRecall {
     /// Collection and projection lag. Read after the sources and before the
     /// lanes, and upstream first, as evidence recall reads it: hints, then
     /// the outbox and the evidence awaiting projection (one statement), then
-    /// the lexical tier.
+    /// the lexical tier: its completeness for the dense side, and its backlog
+    /// split by source, whose `items` bucket is the only lexical lag an item
+    /// answer judges.
     async fn read_readiness(
         &self,
         dense_lane: EvidenceDenseLaneV1,
@@ -872,6 +874,7 @@ impl CockroachItemRecall {
             .fetch_one(&self.pool)
             .await?;
         let completeness = self.reader.completeness().await?;
+        let lexical_lag_by_source = self.reader.lexical_backlog_by_media().await?;
         // With a provider, only that provider's pending parts bear on the
         // answer; without one, the scope's whole lag does, split by kind.
         let lag_by_kind = if provider.is_some() {
@@ -893,7 +896,8 @@ impl CockroachItemRecall {
             hints_unreadable: hints.unreadable(),
             events_awaiting_body_projection: lag_by_kind.total(),
             lag_by_kind,
-            lexical_current: completeness.lexical_complete(),
+            lexical_current: lexical_lag_by_source.items == 0,
+            lexical_lag_by_source,
             dense_current: completeness.dense_complete(),
             dense_lane,
             as_of: row.try_get("as_of")?,

@@ -4080,9 +4080,20 @@ fn evidence_warnings(readiness: &EvidenceReadinessV1, sources: &EvidenceSourcesV
     }
     collector_warnings(readiness, &mut warnings);
     if !readiness.lexical_current {
+        let by_source = readiness
+            .lexical_lag_by_source
+            .map_or_else(String::new, |lag| {
+                format!(
+                    " ({} git facts, {} collected item parts, {} session turns or runs, {} other)",
+                    lag.git, lag.items, lag.sessions, lag.other
+                )
+            });
         warnings.push(json!({
             "code": "evidence_lexical_projection_lag",
-            "message": "some evidence bodies have not been through the lexical projector yet"
+            "message": format!(
+                "some evidence bodies have not been through the lexical projector yet{by_source}"
+            ),
+            "lexical_lag_by_source": readiness.lexical_lag_by_source,
         }));
     }
     if readiness.dense_lane == EvidenceDenseLaneV1::DisabledForeignModel {
@@ -6164,6 +6175,7 @@ mod tests {
             hints_unreadable: false,
             collector_state_unreadable: false,
             lexical_current: true,
+            lexical_lag_by_source: None,
             dense_current: true,
             dense_lane,
             as_of: Utc::now(),
@@ -6779,6 +6791,51 @@ mod tests {
         assert_eq!(
             warnings[0]["lag_by_kind"],
             json!({ "items": 1, "other": 2 })
+        );
+    }
+
+    #[test]
+    fn the_lexical_lag_warning_says_which_source_is_waiting() {
+        use crate::evidence_recall::LexicalLagBySourceV1;
+        let healthy = EvidenceSourcesV1 {
+            active: Vec::new(),
+            truncated: false,
+        };
+        let unsplit = EvidenceReadinessV1 {
+            events_awaiting_body_projection: 0,
+            lexical_current: false,
+            ..evidence_readiness(EvidenceDenseLaneV1::Available)
+        };
+        let warnings = evidence_warnings(&unsplit, &healthy);
+        assert_eq!(
+            warning_codes(&warnings),
+            ["evidence_lexical_projection_lag"]
+        );
+        assert_eq!(
+            warnings[0]["message"],
+            "some evidence bodies have not been through the lexical projector yet"
+        );
+        assert_eq!(warnings[0]["lexical_lag_by_source"], Value::Null);
+        let split = EvidenceReadinessV1 {
+            lexical_lag_by_source: Some(LexicalLagBySourceV1 {
+                git: 0,
+                items: 0,
+                sessions: 2,
+                other: 0,
+            }),
+            ..unsplit
+        };
+        let warnings = evidence_warnings(&split, &healthy);
+        assert!(
+            warnings[0]["message"].as_str().unwrap().contains(
+                "(0 git facts, 0 collected item parts, 2 session turns or runs, 0 other)"
+            ),
+            "{}",
+            warnings[0]
+        );
+        assert_eq!(
+            warnings[0]["lexical_lag_by_source"],
+            json!({ "git": 0, "items": 0, "sessions": 2, "other": 0 })
         );
     }
 

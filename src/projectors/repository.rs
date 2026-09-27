@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 
 use crate::memory_contracts::digest::Sha256Digest;
 
@@ -128,6 +129,38 @@ impl RecallCompletenessV1 {
     #[must_use]
     pub const fn dense_complete(&self) -> bool {
         self.lexical_complete() && self.densely_embedded >= self.lexically_indexed
+    }
+}
+
+/// Bodies with no lexical row, split by the source each media type belongs to.
+///
+/// `git` is the git facts, `items` the collected items, `sessions` the
+/// canonical JSON bodies (`application.json`: transcript turns and CI runs),
+/// and `other` everything else. A scoped absence verdict reads its own
+/// bucket, so a transcript backlog does not make "absent from git" unknown.
+///
+/// Private plane only: the split joins the body table, which the publication
+/// plane cannot reach.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct LexicalLagBySourceV1 {
+    /// Git facts with no lexical row.
+    pub git: u64,
+    /// Collected item parts with no lexical row.
+    pub items: u64,
+    /// Transcript turns and CI runs with no lexical row.
+    pub sessions: u64,
+    /// Bodies of any other media type with no lexical row.
+    pub other: u64,
+}
+
+impl LexicalLagBySourceV1 {
+    /// Every body with no lexical row, whatever its source.
+    #[must_use]
+    pub const fn total(self) -> u64 {
+        self.git
+            .saturating_add(self.items)
+            .saturating_add(self.sessions)
+            .saturating_add(self.other)
     }
 }
 

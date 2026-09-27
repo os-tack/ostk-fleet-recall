@@ -408,8 +408,9 @@ kind does not block `absent`, a pending transcript outbox blocks `sessions`
 and the unscoped verdict, pending items or hints and unreadable collector
 state block `items` and the unscoped verdict, and body projection lag is
 read from `lag_by_kind` (`items` for `items`, `other` for `git` and
-`sessions`) when the split is readable. The listing, readiness, and
-warnings stay scope-wide. Before the cut to `limit`, superseded versions of
+`sessions`) and lexical projection lag from `lexical_lag_by_source`
+(`git`, `items`, `sessions`) when the splits are readable. The listing,
+readiness, and warnings stay scope-wide. Before the cut to `limit`, superseded versions of
 one collected item whose recall text is identical to a listed version's are
 collapsed to the presented head (or the best-ranked copy), so an edited
 document's unchanged sections are listed once; the answer counts them in
