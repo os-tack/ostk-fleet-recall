@@ -1,0 +1,3769 @@
+{
+  "id": null,
+  "uid": "fleet-kubernetes",
+  "title": "Fleet Recall / Kubernetes",
+  "description": "k0s node and workload health from kube-state-metrics, kubelet/cAdvisor, and node exporter. Separates metric coverage, Kubernetes state, container resource budgets, and scheduled-work results.",
+  "tags": [
+    "fleet-recall"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "15s",
+      "30s",
+      "1m",
+      "5m",
+      "15m"
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "k0s \u00b7 workloads and the machine underneath them",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Start with scrape health, then Kubernetes state, then resource pressure.** This view uses kube-state-metrics, kubelet/cAdvisor, and node exporter. Missing telemetry is **Unknown**, never a healthy zero.\n\nNamespace and node filters scope pod/container views; deployment, StatefulSet, DaemonSet, and CronJob controllers are namespace-wide. The default namespaces cover Fleet Recall and its local dependencies. Container logs are one click away in the dashboard links."
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Metrics targets reachable",
+      "description": "Share of discovered metrics targets up across nine infrastructure and monitoring jobs. A missing discovery job is not counted; inspect the job table below.",
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 100
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "100 * sum(up{deployment=~\"$deployment\",cluster=\"k0s\",job=~\"kubernetes-nodes|kubernetes-cadvisor|kube-state-metrics|node-exporter|kubernetes-apiserver|prometheus|loki|alloy|grafana\"}) / count(up{deployment=~\"$deployment\",cluster=\"k0s\",job=~\"kubernetes-nodes|kubernetes-cadvisor|kube-state-metrics|node-exporter|kubernetes-apiserver|prometheus|loki|alloy|grafana\"})",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Nodes Ready",
+      "description": "Ready=true fraction of selected nodes according to Kubernetes. No Ready series is Unknown.",
+      "gridPos": {
+        "x": 4,
+        "y": 4,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 100
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "100 * sum(max by (deployment,node) (kube_node_status_condition{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",node=~\"$node\",condition=\"Ready\",status=\"true\"})) / count(max by (deployment,node) (kube_node_status_condition{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",node=~\"$node\",condition=\"Ready\",status=\"true\"}))",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Pending pods",
+      "description": "Current Pending pod count. Unscheduled pods are included with All nodes; a specific node selection excludes unassigned pods.",
+      "gridPos": {
+        "x": 8,
+        "y": 4,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum((max by (deployment,namespace,pod) (kube_pod_status_phase{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",phase=\"Pending\"})) and on (deployment,namespace,pod) max by (deployment,namespace,pod,node) (kube_pod_info{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\"}))",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "CrashLoop containers",
+      "description": "Current CrashLoopBackOff count. Zero fallback requires known container waiting-state metrics, not a constant.",
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum((max by (deployment,namespace,pod,container) (kube_pod_container_status_waiting_reason{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",reason=\"CrashLoopBackOff\"})) and on (deployment,namespace,pod) max by (deployment,namespace,pod,node) (kube_pod_info{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\"})) or sum(0 * ((max by (deployment,namespace,pod,container) (kube_pod_container_status_waiting{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\"})) and on (deployment,namespace,pod) max by (deployment,namespace,pod,node) (kube_pod_info{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\"})))",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Container restarts \u00b7 1h",
+      "description": "Estimated restart increase during the fixed last hour; real counters, reset-aware. Pod replacement creates new identities.",
+      "gridPos": {
+        "x": 16,
+        "y": 4,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 1,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum((sum by (deployment,namespace,pod,container) (increase(kube_pod_container_status_restarts_total{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\"}[1h]))) and on (deployment,namespace,pod) max by (deployment,namespace,pod,node) (kube_pod_info{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\"}))",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Worst root disk used",
+      "description": "Worst available-capacity consumption on root filesystems of selected nodes. Uses available bytes rather than free bytes.",
+      "gridPos": {
+        "x": 20,
+        "y": 4,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 80
+              },
+              {
+                "color": "red",
+                "value": 90
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max(100 * (1 - node_filesystem_avail_bytes{job=\"node-exporter\",deployment=~\"$deployment\",cluster=\"k0s\",node=~\"$node\",mountpoint=\"/\",fstype!~\"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup.*\"} / node_filesystem_size_bytes{job=\"node-exporter\",deployment=~\"$deployment\",cluster=\"k0s\",node=~\"$node\",mountpoint=\"/\",fstype!~\"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup.*\"}))",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "01 \u00b7 Exporter coverage and Kubernetes health",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 24,
+        "h": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {},
+      "pluginVersion": "10.4.0",
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 9,
+      "type": "table",
+      "title": "Scrape endpoints",
+      "description": "Actual target health. Check for all nine jobs: kubernetes-nodes, kubernetes-cadvisor, kube-state-metrics, node-exporter, kubernetes-apiserver, prometheus, loki, alloy, grafana. A job with no discovered targets has no row.",
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Down",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "Up",
+                  "color": "green"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Reachable",
+            "desc": true
+          }
+        ]
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "up{deployment=~\"$deployment\",cluster=\"k0s\",job=~\"kubernetes-nodes|kubernetes-cadvisor|kube-state-metrics|node-exporter|kubernetes-apiserver|prometheus|loki|alloy|grafana\"}",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "cluster": true
+            },
+            "renameByName": {
+              "deployment": "Environment",
+              "namespace": "Namespace",
+              "pod": "Pod",
+              "container": "Container",
+              "node": "Node",
+              "instance": "Endpoint",
+              "workload_deployment": "Deployment",
+              "statefulset": "StatefulSet",
+              "daemonset": "DaemonSet",
+              "cronjob": "CronJob",
+              "job_name": "Job",
+              "device": "Device",
+              "mountpoint": "Mount",
+              "reason": "Reason",
+              "phase": "Phase",
+              "condition": "Condition",
+              "job": "Scrape job",
+              "Value": "Reachable"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "table",
+      "title": "Node readiness",
+      "description": "Ready condition from kube-state-metrics. This is distinct from exporter reachability.",
+      "gridPos": {
+        "x": 8,
+        "y": 9,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Not Ready",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "Ready",
+                  "color": "green"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Ready",
+            "desc": true
+          }
+        ]
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max by (deployment,node) (kube_node_status_condition{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",node=~\"$node\",condition=\"Ready\",status=\"true\"})",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "cluster": true
+            },
+            "renameByName": {
+              "deployment": "Environment",
+              "namespace": "Namespace",
+              "pod": "Pod",
+              "container": "Container",
+              "node": "Node",
+              "instance": "Endpoint",
+              "workload_deployment": "Deployment",
+              "statefulset": "StatefulSet",
+              "daemonset": "DaemonSet",
+              "cronjob": "CronJob",
+              "job_name": "Job",
+              "device": "Device",
+              "mountpoint": "Mount",
+              "reason": "Reason",
+              "phase": "Phase",
+              "condition": "Condition",
+              "job": "Scrape job",
+              "Value": "Ready"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "table",
+      "title": "Node pressure conditions",
+      "description": "Kubernetes pressure and network conditions. A value of zero is an explicitly observed clear condition.",
+      "gridPos": {
+        "x": 16,
+        "y": 9,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Clear",
+                  "color": "green"
+                },
+                "1": {
+                  "text": "Active",
+                  "color": "red"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Pressure",
+            "desc": true
+          }
+        ]
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max by (deployment,node,condition) (kube_node_status_condition{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",node=~\"$node\",condition=~\"MemoryPressure|DiskPressure|PIDPressure|NetworkUnavailable\",status=\"true\"})",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "cluster": true
+            },
+            "renameByName": {
+              "deployment": "Environment",
+              "namespace": "Namespace",
+              "pod": "Pod",
+              "container": "Container",
+              "node": "Node",
+              "instance": "Endpoint",
+              "workload_deployment": "Deployment",
+              "statefulset": "StatefulSet",
+              "daemonset": "DaemonSet",
+              "cronjob": "CronJob",
+              "job_name": "Job",
+              "device": "Device",
+              "mountpoint": "Mount",
+              "reason": "Reason",
+              "phase": "Phase",
+              "condition": "Condition",
+              "job": "Scrape job",
+              "Value": "Pressure"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "row",
+      "title": "02 \u00b7 Node capacity and pressure",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 24,
+        "h": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {},
+      "pluginVersion": "10.4.0",
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Node CPU busy",
+      "description": "Busy fraction averaged across all logical CPUs on each node; 100% means all cores busy.",
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 2,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 7,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "showPoints": "never",
+            "pointSize": 4,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "100 * (1 - avg by (deployment,node) (rate(node_cpu_seconds_total{job=\"node-exporter\",deployment=~\"$deployment\",cluster=\"k0s\",node=~\"$node\",mode=\"idle\"}[$__rate_interval])))",
+          "legendFormat": "{{node}}",
+          "refId": "A",
+          "format": "time_series",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Node memory used",
+      "description": "Uses MemAvailable, which accounts for reclaimable memory; this is host pressure, not the sum of container working sets.",
+      "gridPos": {
+        "x": 8,
+        "y": 18,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 2,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 7,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "showPoints": "never",
+            "pointSize": 4,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "100 * (1 - max by (deployment,node) (node_memory_MemAvailable_bytes{job=\"node-exporter\",deployment=~\"$deployment\",cluster=\"k0s\",node=~\"$node\"}) / max by (deployment,node) (node_memory_MemTotal_bytes{job=\"node-exporter\",deployment=~\"$deployment\",cluster=\"k0s\",node=~\"$node\"}))",
+          "legendFormat": "{{node}}",
+          "refId": "A",
+          "format": "time_series",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Root filesystem used",
+      "description": "Available-capacity consumption for root mounts. Node exporter must observe the host root filesystem.",
+      "gridPos": {
+        "x": 16,
+        "y": 18,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 2,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 7,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "showPoints": "never",
+            "pointSize": 4,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max by (deployment,node) (100 * (1 - node_filesystem_avail_bytes{job=\"node-exporter\",deployment=~\"$deployment\",cluster=\"k0s\",node=~\"$node\",mountpoint=\"/\",fstype!~\"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup.*\"} / node_filesystem_size_bytes{job=\"node-exporter\",deployment=~\"$deployment\",cluster=\"k0s\",node=~\"$node\",mountpoint=\"/\",fstype!~\"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup.*\"}))",
+          "legendFormat": "{{node}}",
+          "refId": "A",
+          "format": "time_series",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "table",
+      "title": "Filesystem capacity used",
+      "description": "Persistent filesystem capacity, excluding virtual filesystems and per-pod mounts. Bind mounts may describe the same device; never sum capacities across these rows.",
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Used %",
+            "desc": true
+          }
+        ]
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max by (deployment,node,device,mountpoint) (100 * (1 - node_filesystem_avail_bytes{job=\"node-exporter\",deployment=~\"$deployment\",cluster=\"k0s\",node=~\"$node\",fstype!~\"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup.*\",mountpoint!~\"/var/lib/kubelet/pods/.+\"} / node_filesystem_size_bytes{job=\"node-exporter\",deployment=~\"$deployment\",cluster=\"k0s\",node=~\"$node\",fstype!~\"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup.*\",mountpoint!~\"/var/lib/kubelet/pods/.+\"}))",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "cluster": true
+            },
+            "renameByName": {
+              "deployment": "Environment",
+              "namespace": "Namespace",
+              "pod": "Pod",
+              "container": "Container",
+              "node": "Node",
+              "instance": "Endpoint",
+              "workload_deployment": "Deployment",
+              "statefulset": "StatefulSet",
+              "daemonset": "DaemonSet",
+              "cronjob": "CronJob",
+              "job_name": "Job",
+              "device": "Device",
+              "mountpoint": "Mount",
+              "reason": "Reason",
+              "phase": "Phase",
+              "condition": "Condition",
+              "job": "Scrape job",
+              "Value": "Used %"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "table",
+      "title": "Node allocatable resources",
+      "description": "Kubernetes allocatable CPU cores, memory bytes, and pod slots. Each row retains resource/unit; these distinct units are not added. Capacity is discovered, not hardcoded to the local VM.",
+      "gridPos": {
+        "x": 12,
+        "y": 26,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Allocatable",
+            "desc": true
+          }
+        ]
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max by (deployment,node,resource,unit) (kube_node_status_allocatable{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",node=~\"$node\",resource=~\"cpu|memory|pods\"})",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "cluster": true
+            },
+            "renameByName": {
+              "deployment": "Environment",
+              "namespace": "Namespace",
+              "pod": "Pod",
+              "container": "Container",
+              "node": "Node",
+              "instance": "Endpoint",
+              "workload_deployment": "Deployment",
+              "statefulset": "StatefulSet",
+              "daemonset": "DaemonSet",
+              "cronjob": "CronJob",
+              "job_name": "Job",
+              "device": "Device",
+              "mountpoint": "Mount",
+              "reason": "Reason",
+              "phase": "Phase",
+              "condition": "Condition",
+              "job": "Scrape job",
+              "Value": "Allocatable"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "row",
+      "title": "03 \u00b7 Namespace controllers and pod readiness",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 34,
+        "w": 24,
+        "h": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {},
+      "pluginVersion": "10.4.0",
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 19,
+      "type": "table",
+      "title": "Deployment unavailable replicas",
+      "description": "Namespace-wide deployment controller state. The environment deployment label is separate from workload_deployment, normalized by the scrape configuration.",
+      "gridPos": {
+        "x": 0,
+        "y": 35,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "links": [
+            {
+              "title": "Open this namespace in Logs",
+              "url": "/d/fleet-logs?${__url_time_range}&var-deployment=${__data.fields.Environment}&var-namespace=${__data.fields.Namespace}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Unavailable",
+            "desc": true
+          }
+        ]
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max by (deployment,namespace,workload_deployment) (kube_deployment_status_replicas_unavailable{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\"})",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "cluster": true
+            },
+            "renameByName": {
+              "deployment": "Environment",
+              "namespace": "Namespace",
+              "pod": "Pod",
+              "container": "Container",
+              "node": "Node",
+              "instance": "Endpoint",
+              "workload_deployment": "Deployment",
+              "statefulset": "StatefulSet",
+              "daemonset": "DaemonSet",
+              "cronjob": "CronJob",
+              "job_name": "Job",
+              "device": "Device",
+              "mountpoint": "Mount",
+              "reason": "Reason",
+              "phase": "Phase",
+              "condition": "Condition",
+              "job": "Scrape job",
+              "Value": "Unavailable"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "table",
+      "title": "StatefulSet ready / desired",
+      "description": "Ready replica fraction for StatefulSets with positive desired replicas. Scaled-to-zero or missing desired counts do not become a healthy 100%.",
+      "gridPos": {
+        "x": 8,
+        "y": 35,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "links": [
+            {
+              "title": "Open this namespace in Logs",
+              "url": "/d/fleet-logs?${__url_time_range}&var-deployment=${__data.fields.Environment}&var-namespace=${__data.fields.Namespace}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Ready %",
+            "desc": true
+          }
+        ]
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "100 * max by (deployment,namespace,statefulset) (kube_statefulset_status_replicas_ready{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\"}) / (max by (deployment,namespace,statefulset) (kube_statefulset_replicas{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\"}) > 0)",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "cluster": true
+            },
+            "renameByName": {
+              "deployment": "Environment",
+              "namespace": "Namespace",
+              "pod": "Pod",
+              "container": "Container",
+              "node": "Node",
+              "instance": "Endpoint",
+              "workload_deployment": "Deployment",
+              "statefulset": "StatefulSet",
+              "daemonset": "DaemonSet",
+              "cronjob": "CronJob",
+              "job_name": "Job",
+              "device": "Device",
+              "mountpoint": "Mount",
+              "reason": "Reason",
+              "phase": "Phase",
+              "condition": "Condition",
+              "job": "Scrape job",
+              "Value": "Ready %"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "table",
+      "title": "DaemonSet ready / desired",
+      "description": "Namespace-wide DaemonSet coverage; ready divided by desired scheduled pods, only for positive desired count.",
+      "gridPos": {
+        "x": 16,
+        "y": 35,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "links": [
+            {
+              "title": "Open this namespace in Logs",
+              "url": "/d/fleet-logs?${__url_time_range}&var-deployment=${__data.fields.Environment}&var-namespace=${__data.fields.Namespace}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Ready %",
+            "desc": true
+          }
+        ]
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "100 * max by (deployment,namespace,daemonset) (kube_daemonset_status_number_ready{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\"}) / (max by (deployment,namespace,daemonset) (kube_daemonset_status_desired_number_scheduled{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\"}) > 0)",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "cluster": true
+            },
+            "renameByName": {
+              "deployment": "Environment",
+              "namespace": "Namespace",
+              "pod": "Pod",
+              "container": "Container",
+              "node": "Node",
+              "instance": "Endpoint",
+              "workload_deployment": "Deployment",
+              "statefulset": "StatefulSet",
+              "daemonset": "DaemonSet",
+              "cronjob": "CronJob",
+              "job_name": "Job",
+              "device": "Device",
+              "mountpoint": "Mount",
+              "reason": "Reason",
+              "phase": "Phase",
+              "condition": "Condition",
+              "job": "Scrape job",
+              "Value": "Ready %"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "table",
+      "title": "Active pod readiness",
+      "description": "Running, Pending, or Unknown phase pods. Completed Jobs are excluded so completion is not mistaken for an unready service.",
+      "gridPos": {
+        "x": 0,
+        "y": 43,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Not ready",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "Ready",
+                  "color": "green"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "links": [
+            {
+              "title": "Open this pod in Logs",
+              "url": "/d/fleet-logs?${__url_time_range}&var-deployment=${__data.fields.Environment}&var-namespace=${__data.fields.Namespace}&var-pod=${__data.fields.Pod}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Ready",
+            "desc": true
+          }
+        ]
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "((max by (deployment,namespace,pod) (kube_pod_status_ready{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",condition=\"true\"})) and on (deployment,namespace,pod) max by (deployment,namespace,pod,node) (kube_pod_info{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\"})) and on (deployment,namespace,pod) ((max by (deployment,namespace,pod,phase) (kube_pod_status_phase{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",phase=~\"Running|Pending|Unknown\"})) and on (deployment,namespace,pod) max by (deployment,namespace,pod,node) (kube_pod_info{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\"}) == 1)",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "cluster": true
+            },
+            "renameByName": {
+              "deployment": "Environment",
+              "namespace": "Namespace",
+              "pod": "Pod",
+              "container": "Container",
+              "node": "Node",
+              "instance": "Endpoint",
+              "workload_deployment": "Deployment",
+              "statefulset": "StatefulSet",
+              "daemonset": "DaemonSet",
+              "cronjob": "CronJob",
+              "job_name": "Job",
+              "device": "Device",
+              "mountpoint": "Mount",
+              "reason": "Reason",
+              "phase": "Phase",
+              "condition": "Condition",
+              "job": "Scrape job",
+              "Value": "Ready"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "table",
+      "title": "Waiting containers",
+      "description": "Current active waiting reasons; ContainerCreating may be normal during startup. Empty results mean none reported or missing telemetry: check exporter coverage.",
+      "gridPos": {
+        "x": 12,
+        "y": 43,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "links": [
+            {
+              "title": "Open this pod in Logs",
+              "url": "/d/fleet-logs?${__url_time_range}&var-deployment=${__data.fields.Environment}&var-namespace=${__data.fields.Namespace}&var-pod=${__data.fields.Pod}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Waiting",
+            "desc": true
+          }
+        ]
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "((max by (deployment,namespace,pod,container,reason) (kube_pod_container_status_waiting_reason{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",reason=~\"CrashLoopBackOff|ImagePullBackOff|ErrImagePull|CreateContainerConfigError|ContainerCreating\"})) and on (deployment,namespace,pod) max by (deployment,namespace,pod,node) (kube_pod_info{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\"})) == 1",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "cluster": true
+            },
+            "renameByName": {
+              "deployment": "Environment",
+              "namespace": "Namespace",
+              "pod": "Pod",
+              "container": "Container",
+              "node": "Node",
+              "instance": "Endpoint",
+              "workload_deployment": "Deployment",
+              "statefulset": "StatefulSet",
+              "daemonset": "DaemonSet",
+              "cronjob": "CronJob",
+              "job_name": "Job",
+              "device": "Device",
+              "mountpoint": "Mount",
+              "reason": "Reason",
+              "phase": "Phase",
+              "condition": "Condition",
+              "job": "Scrape job",
+              "Value": "Waiting"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "type": "row",
+      "title": "04 \u00b7 Container consumption and configured budgets",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 51,
+        "w": 24,
+        "h": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {},
+      "pluginVersion": "10.4.0",
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "CPU cores \u00b7 usage / requests / limits",
+      "description": "Same unit: CPU cores. Runtime usage is CPU seconds per second; requests/limits sum regular-container specifications on selected nodes. These exclude init/overhead and pod-level resource budgets. Limits may be absent; absence is not zero.",
+      "gridPos": {
+        "x": 0,
+        "y": 52,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cores",
+          "decimals": 2,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 7,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "showPoints": "never",
+            "pointSize": 4,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (deployment,namespace) (sum by (deployment,namespace,pod,container) (rate(container_cpu_usage_seconds_total{job=\"kubernetes-cadvisor\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\",container!=\"\",container!=\"POD\"}[$__rate_interval])))",
+          "legendFormat": "{{namespace}} \u00b7 usage",
+          "refId": "A",
+          "format": "time_series",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (deployment,namespace) ((max by (deployment,namespace,pod,container) (kube_pod_container_resource_requests{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",resource=\"cpu\",unit=\"core\"})) and on (deployment,namespace,pod) max by (deployment,namespace,pod,node) (kube_pod_info{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\"}))",
+          "legendFormat": "{{namespace}} \u00b7 requests",
+          "refId": "B",
+          "format": "time_series",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (deployment,namespace) ((max by (deployment,namespace,pod,container) (kube_pod_container_resource_limits{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",resource=\"cpu\",unit=\"core\"})) and on (deployment,namespace,pod) max by (deployment,namespace,pod,node) (kube_pod_info{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\"}))",
+          "legendFormat": "{{namespace}} \u00b7 limits",
+          "refId": "C",
+          "format": "time_series",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Memory \u00b7 working set / requests / limits",
+      "description": "Same unit: bytes. Working set is observed container memory; request/limit lines are regular-container configuration totals. Missing limits remain missing; a partial total is not a complete namespace cap.",
+      "gridPos": {
+        "x": 12,
+        "y": 52,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "decimals": 2,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 7,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "showPoints": "never",
+            "pointSize": 4,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (deployment,namespace) (max by (deployment,namespace,pod,container) (container_memory_working_set_bytes{job=\"kubernetes-cadvisor\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\",container!=\"\",container!=\"POD\"}))",
+          "legendFormat": "{{namespace}} \u00b7 working set",
+          "refId": "A",
+          "format": "time_series",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (deployment,namespace) ((max by (deployment,namespace,pod,container) (kube_pod_container_resource_requests{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",resource=\"memory\",unit=\"byte\"})) and on (deployment,namespace,pod) max by (deployment,namespace,pod,node) (kube_pod_info{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\"}))",
+          "legendFormat": "{{namespace}} \u00b7 requests",
+          "refId": "B",
+          "format": "time_series",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (deployment,namespace) ((max by (deployment,namespace,pod,container) (kube_pod_container_resource_limits{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",resource=\"memory\",unit=\"byte\"})) and on (deployment,namespace,pod) max by (deployment,namespace,pod,node) (kube_pod_info{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\"}))",
+          "legendFormat": "{{namespace}} \u00b7 limits",
+          "refId": "C",
+          "format": "time_series",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "type": "bargauge",
+      "title": "Hottest containers \u00b7 CPU cores",
+      "description": "Top ten observed regular containers by CPU cores. cAdvisor sandbox and empty-container parent cgroups are excluded.",
+      "gridPos": {
+        "x": 0,
+        "y": 60,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cores",
+          "decimals": 2,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "minVizWidth": 0,
+        "minVizHeight": 16,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "topk(10, sum by (deployment,namespace,pod,container) (rate(container_cpu_usage_seconds_total{job=\"kubernetes-cadvisor\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\",container!=\"\",container!=\"POD\"}[$__rate_interval])))",
+          "legendFormat": "{{namespace}} / {{pod}} \u00b7 {{container}}",
+          "refId": "A",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 28,
+      "type": "bargauge",
+      "title": "Container memory / explicit limit",
+      "description": "Working set as a fraction of a positive explicit regular-container memory limit. Unbounded or unreported limits produce no ratio; they are not assigned zero usage.",
+      "gridPos": {
+        "x": 12,
+        "y": 60,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 2,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "minVizWidth": 0,
+        "minVizHeight": 16,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "topk(10, 100 * max by (deployment,namespace,pod,container) (container_memory_working_set_bytes{job=\"kubernetes-cadvisor\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\",container!=\"\",container!=\"POD\"}) / on (deployment,namespace,pod,container) (((max by (deployment,namespace,pod,container) (kube_pod_container_resource_limits{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",resource=\"memory\",unit=\"byte\"})) and on (deployment,namespace,pod) max by (deployment,namespace,pod,node) (kube_pod_info{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\"})) > 0))",
+          "legendFormat": "{{namespace}} / {{pod}} \u00b7 {{container}}",
+          "refId": "A",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "Container CPU throttling \u00b7 periods",
+      "description": "Percent of CFS scheduling periods throttled, not percent CPU time lost. Positive denominator only; missing/unsupported cgroup metrics stay absent. Top ten are selected independently at each evaluation.",
+      "gridPos": {
+        "x": 0,
+        "y": 68,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 2,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 7,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "showPoints": "never",
+            "pointSize": 4,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "topk(10, 100 * sum by (deployment,namespace,pod,container) (rate(container_cpu_cfs_throttled_periods_total{job=\"kubernetes-cadvisor\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\",container!=\"\",container!=\"POD\"}[$__rate_interval])) / (sum by (deployment,namespace,pod,container) (rate(container_cpu_cfs_periods_total{job=\"kubernetes-cadvisor\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\",container!=\"\",container!=\"POD\"}[$__rate_interval])) > 0))",
+          "legendFormat": "{{namespace}} / {{pod}} \u00b7 {{container}}",
+          "refId": "A",
+          "format": "time_series",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Pod network \u00b7 received / transmitted",
+      "description": "Bytes/second by pod. Max per pod/interface removes duplicate sandbox series before summing interfaces; application containers and loopback are excluded. Only host_network=false pods are included, since host-network counters cannot be uniquely attributed to pods.",
+      "gridPos": {
+        "x": 12,
+        "y": 68,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "decimals": 2,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 7,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "showPoints": "never",
+            "pointSize": 4,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (deployment,namespace,pod) (max by (deployment,namespace,pod,interface) (rate(container_network_receive_bytes_total{job=\"kubernetes-cadvisor\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\",pod!=\"\",container=~\"POD|^$\",interface!=\"lo\"}[$__rate_interval]))) and on (deployment,namespace,pod) max by (deployment,namespace,pod) (kube_pod_info{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\",host_network=\"false\"})",
+          "legendFormat": "{{namespace}} / {{pod}} \u00b7 RX",
+          "refId": "A",
+          "format": "time_series",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (deployment,namespace,pod) (max by (deployment,namespace,pod,interface) (rate(container_network_transmit_bytes_total{job=\"kubernetes-cadvisor\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\",pod!=\"\",container=~\"POD|^$\",interface!=\"lo\"}[$__rate_interval]))) and on (deployment,namespace,pod) max by (deployment,namespace,pod) (kube_pod_info{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\",host_network=\"false\"})",
+          "legendFormat": "{{namespace}} / {{pod}} \u00b7 TX",
+          "refId": "B",
+          "format": "time_series",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "row",
+      "title": "05 \u00b7 Restart evidence and scheduled work",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 76,
+        "w": 24,
+        "h": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {},
+      "pluginVersion": "10.4.0",
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 32,
+      "type": "bargauge",
+      "title": "Container restarts \u00b7 last hour",
+      "description": "Reset-aware counter increase over one hour. This is a bounded recent estimate, not a count over the dashboard range.",
+      "gridPos": {
+        "x": 0,
+        "y": 77,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 1,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "minVizWidth": 0,
+        "minVizHeight": 16,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "(sum by (deployment,namespace,pod,container) (increase(kube_pod_container_status_restarts_total{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\"}[1h]))) and on (deployment,namespace,pod) max by (deployment,namespace,pod,node) (kube_pod_info{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\"})",
+          "legendFormat": "{{namespace}} / {{pod}} \u00b7 {{container}}",
+          "refId": "A",
+          "format": "time_series",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "type": "table",
+      "title": "Last termination was OOMKilled",
+      "description": "Latest retained container termination reason, not an OOM event rate and not necessarily an event in the selected range. This KSM metric may be unavailable; no data stays unknown.",
+      "gridPos": {
+        "x": 12,
+        "y": 77,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "OOMKilled",
+                  "color": "red"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "links": [
+            {
+              "title": "Open this pod in Logs",
+              "url": "/d/fleet-logs?${__url_time_range}&var-deployment=${__data.fields.Environment}&var-namespace=${__data.fields.Namespace}&var-pod=${__data.fields.Pod}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "OOMKilled",
+            "desc": true
+          }
+        ]
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "((max by (deployment,namespace,pod,container) (kube_pod_container_status_last_terminated_reason{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",reason=\"OOMKilled\"})) and on (deployment,namespace,pod) max by (deployment,namespace,pod,node) (kube_pod_info{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",node=~\"$node\"})) == 1",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "cluster": true
+            },
+            "renameByName": {
+              "deployment": "Environment",
+              "namespace": "Namespace",
+              "pod": "Pod",
+              "container": "Container",
+              "node": "Node",
+              "instance": "Endpoint",
+              "workload_deployment": "Deployment",
+              "statefulset": "StatefulSet",
+              "daemonset": "DaemonSet",
+              "cronjob": "CronJob",
+              "job_name": "Job",
+              "device": "Device",
+              "mountpoint": "Mount",
+              "reason": "Reason",
+              "phase": "Phase",
+              "condition": "Condition",
+              "job": "Scrape job",
+              "Value": "OOMKilled"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 34,
+      "type": "table",
+      "title": "CronJob age since successful completion",
+      "description": "Age of the last successful completion recorded by Kubernetes; not the last schedule time. Each CronJob has its own schedule, so compare age with that schedule.",
+      "gridPos": {
+        "x": 0,
+        "y": 85,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 1,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "links": [
+            {
+              "title": "Open this namespace in Logs",
+              "url": "/d/fleet-logs?${__url_time_range}&var-deployment=${__data.fields.Environment}&var-namespace=${__data.fields.Namespace}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Success age",
+            "desc": true
+          }
+        ]
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "time() - (max by (deployment,namespace,cronjob) (kube_cronjob_status_last_successful_time{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\"}) > 0)",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "cluster": true
+            },
+            "renameByName": {
+              "deployment": "Environment",
+              "namespace": "Namespace",
+              "pod": "Pod",
+              "container": "Container",
+              "node": "Node",
+              "instance": "Endpoint",
+              "workload_deployment": "Deployment",
+              "statefulset": "StatefulSet",
+              "daemonset": "DaemonSet",
+              "cronjob": "CronJob",
+              "job_name": "Job",
+              "device": "Device",
+              "mountpoint": "Mount",
+              "reason": "Reason",
+              "phase": "Phase",
+              "condition": "Condition",
+              "job": "Scrape job",
+              "Value": "Success age"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 35,
+      "type": "table",
+      "title": "CronJobs with no success recorded",
+      "description": "Known CronJobs without a positive last-successful timestamp. New or suspended CronJobs can appear here; inspect the schedule and suspend state before treating this as an incident.",
+      "gridPos": {
+        "x": 8,
+        "y": 85,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "No success recorded",
+                  "color": "orange"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "links": [
+            {
+              "title": "Open this namespace in Logs",
+              "url": "/d/fleet-logs?${__url_time_range}&var-deployment=${__data.fields.Environment}&var-namespace=${__data.fields.Namespace}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "No success",
+            "desc": true
+          }
+        ]
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max by (deployment,namespace,cronjob) (kube_cronjob_info{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\"}) unless on (deployment,namespace,cronjob) (max by (deployment,namespace,cronjob) (kube_cronjob_status_last_successful_time{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\"}) > 0)",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "cluster": true
+            },
+            "renameByName": {
+              "deployment": "Environment",
+              "namespace": "Namespace",
+              "pod": "Pod",
+              "container": "Container",
+              "node": "Node",
+              "instance": "Endpoint",
+              "workload_deployment": "Deployment",
+              "statefulset": "StatefulSet",
+              "daemonset": "DaemonSet",
+              "cronjob": "CronJob",
+              "job_name": "Job",
+              "device": "Device",
+              "mountpoint": "Mount",
+              "reason": "Reason",
+              "phase": "Phase",
+              "condition": "Condition",
+              "job": "Scrape job",
+              "Value": "No success"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 36,
+      "type": "table",
+      "title": "Failed Jobs still retained",
+      "description": "Terminal Failed condition of Job objects still retained by Kubernetes. This is not failed-pod count and not a historical total; Job TTL/history cleanup removes objects.",
+      "gridPos": {
+        "x": 16,
+        "y": 85,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "Failed",
+                  "color": "red"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "links": [
+            {
+              "title": "Open this namespace in Logs",
+              "url": "/d/fleet-logs?${__url_time_range}&var-deployment=${__data.fields.Environment}&var-namespace=${__data.fields.Namespace}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Failed",
+            "desc": true
+          }
+        ]
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max by (deployment,namespace,job_name) (kube_job_failed{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\",condition=\"true\"}) == 1",
+          "legendFormat": "",
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "cluster": true
+            },
+            "renameByName": {
+              "deployment": "Environment",
+              "namespace": "Namespace",
+              "pod": "Pod",
+              "container": "Container",
+              "node": "Node",
+              "instance": "Endpoint",
+              "workload_deployment": "Deployment",
+              "statefulset": "StatefulSet",
+              "daemonset": "DaemonSet",
+              "cronjob": "CronJob",
+              "job_name": "Job",
+              "device": "Device",
+              "mountpoint": "Mount",
+              "reason": "Reason",
+              "phase": "Phase",
+              "condition": "Condition",
+              "job": "Scrape job",
+              "Value": "Failed"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 37,
+      "type": "timeseries",
+      "title": "CronJob active executions",
+      "description": "Current active Job references per CronJob. Correlate with concurrency policy and schedule; no CronJobs yields no data.",
+      "gridPos": {
+        "x": 0,
+        "y": 93,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 7,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "showPoints": "never",
+            "pointSize": 4,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max by (deployment,namespace,cronjob) (kube_cronjob_status_active{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\"})",
+          "legendFormat": "{{namespace}} / {{cronjob}}",
+          "refId": "A",
+          "format": "time_series",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 38,
+      "type": "timeseries",
+      "title": "Unsuspended CronJobs \u00b7 schedule lateness",
+      "description": "Seconds past the KSM next-schedule timestamp for unsuspended CronJobs. Zero means the next scheduled time is still in the future; this says nothing about the success of previous executions.",
+      "gridPos": {
+        "x": 12,
+        "y": 93,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 2,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 7,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "showPoints": "never",
+            "pointSize": 4,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.4.0",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "clamp_min(time() - max by (deployment,namespace,cronjob) (kube_cronjob_next_schedule_time{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\"}), 0) and on (deployment,namespace,cronjob) (max by (deployment,namespace,cronjob) (kube_cronjob_spec_suspend{job=\"kube-state-metrics\",deployment=~\"$deployment\",cluster=\"k0s\",namespace=~\"$namespace\"}) == 0)",
+          "legendFormat": "{{namespace}} / {{cronjob}}",
+          "refId": "A",
+          "format": "time_series",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 39,
+      "type": "text",
+      "title": "Investigation notes",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 101,
+        "w": 24,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**No data is a coverage question first.** Check all nine infrastructure and monitoring scrape jobs, then whether the selected namespaces/nodes contain that resource. Sparse waiting/OOM/Job series and zero-replica controllers require context; they are not automatically green.\n\n**Memory and throttling:** correlate positive explicit limits with working set, restart increases, and last termination reasons. CFS throttling is a fraction of scheduling periods. Container requests/limits are configuration totals, not full scheduler accounting for init containers, pod overhead, or pod-level resources.\n\n**Storage and network:** inspect persistent mounts without summing bind mounts. Pod network de-duplicates sandbox series and excludes host networking.\n\n**CronJobs and Fleet workers:** Kubernetes completion status and the application worker snapshot are separate signals. Open **Workers** for the application result and **Logs** for container output; maintain Kubernetes log access controls and retention in the collector."
+      },
+      "pluginVersion": "10.4.0"
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "prometheus",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "selected": true,
+          "text": "Prometheus",
+          "value": "fleet-prometheus"
+        },
+        "options": [],
+        "refresh": 1,
+        "hide": 0,
+        "skipUrlSync": false
+      },
+      {
+        "name": "deployment",
+        "label": "Deployment",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${prometheus}"
+        },
+        "definition": "label_values(up{cluster=\"k0s\"}, deployment)",
+        "query": {
+          "query": "label_values(up{cluster=\"k0s\"}, deployment)",
+          "refId": "StandardVariableQuery"
+        },
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "options": [],
+        "refresh": 1,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "hide": 0,
+        "skipUrlSync": false
+      },
+      {
+        "name": "namespace",
+        "label": "Namespace",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${prometheus}"
+        },
+        "definition": "label_values(kube_pod_info{job=\"kube-state-metrics\",cluster=\"k0s\",deployment=~\"$deployment\"}, namespace)",
+        "query": {
+          "query": "label_values(kube_pod_info{job=\"kube-state-metrics\",cluster=\"k0s\",deployment=~\"$deployment\"}, namespace)",
+          "refId": "StandardVariableQuery"
+        },
+        "current": {
+          "selected": true,
+          "text": [
+            "fleet-recall",
+            "ory",
+            "localstack",
+            "fleet-observability"
+          ],
+          "value": [
+            "fleet-recall",
+            "ory",
+            "localstack",
+            "fleet-observability"
+          ]
+        },
+        "options": [],
+        "refresh": 1,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "hide": 0,
+        "skipUrlSync": false
+      },
+      {
+        "name": "node",
+        "label": "Node",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${prometheus}"
+        },
+        "definition": "label_values(up{job=\"node-exporter\",cluster=\"k0s\",deployment=~\"$deployment\"}, node)",
+        "query": {
+          "query": "label_values(up{job=\"node-exporter\",cluster=\"k0s\",deployment=~\"$deployment\"}, node)",
+          "refId": "StandardVariableQuery"
+        },
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "options": [],
+        "refresh": 1,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "hide": 0,
+        "skipUrlSync": false
+      }
+    ]
+  },
+  "links": [
+    {
+      "title": "Overview",
+      "type": "link",
+      "url": "/d/fleet-overview",
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "Open Overview with current filters and time range"
+    },
+    {
+      "title": "MCP and HTTP",
+      "type": "link",
+      "url": "/d/fleet-mcp",
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "Open MCP and HTTP with current filters and time range"
+    },
+    {
+      "title": "Dependencies",
+      "type": "link",
+      "url": "/d/fleet-dependencies",
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "Open Dependencies with current filters and time range"
+    },
+    {
+      "title": "Workers",
+      "type": "link",
+      "url": "/d/fleet-workers",
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "Open Workers with current filters and time range"
+    },
+    {
+      "title": "Logs",
+      "type": "link",
+      "url": "/d/fleet-logs",
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "Open Logs with current filters and time range"
+    }
+  ]
+}

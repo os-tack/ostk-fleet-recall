@@ -1,0 +1,157 @@
+# Observe only workload/storage status in the five local-stack namespaces, plus cluster nodes/namespaces/PVs.
+# No Secret/ConfigMap contents, Role data, or admission-controller configuration are readable.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-state-metrics
+  labels:
+    app.kubernetes.io/part-of: fleet-observability
+    app.kubernetes.io/name: kube-state-metrics
+  namespace: fleet-observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fleet-observability-ksm-cluster
+  labels:
+    app.kubernetes.io/part-of: fleet-observability
+rules:
+- apiGroups:
+  - ''
+  resources:
+  - nodes
+  - namespaces
+  - persistentvolumes
+  verbs:
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fleet-observability-ksm-cluster
+  labels:
+    app.kubernetes.io/part-of: fleet-observability
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fleet-observability-ksm-cluster
+subjects:
+- kind: ServiceAccount
+  name: kube-state-metrics
+  namespace: fleet-observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fleet-observability-ksm-workloads
+  labels:
+    app.kubernetes.io/part-of: fleet-observability
+rules:
+- apiGroups:
+  - ''
+  resources:
+  - pods
+  - persistentvolumeclaims
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - daemonsets
+  - deployments
+  - replicasets
+  - statefulsets
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - batch
+  resources:
+  - cronjobs
+  - jobs
+  verbs:
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fleet-kube-state-metrics
+  labels:
+    app.kubernetes.io/part-of: fleet-observability
+  namespace: fleet-recall
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fleet-observability-ksm-workloads
+subjects:
+- kind: ServiceAccount
+  name: kube-state-metrics
+  namespace: fleet-observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fleet-kube-state-metrics
+  labels:
+    app.kubernetes.io/part-of: fleet-observability
+  namespace: ory
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fleet-observability-ksm-workloads
+subjects:
+- kind: ServiceAccount
+  name: kube-state-metrics
+  namespace: fleet-observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fleet-kube-state-metrics
+  labels:
+    app.kubernetes.io/part-of: fleet-observability
+  namespace: localstack
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fleet-observability-ksm-workloads
+subjects:
+- kind: ServiceAccount
+  name: kube-state-metrics
+  namespace: fleet-observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fleet-kube-state-metrics
+  labels:
+    app.kubernetes.io/part-of: fleet-observability
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fleet-observability-ksm-workloads
+subjects:
+- kind: ServiceAccount
+  name: kube-state-metrics
+  namespace: fleet-observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fleet-kube-state-metrics
+  labels:
+    app.kubernetes.io/part-of: fleet-observability
+  namespace: fleet-observability
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fleet-observability-ksm-workloads
+subjects:
+- kind: ServiceAccount
+  name: kube-state-metrics
+  namespace: fleet-observability

@@ -18,6 +18,13 @@ deploy/local/bootstrap.sh reset --all       # asks; deletes the VM and .state
 Phases: `preflight vm images certs secrets cockroach migrate authority
 boundary ory localstack recall verify`.
 
+Add local monitoring with `deploy/local/bootstrap.sh phase observability`.
+This optional phase installs Prometheus, Grafana, Loki, Alloy, node exporter,
+and kube-state-metrics in `fleet-observability`; see the
+[monitoring guide](../observability/README.md) for dashboards, access, storage,
+and verification. It can also be installed from another worktree by explicitly
+pointing its installer at this checkout's `.state/kubeconfig`.
+
 ## Prerequisites
 
 Apple Silicon M3 or later on macOS 15 or later (nested virtualization), Lima

@@ -18,6 +18,8 @@ spec:
     metadata:
       labels:
         app: ingress
+      annotations:
+        prometheus.io/scrape: "true"
     spec:
       enableServiceLinks: false
       automountServiceAccountToken: false
@@ -35,7 +37,15 @@ spec:
           ports:
             - name: http
               containerPort: 8787
+            - name: metrics
+              containerPort: 9091
           env:
+            - name: FLEET_RECALL_METRICS_LISTEN
+              value: 0.0.0.0:9091
+            - name: FLEET_RECALL_METRICS_ALLOW_NON_LOOPBACK
+              value: "true"
+            - name: FLEET_RECALL_LOG_FORMAT
+              value: json
             - name: FLEET_RECALL_TENANT_ID
               valueFrom:
                 configMapKeyRef:

@@ -243,6 +243,12 @@ monitoring system before relying on alerts; these examples do not deploy one.
 
 ## Privacy and boundaries
 
+For the local k0s deployment, the [monitoring stack and dashboard guide](../deploy/observability/README.md)
+adds Grafana, Prometheus, Loki, Alloy, node exporter, and kube-state-metrics.
+It covers container resources, cluster state, pod logs and Kubernetes events,
+and explains activation, retention, and the distinction between live service
+counters and completed-worker snapshots.
+
 New operational metrics and completion events contain only code-owned
 categories, numeric measurements, build version, and generated operation IDs
 in spans. They exclude query/body text, credentials, headers, cookies,

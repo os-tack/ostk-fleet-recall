@@ -1,0 +1,33 @@
+# Do not add a namespace transformer: cross-namespace read-only RoleBindings must retain their explicit namespaces.
+# The installer creates fleet-grafana-admin, fleet-grafana-provisioning, fleet-grafana-dashboards and fleet-prometheus-rules first.
+# Generated config names are hashed so configuration edits roll their consuming Deployments.
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- namespace.yaml
+- prometheus-rbac.yaml
+- prometheus.yaml
+- kube-state-metrics-rbac.yaml
+- kube-state-metrics.yaml
+- node-exporter.yaml
+- grafana.yaml
+- networkpolicies.yaml
+- loki.yaml
+- alloy.yaml
+configMapGenerator:
+- name: prometheus-config
+  namespace: fleet-observability
+  files:
+  - prometheus.yml=prometheus.yml
+- name: loki-config
+  namespace: fleet-observability
+  files:
+  - loki.yaml=loki-config.yaml
+- name: alloy-config
+  namespace: fleet-observability
+  files:
+  - config.alloy=alloy-config.alloy
+generatorOptions:
+  labels:
+    app.kubernetes.io/part-of: fleet-observability
