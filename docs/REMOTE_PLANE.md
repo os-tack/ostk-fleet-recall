@@ -119,6 +119,16 @@ with that exact original origin can be routed. It cannot redirect a production
 issuer or an issuer-supplied cross-origin JWKS URL. Production uses reachable
 HTTPS issuer URLs directly.
 
+An issuer that authenticates discovery or JWKS requests can use
+`FLEET_RECALL_OIDC_DISCOVERY_TOKEN_PATHS=k8s=/var/run/recall-oidc/token`.
+Each configured file is bounded to 16 KiB and reread on fetch, supporting
+projected-token rotation. Its bearer is sent only to the configured issuer's
+origin; redirects, cross-origin JWKS URLs, and combining this credential with
+a local transport override are refused. This credential reads verification
+metadata and grants no Recall access. The local overlay uses a dedicated
+`recall-oidc` service account with GET permission only for discovery and JWKS,
+and keeps automatic service-account mounts disabled.
+
 HTTP binds loopback unless `--allow-non-loopback` is passed. Production needs
 TLS termination and a matching HTTPS resource URL. Set
 `FLEET_RECALL_HTTP_ALLOWED_ORIGINS` to explicit allowed browser origins;

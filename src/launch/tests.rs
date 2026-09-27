@@ -167,6 +167,37 @@ fn provider_inputs_are_opt_in_and_never_shared_with_shipper() {
     assert!(!env.contains_key("CODEX_HOME"));
 }
 
+#[test]
+fn grant_lifetime_allows_bounded_clock_skew_but_not_expiry_or_extended_ttl() {
+    let now = chrono::Utc::now();
+    let mut grant = SessionGrant {
+        jti: Uuid::now_v7(),
+        kind: crate::auth::grant::GrantKind::Agent,
+        principal_id: Uuid::now_v7(),
+        principal_revision: 1,
+        tenant_id: Uuid::now_v7(),
+        project: "local-k0s".into(),
+        agent: "sandbox-test".into(),
+        ceiling: crate::auth::registry::Ceiling::Project,
+        sandbox_id: Some(Uuid::now_v7().to_string()),
+        issued_at: now + chrono::Duration::milliseconds(100),
+        expires_at: now + chrono::Duration::seconds(3600) + chrono::Duration::milliseconds(100),
+    };
+    assert!(valid_grant_lifetime(&grant, 3600, now));
+    grant.issued_at = now + chrono::Duration::seconds(60);
+    grant.expires_at = grant.issued_at + chrono::Duration::seconds(3600);
+    assert!(valid_grant_lifetime(&grant, 3600, now));
+    grant.issued_at += chrono::Duration::milliseconds(1);
+    assert!(!valid_grant_lifetime(&grant, 3600, now));
+    grant.issued_at = now;
+    grant.expires_at = now + chrono::Duration::seconds(3600) + chrono::Duration::milliseconds(1);
+    assert!(!valid_grant_lifetime(&grant, 3600, now));
+    grant.expires_at = now;
+    assert!(!valid_grant_lifetime(&grant, 3600, now));
+    grant.issued_at = now + chrono::Duration::seconds(1);
+    assert!(!valid_grant_lifetime(&grant, 3600, now));
+}
+
 fn fake_program(directory: &Path, name: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let program = directory.join(name);

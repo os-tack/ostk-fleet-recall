@@ -24,6 +24,7 @@ spec:
     spec:
       enableServiceLinks: false
       automountServiceAccountToken: false
+      serviceAccountName: recall-oidc
       securityContext:
         runAsUser: 10001
         runAsGroup: 10001
@@ -48,6 +49,7 @@ spec:
             - {name: FLEET_RECALL_OIDC_SCOPE_SUBSTITUTES, value: "hydra=fleet-recall"}
             - {name: FLEET_RECALL_OIDC_LOCAL_TRANSPORTS, value: "hydra=http://hydra-public.ory.svc.cluster.local:4444/"}
             - {name: FLEET_RECALL_OIDC_CA_PATH, value: /etc/kubernetes/ca.crt}
+            - {name: FLEET_RECALL_OIDC_DISCOVERY_TOKEN_PATHS, value: "k8s=/var/run/recall-oidc/token"}
             - {name: FLEET_RECALL_LOCAL_KEY_ANCHOR_PATH, value: /etc/recall/launcher-keys.json}
             - {name: FLEET_RECALL_EMBEDDING_TIER_URL, value: "http://embed:8090"}
             - {name: FLEET_RECALL_TRANSCRIPT_SPOOL_DIR, value: /var/lib/recall/transcripts}
@@ -67,6 +69,7 @@ spec:
           volumeMounts:
             - {name: crdb-ca, mountPath: /etc/crdb, readOnly: true}
             - {name: cluster-ca, mountPath: /etc/kubernetes, readOnly: true}
+            - {name: oidc-discovery, mountPath: /var/run/recall-oidc, readOnly: true}
             - {name: launcher-keys, mountPath: /etc/recall, readOnly: true}
             - {name: transcripts, mountPath: /var/lib/recall/transcripts}
       volumes:
@@ -74,6 +77,13 @@ spec:
           secret: {secretName: crdb-ca}
         - name: cluster-ca
           configMap: {name: kube-root-ca.crt}
+        - name: oidc-discovery
+          projected:
+            defaultMode: 0440
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
         - name: launcher-keys
           configMap: {name: fleet-launcher-keys}
         - name: transcripts

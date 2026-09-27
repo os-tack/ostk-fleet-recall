@@ -3,7 +3,11 @@
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    io::Read as _,
+    path::{Path, PathBuf},
+};
 use tokio::sync::Mutex;
 
 use super::super::{
@@ -15,6 +19,7 @@ use super::{IdentityAnchor, bounded_body, discovery_endpoint, endpoint, http_cli
 const BODY_LIMIT: usize = 262_144;
 const CACHE_SECONDS: i64 = 600;
 const REFRESH_COOLDOWN_SECONDS: i64 = 60;
+const DISCOVERY_TOKEN_LIMIT: usize = 16_384;
 
 pub struct OidcConfig {
     pub anchor_id: String,
@@ -33,6 +38,7 @@ pub struct OidcAnchor {
     allow_http: bool,
     client: reqwest::Client,
     transport_origin: Option<url::Url>,
+    discovery_token_path: Option<PathBuf>,
     cache: Mutex<KeyCache>,
 }
 
@@ -75,6 +81,7 @@ impl OidcAnchor {
             allow_http: config.allow_http,
             client: http_client(config.ca_pem.as_deref())?,
             transport_origin: None,
+            discovery_token_path: None,
             cache: Mutex::new(KeyCache::default()),
         })
     }
@@ -85,6 +92,9 @@ impl OidcAnchor {
     /// Only same-issuer-origin discovery and JWKS URLs may use this route.
     pub fn with_local_transport(mut self, origin: Option<&str>) -> Result<Self, AuthError> {
         if let Some(origin) = origin {
+            if self.discovery_token_path.is_some() {
+                return Err(AuthError::Configuration);
+            }
             let issuer = endpoint(&self.policy.issuer, self.allow_http)?;
             let local = match issuer.host() {
                 Some(url::Host::Domain(host)) => host == "localhost",
@@ -110,25 +120,57 @@ impl OidcAnchor {
         Ok(self)
     }
 
+    /// Operator-configured projected token for authenticated issuer metadata.
+    /// The token is reloaded for every request, including JWKS, so Kubernetes
+    /// volume rotation does not require a restart. Authenticated requests may
+    /// only use the issuer's exact origin, without a transport override.
+    pub fn with_discovery_token_path(mut self, path: Option<&Path>) -> Result<Self, AuthError> {
+        if let Some(path) = path {
+            if !path.is_absolute() || self.transport_origin.is_some() {
+                return Err(AuthError::Configuration);
+            }
+            self.discovery_token_path = Some(path.to_owned());
+        }
+        Ok(self)
+    }
+
     fn routed_url(&self, original: &str) -> Result<url::Url, AuthError> {
         let source = discovery_endpoint(original, self.allow_http)?;
+        let issuer = endpoint(&self.policy.issuer, self.allow_http)?;
+        if (self.discovery_token_path.is_some() || self.transport_origin.is_some())
+            && source.origin() != issuer.origin()
+        {
+            return Err(AuthError::Configuration);
+        }
         let Some(target) = &self.transport_origin else {
             return Ok(source);
         };
-        let issuer = endpoint(&self.policy.issuer, self.allow_http)?;
-        if source.origin() != issuer.origin() {
-            return Err(AuthError::Configuration);
-        }
         let mut routed = target.clone();
         routed.set_path(source.path());
         routed.set_query(source.query());
         Ok(routed)
     }
 
+    async fn request(&self, original: &str) -> Result<reqwest::RequestBuilder, AuthError> {
+        // Check origin before reading the token or constructing its header.
+        let url = self
+            .routed_url(original)
+            .map_err(|_| AuthError::ProviderUnavailable)?;
+        let mut request = self.client.get(url);
+        if let Some(path) = &self.discovery_token_path {
+            let path = path.clone();
+            let value = tokio::task::spawn_blocking(move || discovery_token(&path))
+                .await
+                .map_err(|_| AuthError::ProviderUnavailable)??;
+            request = request.header(reqwest::header::AUTHORIZATION, value);
+        }
+        Ok(request)
+    }
+
     async fn fetch_keys(&self) -> Result<Vec<Jwk>, AuthError> {
         let response = self
-            .client
-            .get(self.routed_url(&self.discovery_url)?)
+            .request(&self.discovery_url)
+            .await?
             .send()
             .await
             .map_err(|_| AuthError::ProviderUnavailable)?;
@@ -137,12 +179,9 @@ impl OidcAnchor {
         if discovery.issuer != self.policy.issuer {
             return Err(AuthError::ProviderUnavailable);
         }
-        let jwks_url = self
-            .routed_url(&discovery.jwks_uri)
-            .map_err(|_| AuthError::ProviderUnavailable)?;
         let response = self
-            .client
-            .get(jwks_url)
+            .request(&discovery.jwks_uri)
+            .await?
             .send()
             .await
             .map_err(|_| AuthError::ProviderUnavailable)?;
@@ -192,6 +231,42 @@ impl OidcAnchor {
     }
 }
 
+fn discovery_token(path: &Path) -> Result<reqwest::header::HeaderValue, AuthError> {
+    // Projected volumes deliberately use symlinks for atomic rotation. Follow
+    // the operator-controlled path, then validate and bound the opened file.
+    let descriptor = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|_| AuthError::ProviderUnavailable)?;
+    let source = std::fs::File::from(descriptor);
+    let metadata = source
+        .metadata()
+        .map_err(|_| AuthError::ProviderUnavailable)?;
+    if !metadata.is_file() || metadata.len() > DISCOVERY_TOKEN_LIMIT as u64 {
+        return Err(AuthError::ProviderUnavailable);
+    }
+    let mut bytes = Vec::new();
+    source
+        .take(DISCOVERY_TOKEN_LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| AuthError::ProviderUnavailable)?;
+    if bytes.len() > DISCOVERY_TOKEN_LIMIT {
+        return Err(AuthError::ProviderUnavailable);
+    }
+    let token = std::str::from_utf8(&bytes)
+        .map_err(|_| AuthError::ProviderUnavailable)?
+        .trim_ascii();
+    if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(AuthError::ProviderUnavailable);
+    }
+    let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| AuthError::ProviderUnavailable)?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
 #[async_trait]
 impl IdentityAnchor for OidcAnchor {
     fn anchor_id(&self) -> &str {
@@ -224,6 +299,210 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tokio::sync::RwLock;
+
+    fn authenticated_anchor(issuer: &str, path: &Path) -> OidcAnchor {
+        OidcAnchor::new(OidcConfig {
+            anchor_id: "k8s".into(),
+            issuer: issuer.into(),
+            resource: "https://recall/mcp".into(),
+            audience_policy: AudiencePolicy::Required,
+            ca_pem: None,
+            allow_http: true,
+        })
+        .unwrap()
+        .with_discovery_token_path(Some(path))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn discovery_token_files_are_bounded_sensitive_and_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("token");
+        let anchor = authenticated_anchor("http://localhost:4444/", &path);
+        assert!(anchor.request(&anchor.discovery_url).await.is_err());
+        for invalid in [
+            Vec::new(),
+            vec![b'x'; DISCOVERY_TOKEN_LIMIT + 1],
+            b"first\r\nAuthorization: second".to_vec(),
+            b"contains space".to_vec(),
+            vec![0xff],
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(anchor.request(&anchor.discovery_url).await.is_err());
+        }
+        std::fs::write(&path, b"header.payload.signature\n").unwrap();
+        let request = anchor
+            .request(&anchor.discovery_url)
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        let header = &request.headers()[reqwest::header::AUTHORIZATION];
+        assert_eq!(header, "Bearer header.payload.signature");
+        assert!(header.is_sensitive());
+        assert!(!format!("{request:?}").contains("header.payload.signature"));
+        assert!(
+            authenticated_anchor("http://localhost:4444/", directory.path())
+                .request("http://localhost:4444/keys")
+                .await
+                .is_err()
+        );
+        assert!(
+            anchor
+                .with_local_transport(Some("http://internal/"))
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discovery_token_follows_projected_symlink_but_refuses_fifo() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("generation-token");
+        std::fs::write(&target, b"projected-token").unwrap();
+        let link = directory.path().join("token");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let anchor = authenticated_anchor("http://localhost/", &link);
+        assert_eq!(
+            anchor
+                .request(&anchor.discovery_url)
+                .await
+                .unwrap()
+                .build()
+                .unwrap()
+                .headers()[reqwest::header::AUTHORIZATION],
+            "Bearer projected-token"
+        );
+        let fifo = directory.path().join("fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let anchor = authenticated_anchor("http://localhost/", &fifo);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            anchor.request(&anchor.discovery_url),
+        )
+        .await
+        .expect("nonregular token paths must not block");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn authenticated_discovery_reloads_token_for_each_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("token");
+        std::fs::write(&path, b"first-token").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}/", listener.local_addr().unwrap());
+        let metadata = serde_json::json!({"issuer":issuer,"jwks_uri":format!("{issuer}keys")});
+        let signer = Ed25519Signer::from_seed_hex("k8s", &"01".repeat(32)).unwrap();
+        let jwks = serde_json::json!({"keys":[signer.public_jwk()]});
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let discovery_observed = observed.clone();
+        let keys_observed = observed.clone();
+        let rotated_path = path.clone();
+        let app = Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                get(move |headers: axum::http::HeaderMap| {
+                    let observed = discovery_observed.clone();
+                    let metadata = metadata.clone();
+                    let path = rotated_path.clone();
+                    async move {
+                        observed
+                            .lock()
+                            .await
+                            .push(headers[reqwest::header::AUTHORIZATION].clone());
+                        // Rotation occurs between discovery and its JWKS request.
+                        std::fs::write(path, b"rotated-token").unwrap();
+                        axum::Json(metadata)
+                    }
+                }),
+            )
+            .route(
+                "/keys",
+                get(move |headers: axum::http::HeaderMap| {
+                    let observed = keys_observed.clone();
+                    let jwks = jwks.clone();
+                    async move {
+                        observed
+                            .lock()
+                            .await
+                            .push(headers[reqwest::header::AUTHORIZATION].clone());
+                        axum::Json(jwks)
+                    }
+                }),
+            );
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let anchor = authenticated_anchor(&issuer, &path);
+        assert_eq!(anchor.fetch_keys().await.unwrap().len(), 1);
+        assert_eq!(anchor.fetch_keys().await.unwrap().len(), 1);
+        assert_eq!(
+            observed.lock().await.as_slice(),
+            [
+                "Bearer first-token",
+                "Bearer rotated-token",
+                "Bearer rotated-token",
+                "Bearer rotated-token"
+            ]
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn authenticated_metadata_cannot_send_token_to_another_origin() {
+        use axum::response::IntoResponse as _;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("token");
+        std::fs::write(&path, b"private-discovery-token").unwrap();
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/keys", target.local_addr().unwrap());
+        let leaks = Arc::new(AtomicUsize::new(0));
+        let observed = leaks.clone();
+        let target_app = Router::new().fallback(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { "unexpected" }
+        });
+        let target_task =
+            tokio::spawn(async move { axum::serve(target, target_app).await.unwrap() });
+        for redirect in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let issuer = format!("http://{}/", listener.local_addr().unwrap());
+            let metadata = serde_json::json!({"issuer":issuer,"jwks_uri":target_url});
+            let destination = target_url.clone();
+            let app = Router::new().route(
+                "/.well-known/openid-configuration",
+                get(move |headers: axum::http::HeaderMap| {
+                    assert_eq!(
+                        headers[reqwest::header::AUTHORIZATION],
+                        "Bearer private-discovery-token"
+                    );
+                    let metadata = metadata.clone();
+                    let destination = destination.clone();
+                    async move {
+                        if redirect {
+                            axum::response::Redirect::temporary(&destination).into_response()
+                        } else {
+                            axum::Json(metadata).into_response()
+                        }
+                    }
+                }),
+            );
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let anchor = authenticated_anchor(&issuer, &path);
+            assert_eq!(
+                anchor.fetch_keys().await.unwrap_err(),
+                AuthError::ProviderUnavailable
+            );
+            assert_eq!(leaks.load(Ordering::SeqCst), 0);
+            task.abort();
+        }
+        target_task.abort();
+    }
 
     #[test]
     fn local_transport_preserves_issuer_paths_and_rejects_origin_escape() {

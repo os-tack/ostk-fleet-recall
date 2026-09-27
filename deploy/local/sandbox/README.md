@@ -10,6 +10,9 @@ docker build -f deploy/local/sandbox/Dockerfile \
   -t ostk-sandbox:local .
 ```
 
+Launcher examples use `ostk-fleet-recall` on `PATH`. After a local Cargo build,
+use `target/debug/ostk-fleet-recall` instead if the command is not installed.
+
 The Node 24 LTS base is pinned by OCI index digest. Codex 0.157.1 and Claude
 Code 2.1.283 match the locally verified CLI versions. Both versions can be
 changed explicitly through build arguments after compatibility testing.
@@ -63,7 +66,10 @@ Claude uses Haiku. See official [Codex authentication](https://learn.chatgpt.com
 [headless execution](https://learn.chatgpt.com/docs/non-interactive-mode), and
 [MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 
-All harnesses use a fresh home and Recall-only configuration. Provider auth
+All harnesses use a fresh home and Recall-only configuration. Selecting the
+Codex harness preapproves exactly its scoped `recall` and `remember` tools;
+shell execution stays read-only and other approval requests remain denied.
+Provider auth
 and logs stay outside the transcript volume. Only native transcript directories
 are shared with the shipper. The shim receives just the agent's Recall token;
 the shipper receives just its own grant. Tokens never appear in command arguments

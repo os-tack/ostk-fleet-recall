@@ -2,7 +2,7 @@
   "id": null,
   "uid": "fleet-dependencies",
   "title": "Fleet Recall / Dependencies",
-  "description": "Live CockroachDB transaction/readiness and local embedding metrics. Retries, latency distributions, outcomes and numeric work units preserve operation boundaries and keep missing observations distinct from zero.",
+  "description": "Live CockroachDB transaction/readiness and local/remote embedding metrics. Retries, latency distributions, outcomes and numeric work units preserve operation boundaries and keep missing observations distinct from zero.",
   "tags": [
     "fleet-recall",
     "dependencies",
@@ -2432,7 +2432,7 @@
             "uid": "$prometheus"
           },
           "editorMode": "code",
-          "expr": "((sum by (operation)(rate(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=\"embedding\",operation=~\"local_batch|embed\",outcome=\"error\"}[$__rate_interval]))) / (sum by (operation)(rate(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=\"embedding\",operation=~\"local_batch|embed\"}[$__rate_interval])))) and ((sum by (operation)(rate(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=\"embedding\",operation=~\"local_batch|embed\"}[$__rate_interval]))) > 0)",
+          "expr": "((sum by (operation)(rate(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=\"embedding\",operation=~\"local_batch|embed|remote_batch|remote_descriptor\",outcome=\"error\"}[$__rate_interval]))) / (sum by (operation)(rate(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=\"embedding\",operation=~\"local_batch|embed|remote_batch|remote_descriptor\"}[$__rate_interval])))) and ((sum by (operation)(rate(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=\"embedding\",operation=~\"local_batch|embed|remote_batch|remote_descriptor\"}[$__rate_interval]))) > 0)",
           "legendFormat": "{{operation}}",
           "range": true,
           "instant": false,
@@ -2529,7 +2529,7 @@
             "uid": "$prometheus"
           },
           "editorMode": "code",
-          "expr": "((sum by (operation)(rate(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=\"embedding\",operation=~\"local_batch|embed\",outcome=\"invalid\"}[$__rate_interval]))) / (sum by (operation)(rate(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=\"embedding\",operation=~\"local_batch|embed\"}[$__rate_interval])))) and ((sum by (operation)(rate(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=\"embedding\",operation=~\"local_batch|embed\"}[$__rate_interval]))) > 0)",
+          "expr": "((sum by (operation)(rate(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=\"embedding\",operation=~\"local_batch|embed|remote_batch|remote_descriptor\",outcome=\"invalid\"}[$__rate_interval]))) / (sum by (operation)(rate(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=\"embedding\",operation=~\"local_batch|embed|remote_batch|remote_descriptor\"}[$__rate_interval])))) and ((sum by (operation)(rate(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=\"embedding\",operation=~\"local_batch|embed|remote_batch|remote_descriptor\"}[$__rate_interval]))) > 0)",
           "legendFormat": "{{operation}}",
           "range": true,
           "instant": false,
@@ -2736,7 +2736,7 @@
             "uid": "$prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (deployment,instance,operation)(fleet_recall_operations_in_flight{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=\"embedding\",operation=~\"local_batch|embed\"})",
+          "expr": "sum by (deployment,instance,operation)(fleet_recall_operations_in_flight{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=\"embedding\",operation=~\"local_batch|embed|remote_batch|remote_descriptor\"})",
           "legendFormat": "{{deployment}} / {{instance}} \u00b7 {{operation}}",
           "range": true,
           "instant": false,
@@ -2914,7 +2914,7 @@
             "uid": "$prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (operation,outcome)(increase(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=\"embedding\",operation=~\"local_batch|embed\",outcome=~\"success|error|invalid|cancelled\"}[$__range]))",
+          "expr": "sum by (operation,outcome)(increase(fleet_recall_operations_total{job=\"fleet-recall\",deployment=~\"$deployment\",instance=~\"$instance\",component=\"embedding\",operation=~\"local_batch|embed|remote_batch|remote_descriptor\",outcome=~\"success|error|invalid|cancelled\"}[$__range]))",
           "legendFormat": "{{operation}} \u00b7 {{outcome}}",
           "range": false,
           "instant": true,

@@ -44,11 +44,14 @@ pub fn router(
         bearer: token.map(|token| Arc::new(hmac::Key::new(hmac::HMAC_SHA256, token.as_bytes()))),
         capacity: Arc::new(Semaphore::new(4)),
     };
-    Ok(Router::new()
-        .route("/v1/descriptor", get(describe))
-        .route("/v1/embed", post(embed))
-        .layer(middleware::from_fn_with_state(state.clone(), guard))
-        .with_state(state))
+    Ok(crate::telemetry::http::instrument(
+        Router::new()
+            .route("/v1/descriptor", get(describe))
+            .route("/v1/embed", post(embed))
+            .layer(middleware::from_fn_with_state(state.clone(), guard))
+            .with_state(state),
+        "http_embed",
+    ))
 }
 
 async fn guard(State(state): State<ServerState>, request: Request, next: Next) -> Response {
@@ -124,10 +127,13 @@ async fn embed(State(state): State<ServerState>, request: Request) -> Response {
         return failure(StatusCode::BAD_REQUEST, "invalid_request");
     }
     let count = request.texts.len();
+    let span = tracing::Span::current();
     let vectors = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let texts = request.texts.iter().map(String::as_str).collect::<Vec<_>>();
-        state.embedder.encode_batch(&texts)
+        span.in_scope(|| {
+            let _permit = permit;
+            let texts = request.texts.iter().map(String::as_str).collect::<Vec<_>>();
+            state.embedder.encode_batch(&texts)
+        })
     })
     .await;
     let Ok(vectors) = vectors else {

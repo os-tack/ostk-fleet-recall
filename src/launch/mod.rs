@@ -440,10 +440,7 @@ fn validate_grant(
         "server returned a grant for a different identity or scope"
     );
     ensure!(
-        grant.expires_at > chrono::Utc::now()
-            && grant.issued_at <= chrono::Utc::now()
-            && (grant.expires_at - grant.issued_at).num_seconds()
-                <= i64::try_from(args.ttl_seconds)?,
+        valid_grant_lifetime(grant, args.ttl_seconds, chrono::Utc::now()),
         "server returned an invalid grant lifetime"
     );
     ensure!(
@@ -453,6 +450,20 @@ fn validate_grant(
         "server returned an invalid grant token"
     );
     Ok(())
+}
+
+fn valid_grant_lifetime(
+    grant: &SessionGrant,
+    ttl_seconds: u64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let lifetime = grant.expires_at - grant.issued_at;
+    // Match the verifier's bounded clock leeway. VM and host clocks can
+    // differ by milliseconds even while showing the same wall-clock second.
+    grant.expires_at > now
+        && grant.issued_at <= now + chrono::Duration::seconds(60)
+        && lifetime > chrono::Duration::zero()
+        && lifetime <= chrono::Duration::seconds(i64::try_from(ttl_seconds).unwrap_or_default())
 }
 
 async fn launch_up(args: LaunchUpV1) -> anyhow::Result<()> {

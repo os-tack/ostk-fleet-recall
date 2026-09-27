@@ -1,8 +1,9 @@
 # ADR 0009: The remote plane
 
-- Status: accepted; M1 and the M2 remote plane are implemented. M3 remains
-  planned. See `deploy/local/README.md` for the local checkpoint and the
-  native Claude usage-limit qualification. Nothing here changes a frozen registry generation.
+- Status: accepted; M1, M2, and M3 are implemented. M3 is verified with Docker,
+  Kubernetes service-account launches, and real Codex transcript recall. See
+  `deploy/local/README.md` for checkpoint evidence and the Claude usage-limit
+  qualification. Nothing here changes a frozen registry generation.
 - Date: 2026-09-27
 - Scope: where the recall process, the embedding model, the writer credential,
   and the scope binding run relative to the agent; how an agent in an

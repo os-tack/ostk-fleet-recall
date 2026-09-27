@@ -51,6 +51,7 @@ fn route(path: Option<&str>) -> &'static str {
         Some("/api/recall") => "recall",
         Some("/mcp") => "mcp",
         Some("/v1/embed") => "embed",
+        Some("/v1/descriptor") => "descriptor",
         Some("/v1/model") => "model",
         Some(
             "/.well-known/oauth-protected-resource" | "/.well-known/oauth-protected-resource/mcp",
@@ -89,6 +90,8 @@ mod tests {
         );
         for (path, expected) in [
             ("/mcp", "mcp"),
+            ("/v1/embed", "embed"),
+            ("/v1/descriptor", "descriptor"),
             ("/.well-known/oauth-protected-resource", "resource_metadata"),
             (
                 "/.well-known/oauth-protected-resource/mcp",

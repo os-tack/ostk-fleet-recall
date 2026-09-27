@@ -8,6 +8,7 @@ use super::{
 use crate::projectors::{
     EmbeddingModelDescriptorV1, EmbeddingProvider, RecallProjectionError, RecallProjectionResult,
 };
+use crate::telemetry::{self, Outcome};
 use async_trait::async_trait;
 use ostk_recall_core::ChunkEmbedder;
 use serde::de::DeserializeOwned;
@@ -19,6 +20,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
+use tracing::Instrument as _;
 
 pub struct RemoteClient {
     client: reqwest::Client,
@@ -64,6 +66,7 @@ impl RemoteClient {
     }
 
     pub async fn check_health(&self) -> Result<(), TierError> {
+        let observation = telemetry::start("embedding", "remote_descriptor");
         let result = async {
             let actual: Descriptor = self.request("/v1/descriptor", None).await?;
             if actual != self.descriptor {
@@ -71,8 +74,10 @@ impl RemoteClient {
             }
             Ok(())
         }
+        .instrument(observation.span())
         .await;
         self.degraded.store(result.is_err(), Ordering::Release);
+        observation.finish(outcome(&result));
         result
     }
 
@@ -87,8 +92,13 @@ impl RemoteClient {
     }
 
     pub async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, TierError> {
-        let result = self.embed_inner(texts).await;
+        let observation = telemetry::start("embedding", "remote_batch");
+        let result = self.embed_inner(texts).instrument(observation.span()).await;
         self.degraded.store(result.is_err(), Ordering::Release);
+        if result.is_ok() {
+            telemetry::add_units("embedding", "remote_batch", "texts", texts.len() as u64);
+        }
+        observation.finish(outcome(&result));
         result
     }
 
@@ -164,6 +174,19 @@ impl RemoteClient {
     }
 }
 
+const fn outcome<T>(result: &Result<T, TierError>) -> Outcome {
+    match result {
+        Ok(_) => Outcome::Success,
+        Err(
+            TierError::Configuration
+            | TierError::DescriptorMismatch
+            | TierError::InvalidVectors
+            | TierError::InvalidRequest,
+        ) => Outcome::Invalid,
+        Err(TierError::Unavailable | TierError::UnsupportedRuntime) => Outcome::Error,
+    }
+}
+
 fn bridge<T>(future: impl Future<Output = Result<T, TierError>>) -> Result<T, TierError> {
     let handle =
         tokio::runtime::Handle::try_current().map_err(|_| TierError::UnsupportedRuntime)?;
@@ -201,6 +224,12 @@ impl ChunkEmbedder for RemoteEmbedder {
         });
         result.unwrap_or_else(|_| {
             self.client.degraded.store(true, Ordering::Release);
+            telemetry::add_units(
+                "embedding",
+                "remote_batch",
+                "zero_fallbacks",
+                texts.len() as u64,
+            );
             vec![vec![0.0; DIMENSIONS]; texts.len()]
         })
     }
@@ -220,19 +249,21 @@ impl EmbeddingProvider for RemoteEmbeddingProvider {
         &self.client.projection
     }
     async fn embed(&self, text: &str) -> RecallProjectionResult<Vec<f32>> {
-        let mut vectors = self
-            .client
-            .embed(&[text])
-            .await
-            .map_err(|error| RecallProjectionError::EmbeddingProvider(error.to_string()))?;
-        let vector = vectors.pop().ok_or_else(|| {
-            RecallProjectionError::EmbeddingProvider(TierError::InvalidVectors.to_string())
-        })?;
-        if vector.iter().all(|value| *value == 0.0) {
-            return Err(RecallProjectionError::EmbeddingProvider(
-                TierError::InvalidVectors.to_string(),
-            ));
+        let observation = telemetry::start("embedding", "embed");
+        let result = async {
+            let mut vectors = self.client.embed(&[text]).await?;
+            let vector = vectors.pop().ok_or(TierError::InvalidVectors)?;
+            if vector.iter().all(|value| *value == 0.0) {
+                return Err(TierError::InvalidVectors);
+            }
+            Ok(vector)
         }
-        Ok(vector)
+        .instrument(observation.span())
+        .await;
+        if result.is_ok() {
+            telemetry::add_units("embedding", "embed", "embeddings", 1);
+        }
+        observation.finish(outcome(&result));
+        result.map_err(|error| RecallProjectionError::EmbeddingProvider(error.to_string()))
     }
 }

@@ -142,11 +142,12 @@ by stock Claude Code, with PKCE and no client secret.
 
 ## M2 HTTP service and human enrollment
 
-The first M2 local service runs on the Mac at `http://localhost:8080/mcp`,
-using the secure k0s database and its existing Ory issuer. This keeps Hydra's
+The original M2 checkpoint ran on the Mac at `http://localhost:8080/mcp`,
+using the secure k0s database and its existing Ory issuer. This kept Hydra's
 issuer and discovery URL reachable exactly as advertised (`localhost:4444`)
-and leaves the cluster's stdio writer available. The M2/M3 Kubernetes overlay
-stays reserved until its identity routing and embedding service are deployed.
+and left the cluster's stdio writer available. M3 now deploys the Kubernetes
+overlay and restores the Lima forward to its HTTP service; these M2 instructions
+remain available for a standalone Mac process.
 LocalStack is not required for the OIDC human path.
 The full configuration, authorization model, and request examples are in
 [Remote plane](../../docs/REMOTE_PLANE.md).
@@ -286,6 +287,7 @@ From the repository root, with `FLEET_LOCAL_STATE` pointing at the existing
 cluster state when using a worktree:
 
 ```sh
+cargo build --locked --bin ostk-fleet-recall
 python3 deploy/local/bin/deploy-sandbox-plane.py --image-tag m3-local --prepare-only
 python3 deploy/local/bin/deploy-sandbox-plane.py --image-tag m3-local --build
 docker build -f deploy/local/sandbox/Dockerfile \
@@ -326,14 +328,78 @@ and shipper never receive it.
 
 The local overlay explicitly routes Hydra's loopback issuer to its internal
 Service while retaining the original issuer checks. Kubernetes issuer JWKS
-use the cluster CA; the overlay permits anonymous GET only to its public
-discovery and JWKS paths, without granting Kubernetes API resource access.
+use the cluster CA. Since k0s disables anonymous authentication, Recall mounts
+a rotating token for the dedicated `recall-oidc` service account. Its role grants
+GET only to discovery and JWKS paths, without Kubernetes API resource access.
+This token is used only for issuer metadata; sandboxes never receive it.
 The receiver validates sandbox-bound shipper grants and
 stores only appendable, bounded, provenance-bound files. The worker picks up
 the current tenant/project's spool and runs `ingest,project,embed`; empty git
 and CI groups do not need their executables. See
 [remote plane behavior](../../docs/REMOTE_PLANE.md#m3-sandboxes-and-transcripts)
 for parser, quota, retry and revocation semantics.
+
+Run the provider-free end-to-end checkpoint after importing the sandbox image:
+
+```sh
+python3 deploy/local/bin/sandbox-smoke.py --image ostk-sandbox:m3-local \
+  --bin target/debug/ostk-fleet-recall
+```
+
+The helper tests Docker with the local launcher key and Kubernetes with a
+projected service-account token. Each run checks MCP status/record/get, shipped
+transcript provenance, a worker tick, evidence recall, teardown, and both revoked
+grants returning 401. It preserves protected proof files under local state and
+restores the worker CronJob's original suspension setting. Use `--backend` to
+select one runtime; `--state` and `--bin` select existing state and a built binary
+when running from a worktree.
+
+## M3 verified checkpoint (2026-09-27)
+
+The running service and worker use `ostk-fleet-recall:m3-20260927c`; the final
+sandbox image is `ostk-sandbox:m3-20260927d`. Mac port 8080 forwards to the
+cluster, and Codex's native `recall-remote` OAuth connection successfully lists
+tools and performs status, record, and read-back calls.
+
+- Docker with the local launcher key and Kubernetes with an audience-bound
+  service-account token passed synthetic MCP calls, transcript shipping,
+  worker ingestion/projection, evidence recall, teardown, and both revoked
+  grants returning 401. Each synthetic spool contains 712 verified bytes.
+- A real Codex run performed status/record/get and produced 77,474 native JSONL
+  bytes, identical to its authenticated server spool. Its final assistant turn
+  was recalled as evidence. Agent and shipper grants were both revoked, runtime
+  resources stopped, and private credential files cleared. Private comparisons
+  found no launcher, grant, or provider tokens in transcript or container logs.
+- Stopping the embedding tier changed status to degraded, preserved lexical
+  retrieval, and refused embedding-dependent writes. Restarting recovered
+  without a Recall restart. The database-backed test also verifies no zero
+  vector is persisted.
+- The base verification passed 34 checks, with three explicitly skipped
+  LocalStack checks. Prometheus discovers Recall and embed on port 9100;
+  Grafana serves six dashboards and the updated remote-embedding panels.
+
+The standard Rust suite passed 2,769 tests with 19 ignored; strict all-target
+Clippy, the sandbox configuration tests, and targeted connected M3 tests
+passed. UBS findings were reviewed, including the credential boundaries; its
+nonzero heuristic counts are not represented as a clean aggregate scan.
+An extended parallel database run stopped at an import serialization retry;
+that case passed in isolation. Enrollment checks passed in a fresh database
+after duplicate legacy fixtures prevented the reused-database run from
+reapplying its complete principal list. These checks required no product changes.
+
+Protected local proof directories are `sandbox-smoke/20260927-143152-43130a50`
+(Docker), `sandbox-smoke/20260927-144317-9823bede` (Kubernetes), and
+`codex-sandbox-smoke/20260927-143253-18b2b96c27ad` under `deploy/local/.state`.
+The worker CronJob's original schedule state was restored. The live checks
+caught and corrected sub-second launcher clock skew, worker mount merging,
+Codex per-tool approvals, and authenticated Kubernetes issuer discovery.
+Enrollment retries are bounded and idempotent to tolerate brief service-routing
+gaps immediately after a rollout.
+
+Claude's CLI and transcript support are included, but its model-driven sandbox
+run remains unverified because the account's weekly usage is exhausted. Codex
+was the real provider used for this checkpoint. Kata is not installed, so the
+Kubernetes proof used the default runtime. LocalStack remains disabled by choice.
 
 ## Notes and known limits
 

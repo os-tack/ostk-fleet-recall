@@ -7,8 +7,17 @@ metadata:
     fleet-recall.dev/phase: remote
 automountServiceAccountToken: false
 ---
-# Discovery documents and verification keys are public OIDC metadata. No API
-# resource (including tokens or Secrets) is granted to anonymous callers.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: recall-oidc
+  namespace: fleet-recall
+  labels:
+    fleet-recall.dev/phase: remote
+automountServiceAccountToken: false
+---
+# The API disables anonymous authentication. This identity can read only OIDC
+# discovery and verification keys, without access to Kubernetes API resources.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -30,9 +39,9 @@ roleRef:
   kind: ClusterRole
   name: fleet-issuer-discovery
 subjects:
-  - kind: Group
-    name: system:unauthenticated
-    apiGroup: rbac.authorization.k8s.io
+  - kind: ServiceAccount
+    name: recall-oidc
+    namespace: fleet-recall
 ---
 apiVersion: batch/v1
 kind: Job
@@ -42,7 +51,10 @@ metadata:
   labels:
     fleet-recall.dev/phase: remote-enroll
 spec:
-  backoffLimit: 0
+  # Applying identical declarations and scope bootstrap is idempotent. Retry
+  # short service-routing gaps after the embedding Deployment becomes Ready.
+  backoffLimit: 2
+  activeDeadlineSeconds: 120
   template:
     spec:
       restartPolicy: Never

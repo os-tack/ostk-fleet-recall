@@ -41,7 +41,15 @@ def configure(home, transcripts, env):
         '[mcp_servers.recall]\n'
         'command = "/usr/local/bin/recall-shim"\n'
         'env_vars = ["FLEET_RECALL_TOKEN", "FLEET_RECALL_URL"]\n'
-        'required = true\n', encoding="utf-8")
+        'required = true\n'
+        'enabled_tools = ["recall", "remember"]\n'
+        'default_tools_approval_mode = "prompt"\n'
+        # Selecting this harness authorizes the scoped Recall read/write tools.
+        # Keep that permission separate from shell execution and other servers.
+        '[mcp_servers.recall.tools.recall]\n'
+        'approval_mode = "approve"\n'
+        '[mcp_servers.recall.tools.remember]\n'
+        'approval_mode = "approve"\n', encoding="utf-8")
     private_json(work / ".mcp.json", {"mcpServers": {"recall": {
         "command": "/usr/local/bin/recall-shim", "args": [],
         "env": {"FLEET_RECALL_TOKEN": "${FLEET_RECALL_TOKEN}",

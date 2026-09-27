@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import tomllib
 import unittest
 
 
@@ -28,6 +29,13 @@ class SandboxTests(unittest.TestCase):
             self.assertEqual(list(transcripts.rglob("*.json")), [])
             self.assertIn("provider-token", (home / ".codex/auth.json").read_text())
             self.assertNotIn("provider-token", (home / ".codex/config.toml").read_text())
+            codex_config = tomllib.loads((home / ".codex/config.toml").read_text())
+            recall = codex_config["mcp_servers"]["recall"]
+            self.assertEqual(list(codex_config["mcp_servers"]), ["recall"])
+            self.assertEqual(recall["enabled_tools"], ["recall", "remember"])
+            self.assertEqual(recall["default_tools_approval_mode"], "prompt")
+            self.assertEqual(recall["tools"], {"recall": {"approval_mode": "approve"},
+                                              "remember": {"approval_mode": "approve"}})
             self.assertNotIn("agent-token", (work / ".mcp.json").read_text())
             config = json.loads((work / ".mcp.json").read_text())
             self.assertEqual(list(config["mcpServers"]), ["recall"])

@@ -42,6 +42,7 @@ pub struct RemoteConfig {
     signing_key: String,
     oidc: BTreeMap<String, String>,
     oidc_transports: BTreeMap<String, String>,
+    oidc_discovery_token_paths: BTreeMap<String, String>,
     scope_substitutes: BTreeMap<String, String>,
     oidc_ca_path: Option<String>,
     local_key_path: Option<String>,
@@ -87,10 +88,17 @@ impl RemoteConfig {
         let oidc = pairs(&lookup("FLEET_RECALL_OIDC_ISSUERS").unwrap_or_default())?;
         let oidc_transports =
             pairs(&lookup("FLEET_RECALL_OIDC_LOCAL_TRANSPORTS").unwrap_or_default())?;
+        let oidc_discovery_token_paths =
+            pairs(&lookup("FLEET_RECALL_OIDC_DISCOVERY_TOKEN_PATHS").unwrap_or_default())?;
         let scope_substitutes =
             pairs(&lookup("FLEET_RECALL_OIDC_SCOPE_SUBSTITUTES").unwrap_or_default())?;
         if scope_substitutes.keys().any(|key| !oidc.contains_key(key))
             || oidc_transports.keys().any(|key| !oidc.contains_key(key))
+            || oidc_discovery_token_paths.iter().any(|(key, path)| {
+                !oidc.contains_key(key)
+                    || oidc_transports.contains_key(key)
+                    || !Path::new(path).is_absolute()
+            })
             || oidc.contains_key("local-key")
             || oidc.contains_key("aws-iam")
             || oidc
@@ -159,6 +167,7 @@ impl RemoteConfig {
             signing_key,
             oidc,
             oidc_transports,
+            oidc_discovery_token_paths,
             scope_substitutes,
             oidc_ca_path: lookup("FLEET_RECALL_OIDC_CA_PATH"),
             local_key_path,
@@ -250,6 +259,11 @@ impl RemoteBackend {
                 })
                 .and_then(|anchor| {
                     anchor.with_local_transport(config.oidc_transports.get(id).map(String::as_str))
+                })
+                .and_then(|anchor| {
+                    anchor.with_discovery_token_path(
+                        config.oidc_discovery_token_paths.get(id).map(Path::new),
+                    )
                 })
                 .map_err(|_| configuration("invalid OIDC anchor configuration"))?,
             ));
@@ -590,6 +604,14 @@ mod tests {
                 "FLEET_RECALL_OIDC_SCOPE_SUBSTITUTES",
                 "unknown=fleet-recall",
             ),
+            (
+                "FLEET_RECALL_OIDC_DISCOVERY_TOKEN_PATHS",
+                "unknown=/var/run/oidc/token",
+            ),
+            (
+                "FLEET_RECALL_OIDC_DISCOVERY_TOKEN_PATHS",
+                "human=relative/token",
+            ),
             ("FLEET_RECALL_GRANT_CHECK_CACHE_SECONDS", "6"),
             ("FLEET_RECALL_SCOPE_CACHE_MAX", "0"),
             ("FLEET_RECALL_AWS_IAM_SERVER_ID", "partial"),
@@ -602,6 +624,25 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn discovery_credentials_are_explicit_and_cannot_use_transport_overrides() {
+        let mut values = settings();
+        values.insert(
+            "FLEET_RECALL_OIDC_DISCOVERY_TOKEN_PATHS".into(),
+            "human=/var/run/oidc/token".into(),
+        );
+        let config = RemoteConfig::from_lookup(|name| values.get(name).cloned()).unwrap();
+        assert_eq!(
+            config.oidc_discovery_token_paths["human"],
+            "/var/run/oidc/token"
+        );
+        values.insert(
+            "FLEET_RECALL_OIDC_LOCAL_TRANSPORTS".into(),
+            "human=http://internal/".into(),
+        );
+        assert!(RemoteConfig::from_lookup(|name| values.get(name).cloned()).is_err());
     }
 
     #[test]

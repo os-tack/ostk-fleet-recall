@@ -193,6 +193,25 @@ fn codex_turn(
         return Ok(None);
     }
     let payload = &record["payload"];
+    // Native rollouts can serialize reasoning `content: null` (or a content
+    // array). These known non-conversation records remain deliberately skipped
+    // regardless of their optional fields; their text is never evidence.
+    if matches!(
+        payload["type"].as_str(),
+        Some(
+            "reasoning"
+                | "function_call"
+                | "function_call_output"
+                | "custom_tool_call"
+                | "custom_tool_call_output"
+                | "web_search_call"
+                | "tool_search_call"
+                | "tool_search_output"
+                | "compaction"
+        )
+    ) {
+        return Ok(None);
+    }
     if payload["type"] != "message" {
         if payload.get("content").is_some() {
             return Err(malformed(
@@ -292,5 +311,28 @@ mod tests {
             .unwrap()
             .replace("input_text", "future_text");
         assert!(parse_codex_transcript("rollout", text.as_bytes(), 0, 0).is_err());
+    }
+
+    #[test]
+    fn known_non_conversation_items_skip_optional_content_but_unknown_items_refuse() {
+        let mut bytes = fixture();
+        for kind in [
+            "reasoning",
+            "function_call_output",
+            "custom_tool_call_output",
+        ] {
+            for content in [
+                serde_json::Value::Null,
+                serde_json::json!([{"type":"text","text":"not conversation evidence"}]),
+            ] {
+                let record = serde_json::json!({"type":"response_item","payload":{"type":kind,"content":content}});
+                bytes.extend_from_slice(format!("{record}\n").as_bytes());
+            }
+        }
+        let parsed = parse_codex_transcript("rollout", &bytes, 0, 0).unwrap();
+        assert_eq!(parsed.turns.len(), 2);
+        assert_eq!(parsed.skipped_records, 8);
+        bytes.extend_from_slice(b"{\"type\":\"response_item\",\"payload\":{\"type\":\"future_message\",\"content\":null}}\n");
+        assert!(parse_codex_transcript("rollout", &bytes, 0, 0).is_err());
     }
 }

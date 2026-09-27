@@ -25,6 +25,7 @@ spec:
                     secretKeyRef: {name: fleet-remote, key: FLEET_RECALL_EMBEDDING_TIER_TOKEN}
               volumeMounts:
                 - name: model
+                  mountPath: /opt/ostk/models/potion-retrieval-32M
                   $patch: delete
                 - {name: transcripts, mountPath: /var/lib/recall/transcripts}
           volumes:

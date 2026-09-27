@@ -12,13 +12,21 @@ RUN apt-get update \
 
 WORKDIR /workspace
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+ARG TARGETARCH
 
 COPY Cargo.toml Cargo.lock ./
 COPY migrations ./migrations
 COPY src ./src
 COPY contracts ./contracts
 
-RUN cargo build --locked --release --bin ostk-fleet-recall
+# Preserve dependency artifacts across source changes while keeping the final
+# image independent of BuildKit's caches. Architecture-specific target caches
+# prevent concurrent local arm64 and CI amd64 builds sharing object files.
+RUN --mount=type=cache,id=fleet-recall-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=fleet-recall-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=fleet-recall-target-${TARGETARCH},target=/workspace/target,sharing=locked \
+    cargo build --locked --release --bin ostk-fleet-recall \
+    && install -D --mode=0755 target/release/ostk-fleet-recall /out/ostk-fleet-recall
 
 FROM golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36 AS s5cmd-builder
 
@@ -59,7 +67,7 @@ RUN printf 'ostk:x:10001:\n' >>/etc/group \
     && install --directory --owner ostk --group ostk --mode 0555 /opt/ostk/demo
 
 COPY --from=s5cmd-builder /out/s5cmd /usr/local/bin/s5cmd
-COPY --from=builder /workspace/target/release/ostk-fleet-recall /usr/local/bin/ostk-fleet-recall
+COPY --from=builder /out/ostk-fleet-recall /usr/local/bin/ostk-fleet-recall
 COPY --chmod=0555 deploy/container-entrypoint.sh /usr/local/bin/container-entrypoint
 COPY --chown=10001:10001 --chmod=0444 examples/demo.ndjson /opt/ostk/demo/demo.ndjson
 COPY --from=s5cmd-builder /out/licenses /usr/share/licenses/s5cmd

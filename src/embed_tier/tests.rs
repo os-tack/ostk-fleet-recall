@@ -46,6 +46,57 @@ fn descriptor() -> Descriptor {
     Descriptor::pinned(Sha256Digest::from_bytes([7; 32]))
 }
 
+#[tokio::test]
+async fn measurements_cover_remote_failure_without_identity_or_content_labels() {
+    let secret = "telemetry-private-tier-token";
+    let model = "telemetry-private-model-identity";
+    let text = "telemetry-private-query-text";
+    let (url, task) =
+        host(server::router(Arc::new(TestEmbedder), descriptor(), Some(secret.into())).unwrap())
+            .await;
+    let config = RemoteConfig::new(&url, Duration::from_millis(200), Some(secret.into())).unwrap();
+    let client = RemoteClient::connect(config, descriptor(), model.into())
+        .await
+        .unwrap();
+    let provider = RemoteEmbeddingProvider::new(client.clone());
+    provider.embed(text).await.unwrap();
+    assert!(provider.embed("").await.is_err());
+    assert!(client.embed(&[text; 65]).await.is_err());
+    // Current-thread callers cannot run the synchronous bridge; this is the
+    // same bounded fallback counter that an unavailable tier increments.
+    RemoteEmbedder::new(client.clone()).encode_batch(&[text]);
+    task.abort();
+    let _ = task.await;
+    assert!(client.embed(&[text]).await.is_err());
+    let metrics = crate::telemetry::render().unwrap();
+    for (operation, outcome) in [
+        ("remote_descriptor", "success"),
+        ("remote_batch", "success"),
+        ("remote_batch", "error"),
+        ("remote_batch", "invalid"),
+        ("embed", "invalid"),
+    ] {
+        let prefix = format!(
+            "fleet_recall_operations_total{{component=\"embedding\",operation=\"{operation}\",outcome=\"{outcome}\"}} "
+        );
+        let value = metrics
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap();
+        assert!(value.parse::<u64>().unwrap() > 0);
+    }
+    assert!(metrics.contains("fleet_recall_units_total{component=\"embedding\",operation=\"remote_batch\",unit=\"zero_fallbacks\"}"));
+    for private in [
+        secret,
+        model,
+        text,
+        url.as_str(),
+        &descriptor().model_digest.to_hex(),
+    ] {
+        assert!(!metrics.contains(private));
+    }
+}
+
 async fn host(router: Router) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

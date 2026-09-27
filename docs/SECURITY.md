@@ -718,9 +718,11 @@ performs redaction and validates the active frozen contract. The shipper also
 refuses symlinks and hard links, so an agent cannot route it to credential
 files through the shared transcript volume.
 
-The local Kubernetes overlay grants anonymous GET only on its public OIDC
-discovery and JWKS paths so Recall can verify projected tokens; it grants no
-API resource access. Its explicit Hydra transport override is restricted to
+The local Kubernetes overlay gives Recall a rotating projected token for a
+dedicated service account with GET only on OIDC discovery and JWKS paths; it
+grants no API resource access. Configured discovery bearers are bounded, reread
+on fetch, and sent only to the issuer's exact origin. They cannot be combined
+with a local transport override. Its explicit Hydra transport override is restricted to
 a loopback issuer and that issuer's exact original origin. Production uses
 ordinary HTTPS discovery and TLS for MCP/embedding traffic. Metrics listeners
 remain private and do not receive authentication tokens or transcript text.
