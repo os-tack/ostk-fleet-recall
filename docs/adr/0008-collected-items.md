@@ -412,7 +412,11 @@ project's own git, CI, and transcript evidence (which carries no label). The
 tool description says so. Each collected hit also names its item (`item_id`,
 provider, trust tier, lifecycle, and whether its version is the item's
 presented head, so an older version's body reads `current: false`), read
-through `memory_collected_items_body_idx`; its provenance and advisory
+through `memory_collected_items_body_idx`; superseded versions of one item
+whose recall text is identical to a listed version's (an edit's unchanged
+sections) are collapsed to the presented head before the cut and counted in
+`duplicates_collapsed`, so an older version is listed only for text the head
+no longer has; its provenance and advisory
 injection signals are the item recall surface's (D7). `recall(status)`'s
 evidence block adds a `collectors` count (active collector instances,
 pending parts, and dead letters of the last 24 hours) when the collector

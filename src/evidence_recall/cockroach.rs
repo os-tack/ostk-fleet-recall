@@ -29,11 +29,12 @@ use crate::store::cockroach::{
 };
 use crate::worker::WorkerSourceOutcomeV1;
 
+use super::collapse::{HydratedHitV1, collapse_bound, collapse_duplicates};
 use super::verdict::{ScoredHitV1, absence_verdict};
 use super::{
-    AbsenceScopeV1, ContentTrustV1, EVIDENCE_RECALL_SCHEMA_VERSION, EVIDENCE_SNIPPET_CHARS,
-    EvidenceBodyV1, EvidenceCollectorsV1, EvidenceCoverageV1, EvidenceDenseLaneV1, EvidenceHitV1,
-    EvidenceItemV1, EvidenceReadinessV1, EvidenceRecall, EvidenceSearchV1, EvidenceSourceFilterV1,
+    ContentTrustV1, EVIDENCE_RECALL_SCHEMA_VERSION, EVIDENCE_SNIPPET_CHARS, EvidenceBodyV1,
+    EvidenceCollectorsV1, EvidenceCoverageV1, EvidenceDenseLaneV1, EvidenceHitV1, EvidenceItemV1,
+    EvidenceReadinessV1, EvidenceRecall, EvidenceSearchV1, EvidenceSourceFilterV1,
     EvidenceSourceKindV1, EvidenceSourceV1, EvidenceSourcesV1, EvidenceStatusV1, LagByKindV1,
     MAX_EVIDENCE_SEARCH_LIMIT, MAX_EVIDENCE_SOURCE_ERROR_BYTES, MAX_EVIDENCE_SOURCES,
     lexical_query_text,
@@ -183,10 +184,12 @@ static READINESS_BY_KIND_SQL: LazyLock<String> = LazyLock::new(|| {
 /// Whether a query has any lexeme. `$1` is already [`lexical_query_text`].
 const LEXICAL_TERMS_SQL: &str = "SELECT plainto_tsquery('english', $1)::STRING";
 
-/// The hits' bodies: media type, first event, and a snippet of recall text.
+/// The hits' bodies: media type, first event, a snippet of recall text, and
+/// the digest of the whole text, which the duplicate collapse keys on.
 const HYDRATE_SQL: &str = "SELECT body.content_sha256, body.media_type, \
      body.first_accepted_event_id, \
      substring(lexical.lexical_text FROM 1 FOR $4) AS snippet, \
+     lexical.lexical_text_digest, \
      octet_length(lexical.lexical_text) AS text_bytes \
      FROM public.memory_body_objects_v1 AS body \
      JOIN public.memory_body_lexical_projection_v1 AS lexical \
@@ -604,12 +607,15 @@ impl CockroachEvidenceRecall {
         })
     }
 
-    /// Attach each scored hit's body, keeping the fused order.
+    /// Attach each scored hit's body, keeping the fused order, with the
+    /// digest of its recall text for the duplicate collapse. The candidates
+    /// are wider than the answer ([`collapse_bound`]); the caller collapses
+    /// and cuts them.
     async fn hydrate(
         &self,
         scored: Vec<ScoredHitV1>,
         state: CollectorStateV1,
-    ) -> Result<Vec<EvidenceHitV1>> {
+    ) -> Result<Vec<HydratedHitV1>> {
         if scored.is_empty() {
             return Ok(Vec::new());
         }
@@ -636,31 +642,35 @@ impl CockroachEvidenceRecall {
                     digest(row, "first_accepted_event_id")?,
                     snippet_truncated(&snippet, text_bytes),
                     snippet,
+                    digest(row, "lexical_text_digest")?,
                 ),
             );
         }
         let hits = scored
             .into_iter()
             .map(|hit| {
-                let (media_type, first_accepted_event_id, snippet_truncated, snippet) =
+                let (media_type, first_accepted_event_id, snippet_truncated, snippet, text_digest) =
                     bodies.remove(&hit.id).ok_or_else(|| {
                         FleetError::Memory(format!(
                             "recalled body {} has no body row and lexical row in this scope",
                             hit.id
                         ))
                     })?;
-                Ok(EvidenceHitV1 {
-                    id: hit.id,
-                    score: hit.score,
-                    matched_by: hit.matched_by,
-                    lexical_score: hit.lexical_score,
-                    dense_similarity: hit.dense_similarity,
-                    content_trust: ContentTrustV1::of_media_type(&media_type),
-                    media_type,
-                    snippet,
-                    snippet_truncated,
-                    first_accepted_event_id,
-                    item: None,
+                Ok(HydratedHitV1 {
+                    hit: EvidenceHitV1 {
+                        id: hit.id,
+                        score: hit.score,
+                        matched_by: hit.matched_by,
+                        lexical_score: hit.lexical_score,
+                        dense_similarity: hit.dense_similarity,
+                        content_trust: ContentTrustV1::of_media_type(&media_type),
+                        media_type,
+                        snippet,
+                        snippet_truncated,
+                        first_accepted_event_id,
+                        item: None,
+                    },
+                    text_digest,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -670,18 +680,18 @@ impl CockroachEvidenceRecall {
         if !state.readable() {
             return Ok(hits
                 .into_iter()
-                .filter(|hit| hit.media_type != COLLECTED_ITEM_MEDIA_TYPE)
+                .filter(|hydrated| hydrated.hit.media_type != COLLECTED_ITEM_MEDIA_TYPE)
                 .collect());
         }
         self.annotate_items(hits).await
     }
 
     /// Attach to each collected hit the item it belongs to.
-    async fn annotate_items(&self, mut hits: Vec<EvidenceHitV1>) -> Result<Vec<EvidenceHitV1>> {
+    async fn annotate_items(&self, mut hits: Vec<HydratedHitV1>) -> Result<Vec<HydratedHitV1>> {
         let collected: Vec<Vec<u8>> = hits
             .iter()
-            .filter(|hit| hit.media_type == COLLECTED_ITEM_MEDIA_TYPE)
-            .map(|hit| hit.id.as_bytes().to_vec())
+            .filter(|hydrated| hydrated.hit.media_type == COLLECTED_ITEM_MEDIA_TYPE)
+            .map(|hydrated| hydrated.hit.id.as_bytes().to_vec())
             .collect();
         if collected.is_empty() {
             return Ok(hits);
@@ -707,8 +717,8 @@ impl CockroachEvidenceRecall {
                 },
             );
         }
-        for hit in &mut hits {
-            hit.item = items.remove(&hit.id);
+        for hydrated in &mut hits {
+            hydrated.hit.item = items.remove(&hydrated.hit.id);
         }
         Ok(hits)
     }
@@ -845,7 +855,9 @@ impl EvidenceRecall for CockroachEvidenceRecall {
         );
         // Each lane is read deeper than the answer, then the two are fused by
         // reciprocal rank (the lexical cutoff and the dense floor applied
-        // inside the fusion) and cut to `limit`.
+        // inside the fusion) and kept wider than `limit`, so that the
+        // duplicate versions collapsed after hydration leave the answer
+        // full; the collapse then cuts to `limit`.
         let lanes = reader
             .recall_lanes(
                 if lexical_terms { &lexical_text } else { "" },
@@ -857,19 +869,20 @@ impl EvidenceRecall for CockroachEvidenceRecall {
             &lanes.lexical,
             &lanes.dense,
             RETRIEVAL_DENSE_MIN_COSINE_SIMILARITY,
-            limit,
+            collapse_bound(limit),
         );
-        let hits = self
+        let hydrated = self
             .hydrate(fused.into_iter().map(ScoredHitV1::from).collect(), state)
             .await?;
+        let (hits, duplicates_collapsed) = collapse_duplicates(hydrated, limit);
         let votes: Vec<_> = hits.iter().map(EvidenceHitV1::vote).collect();
-        let mut absence = absence_verdict(&votes, lexical_terms, &readiness, &sources);
-        absence.scope = source.map(|source| AbsenceScopeV1 { source });
+        let absence = absence_verdict(&votes, lexical_terms, &readiness, &sources, source);
         Ok(EvidenceSearchV1 {
             hits,
             readiness,
             sources,
             absence,
+            duplicates_collapsed,
         })
     }
 
