@@ -1,12 +1,23 @@
 # Fleet Recall project primer
 
+For setup and operating tasks, start with the [documentation index](README.md).
+The current qualified service runs locally on Lima/k0s; AWS publication-demo
+infrastructure and the planned AWS remote stack are distinct
+[deployment profiles](reference/DEPLOYMENT_PROFILES.md).
+
 ## Why Fleet Recall exists
 
 An inference call is temporary, but the decisions made around it can govern work for days or weeks. Fleet Recall gives replaceable agents a shared memory plane where evidence, decisions, corrections, and disagreements survive the process that produced them. It exists so a new worker can recover not only what was decided, but who asserted it, what source supported it, and whether another agent still disagrees.
 
 ## What survives replacement
 
-The ECS/Fargate application tasks are deliberately stateless. Corpus chunks, typed claims, support records, idempotency receipts, conflicts, and action history live in CockroachDB Cloud, so a complete serving-task replacement does not erase memory.
+Corpus chunks, typed claims, support records, idempotency receipts, conflicts,
+and action history live in CockroachDB rather than an agent process. The local
+installation preserves SQL and acknowledged transcript files on the Lima disk
+across pod and VM restarts. The AWS publication design uses CockroachDB Cloud
+with replaceable ECS/Fargate tasks. Losing a VM disk or Mac still needs backup
+recovery; neither process replacement nor durable SQL protects unshipped sandbox
+transcript bytes.
 
 ## Why CockroachDB is the memory plane
 

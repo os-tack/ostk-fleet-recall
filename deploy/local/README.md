@@ -1,17 +1,20 @@
-# Local production-shaped environment
+# Local bootstrap and M1–M3 checkpoints
 
-A single-node Kubernetes (k0s) cluster in a Lima VM on this Mac, running the
-Fleet Recall stack the way production is shaped: a secure CockroachDB with the
-role boundary applied, the recall workloads, Ory Hydra + Kratos for identity,
-and LocalStack for the AWS surfaces. It is the reference the production
-Pulumi or Terraform program is derived from (ADR 0009).
+For the existing HTTPS installation, start with the
+[operator guide](../../docs/guides/OPERATING.md) and
+[troubleshooting](../../docs/guides/TROUBLESHOOTING.md). Its MCP URL is
+`https://recall.fleet.test:8443/mcp`; see the
+[HTTPS cutover runbook](https/README.md) and
+[M4.3 qualification record](https/LIFECYCLE_QUALIFICATION.md).
 
-The existing installation was upgraded to the [M4.2 HTTPS profile](https/README.md)
-on 2026-09-27. Its MCP URL is `https://recall.fleet.test:8443/mcp`;
-LocalStack remains disabled and optional. Use that profile's cutover and
-verification helpers for the current installation. The HTTP bootstrap/M2/M3
-commands below describe earlier development profiles and are not an HTTPS
-reconciliation procedure. See the [tested scope and remaining checks](https/QUALIFICATION.md).
+The commands below describe the earlier single-node Lima/k0s HTTP bootstrap:
+secure CockroachDB, Recall workloads, Ory identity, and optional LocalStack AWS
+emulation. They remain a development and historical reference, **not an HTTPS
+reconciliation procedure**. In particular, do not rerun `bootstrap.sh up` or
+the M3 deployment helper against the upgraded installation. Compare
+[deployment profiles](../../docs/reference/DEPLOYMENT_PROFILES.md) before using them.
+
+## Legacy bootstrap commands
 
 ```
 deploy/local/bootstrap.sh up                # every phase, in order
@@ -37,12 +40,14 @@ pointing its installer at this checkout's `.state/kubeconfig`.
 Apple Silicon M3 or later on macOS 15 or later (nested virtualization), Lima
 2.x, OrbStack or another Docker with `buildx`, `kubectl` 1.34+, `helm`, `jq`,
 `openssl`, the AWS CLI, a Rust toolchain, and the potion model bundle at
-`.models/potion-retrieval-32M-<revision>/` (README "Local quickstart" step 1).
-A LocalStack auth token in the environment (`LOCALSTACK_AUTH_TOKEN`) or in the
-repository `.env` (`LOCAL_STACK_API_KEY`); it is never printed or committed.
+`.models/potion-retrieval-32M-<revision>/` (see the
+[local development tutorial](../../docs/tutorials/LOCAL_DEVELOPMENT.md)).
+Only the optional LocalStack phase requires a valid LocalStack auth token in
+the environment (`LOCALSTACK_AUTH_TOKEN`) or repository `.env`
+(`LOCAL_STACK_API_KEY`); it is never printed or committed.
 
-LocalStack is optional for the mounted-model and Ory paths. To bring up or
-verify that configuration without a LocalStack license:
+LocalStack is optional for the mounted-model and Ory paths. For a **legacy
+HTTP development installation**, bring up or verify without a LocalStack license:
 
 ```sh
 FLEET_LOCAL_SKIP_LOCALSTACK=1 deploy/local/bootstrap.sh up

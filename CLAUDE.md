@@ -3,8 +3,9 @@
 Rust service: shared fleet memory over CockroachDB for agents. One binary
 (`ostk-fleet-recall`) serves the Recall MCP protocol, runs the worker tick, the
 demo viewer and the private ingress; ten workstation-only ceremony and
-maintenance binaries live under `src/bin/`. Start with `README.md` (Local
-quickstart), `docs/ARCHITECTURE.md`, `docs/SECURITY.md`, and the ADRs under
+maintenance binaries live under `src/bin/`. Start with `README.md` and the
+task index in `docs/README.md`; the disposable quickstart is under
+`docs/tutorials/`. Read `docs/ARCHITECTURE.md`, `docs/SECURITY.md`, and the ADRs under
 `docs/adr/` (0009 covers the remote plane).
 
 ## Tooling rule for this repository

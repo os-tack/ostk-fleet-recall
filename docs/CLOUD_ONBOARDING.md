@@ -1,5 +1,10 @@
 # Cloud onboarding
 
+This runbook applies to the existing AWS **publication demo**. It does not
+deploy the authenticated M4.4 remote stack; that work is currently on hold.
+Choose the intended [deployment profile](reference/DEPLOYMENT_PROFILES.md)
+before following provisioning instructions.
+
 This is the human-approved path from a validated LocalStack run to a real AWS
 and CockroachDB Cloud deployment. It does not automate account creation,
 billing choices, DNS ownership, or database credentials. Do not place database
@@ -298,8 +303,8 @@ from `FLEET_RECALL_INGRESS_DATABASE_URL` (same TLS rules), refuses to start
 beside any other database URL, the content key, or a provider API credential
 the sources file names, and listens on loopback
 unless `--allow-non-loopback` is given; the relay that forwards the
-providers' requests to it is the operator's (see the README's
-[receiving provider webhooks](../README.md#receiving-provider-webhooks) and
+providers' requests to it is the operator's (see
+[receiving provider webhooks](reference/COLLECTION.md#receiving-provider-webhooks) and
 the [collected-items runbook](COLLECTED_ITEMS_RUNBOOK.md)).
 
 For each user, obtain a URL-encoded raw connection URL for `fleet_recall` with

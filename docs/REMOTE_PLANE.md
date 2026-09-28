@@ -1,15 +1,25 @@
 # Remote HTTP MCP
 
+This is the configuration and behavior reference for authenticated remote MCP.
+For the current local HTTPS deployment, begin with the
+[operator guide](guides/OPERATING.md), its
+[client connection procedure](guides/OPERATING.md#connect-an-enrolled-client),
+or [troubleshooting](guides/TROUBLESHOOTING.md).
+Compare [deployment profiles](reference/DEPLOYMENT_PROFILES.md) before applying
+the loopback development examples below.
+
 The M2 remote plane serves one authenticated `/mcp` endpoint and resolves each
 request into a tenant, project, agent, role, and visibility ceiling. The stdio
 server continues to use its deployment identity. M3 adds a pinned embedding
 service, stdio shim, Docker/Kubernetes launcher, and scoped transcript spool
 for Claude Code and Codex. Local in-process embedding remains supported.
 
-M4 is tracked in [dependable remote access](M4_REMOTE_ACCESS_PLAN.md), covering
-canonical HTTPS identity, local LAN/VPN access, and a separate AWS remote
-deployment. M4.1 implements the client/discovery contract; deployment and
-end-to-end qualification remain pending.
+M4 is tracked in [dependable remote access](M4_REMOTE_ACCESS_PLAN.md). The
+single-Mac canonical HTTPS deployment and local lifecycle checks are qualified
+through M4.3; see its [qualification record](../deploy/local/https/LIFECYCLE_QUALIFICATION.md).
+Second-machine LAN/VPN testing and the later soak remain pending. The separate
+M4.4 AWS remote deployment is planned and currently on hold; the existing AWS
+publication demo is a different deployment.
 
 ## Prepare the database and enrollment login
 
@@ -69,6 +79,11 @@ until owner/tier visibility is enforced; `public` is read-only through the
 existing publication composition, including its asserted-claim withholding.
 
 ## Run and connect
+
+The commands in this section are explicit **loopback HTTP development**
+examples. An installed HTTPS client uses `https://recall.fleet.test:8443/mcp`,
+the configured public CA and the [HTTPS connection procedure](guides/OPERATING.md#connect-an-enrolled-client);
+do not apply these HTTP issuer/resource values to that server.
 
 Configure the ordinary writer URL, model, and pinned default scope, plus:
 

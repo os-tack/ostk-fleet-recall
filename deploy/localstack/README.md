@@ -44,10 +44,10 @@ authoritative grant lists.
 
 The harness runs no webhook receiver. `ingress-boundary.sh`, beside the
 boundary helper, provisions its `fleet_ingress` login the same way on the
-README quickstart's local node: quiesced, under
+[developer tutorial's](../../docs/tutorials/LOCAL_DEVELOPMENT.md) local node: quiesced, under
 [`ingress-receiver-role-grants.sql`](../cockroach/ingress-receiver-role-grants.sql),
-with the PUBLIC-default cleanup, and enabled last (see the README's
-[receiving provider webhooks](../../README.md#receiving-provider-webhooks)).
+with the PUBLIC-default cleanup, and enabled last (see
+[receiving provider webhooks](../../docs/reference/COLLECTION.md#receiving-provider-webhooks)).
 
 ## Image and secret boundary
 

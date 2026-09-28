@@ -29,9 +29,9 @@ a Slack workspace, a Linear organization, and a Granola account. Each source
 and collector is its own connector instance. Replace the paths, repository
 coordinates, provider ids, and token variables with your own, and drop the
 collectors you do not run; a collector needs the scope at generation 3. See
-[memory worker](../README.md#memory-worker) for the environment the command
+[memory worker reference](../docs/reference/WORKER.md) for the environment the command
 reads and where each step can run, and
-[receiving provider webhooks](../README.md#receiving-provider-webhooks) for
+[receiving provider webhooks](../docs/reference/COLLECTION.md#receiving-provider-webhooks) for
 the `push` entry a collector adds to take webhooks.
 
 # Recall trial kit

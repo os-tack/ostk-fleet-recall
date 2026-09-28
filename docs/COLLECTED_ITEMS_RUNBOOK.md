@@ -5,11 +5,11 @@ Slack conversations, Linear tickets, and Granola meetings into a scope's
 memory, let agents relay what they read, receive provider webhooks, and check
 what agents then recall. The decisions behind it are
 [ADR 0008](adr/0008-collected-items.md); the commands' full reference is the
-[README](../README.md#memory-worker) and
+[worker reference](reference/WORKER.md), [collection reference](reference/COLLECTION.md) and
 [migration operations](MIGRATIONS.md). Everything here is private plane: the
 public demo serves none of it.
 
-[Local quickstart](../README.md#local-quickstart) step 10 runs the documents
+[Memory pipeline tutorial](tutorials/MEMORY_PIPELINES.md#10-collect-documents-an-import-and-a-slack-export) step 10 runs the documents
 collector, both import formats, and a capture against a local node. The last
 section records an end-to-end run of every step below against a fresh secure
 node, with local stand-ins for the three providers.

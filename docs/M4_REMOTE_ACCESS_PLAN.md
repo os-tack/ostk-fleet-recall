@@ -5,7 +5,8 @@ single-Mac HTTPS services, native Codex CLI and container paths are deployed
 and tested, including macOS certificate trust and the restarted Codex harness.
 The second-machine LAN/VPN check is deferred because no second machine is
 currently available. It remains unqualified. M4.3 is implemented and locally
-qualified; M4.4–M4.5 remain pending. The original baseline was
+qualified; M4.4–M4.5 remain pending. M4.4 work is on hold at the user's request
+while the documentation and operator guidance are improved. The original baseline was
 `ea6d43d` on `main`, including M3 and merged Prometheus/Grafana telemetry.
 The original remote plan ended at M3. M4 is the follow-on described here.
 
@@ -89,7 +90,7 @@ See the [lifecycle qualification record](../deploy/local/https/LIFECYCLE_QUALIFI
 automated checks, scanner triage and exact limits. This checkpoint does not
 establish off-device backup retrieval, a consistent 24-hour RPO, an alert
 notification receiver, root/application-key rotation, Mac HA or autostart.
-The next implementation slice is M4.4; its live AWS rollout must still pass
+M4.4 is the next planned implementation slice, currently on hold; its live AWS rollout must still pass
 the storage and credential-isolation gates below. M4.5 retains second-machine
 acceptance and the monitored 24-hour soak.
 

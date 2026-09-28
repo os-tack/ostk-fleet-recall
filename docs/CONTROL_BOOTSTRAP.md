@@ -230,8 +230,8 @@ grants, which this dedicated-database policy replaces explicitly:
 - <https://www.cockroachlabs.com/docs/stable/security-reference/authorization>
 
 `tests/control_log_live.rs` exercises the control-ledger repository against a
-real CockroachDB database; see the README's
-[development workflow](../README.md#development-workflow) for running the live
+real CockroachDB database; see the
+[development workflow](DEVELOPMENT.md) for running the live
 tests.
 
 ## Writer-authority installer

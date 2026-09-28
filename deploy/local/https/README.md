@@ -1,5 +1,11 @@
 # Local HTTPS deployment
 
+For daily use, startup/shutdown, enrollment, monitoring and maintenance, start
+with the [operator guide](../../../docs/guides/OPERATING.md). Diagnose failures
+with [troubleshooting](../../../docs/guides/TROUBLESHOOTING.md). This document
+is the detailed **M3-to-HTTPS installation/cutover runbook**; established HTTPS
+installations use the lifecycle procedure for later image updates.
+
 This profile upgrades the existing M3 Lima/k0s deployment in place. It keeps
 the database, principal registry, signing keys, writer authority pins, content
 key and transcript volume. It does not rerun migrations or enrollment.
@@ -27,6 +33,9 @@ and the remaining local/cloud acceptance boundaries.
 ## Prerequisites and preparation
 
 Use an existing healthy M3 deployment and its original private state directory.
+From another worktree, select that original directory explicitly rather than
+using the new checkout's `.state`; see
+[installation selection](../../../docs/guides/OPERATING.md#select-the-installation-before-running-commands).
 The examples run from the repository root. They require Docker Desktop,
 Lima 2.2, kubectl, Helm, OpenSSL and Python 3. The encrypted checkpoint helper
 also requires the Python `cryptography` package; lifecycle/recovery helpers

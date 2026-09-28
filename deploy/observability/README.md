@@ -7,7 +7,19 @@ manual dashboard setup are required.
 
 ## Install on the local k0s VM
 
-After `deploy/local/bootstrap.sh up`, run:
+For the **current HTTPS installation**, first select its original state and
+kubeconfig using the [operator guide](../../docs/guides/OPERATING.md), then run:
+
+```sh
+FLEET_OBSERVABILITY_REMOTE=true deploy/observability/install-k0s.sh up
+deploy/observability/install-k0s.sh forward
+```
+
+Keep the remote flag on subsequent `up` and `verify` commands. Installing the
+base profile instead suspends the remote probe and omits its scrapes/rules.
+
+For an **earlier HTTP/bootstrap environment**, after its initial
+`deploy/local/bootstrap.sh up`, install the base profile with:
 
 ```sh
 deploy/local/bootstrap.sh phase observability
@@ -26,13 +38,13 @@ kubectl -n fleet-observability get secret fleet-grafana-admin \
 Keep the `forward` command running in a terminal while using Grafana. Restart
 it after closing that terminal, restarting the app that launched it, or a
 Grafana pod replacement. A stopped forward makes the local URL unreachable
-even when monitoring is healthy. The normal local `bootstrap.sh up` does not
-remove the monitoring namespace; use `install-k0s.sh verify` to check the
-stack independently of the browser connection.
+even when monitoring is healthy. Use `install-k0s.sh verify` (with the remote
+flag for HTTPS) to check the stack independently of the browser connection.
+Do not rerun application bootstrap to repair a stopped port-forward.
 
 From a separate worktree, set `KUBECONFIG` to the original checkout's
 `deploy/local/.state/kubeconfig`, then run `deploy/observability/install-k0s.sh
-up` directly. The installer requires an explicit kubeconfig and exactly one
+up` directly with the selected profile flag. The installer requires an explicit kubeconfig and exactly one
 k0s node because storage lives on that VM. Rerunning `up` updates manifests
 and provisioning while preserving the existing admin credential and data.
 `render` prints the public configuration for review without contacting the
@@ -113,9 +125,11 @@ The CronJob forbids overlap. One collector directory represents exactly one
 scheduled worker identity.
 
 Source changes take effect after rebuilding and deploying an image containing
-the telemetry code (`bootstrap.sh phase images`, then `phase recall`, with
-the normal local state/model configuration). Installing monitoring alone does
-not replace application images. Infrastructure and raw log panels work with
+the telemetry code. For the current HTTPS deployment, follow the
+[lifecycle deployment procedure](../local/https/OPERATIONS.md#rehearsal-and-deployment);
+the legacy `bootstrap.sh phase images` / `phase recall` sequence configures the
+older HTTP baseline and must not reconcile that upgraded installation.
+Installing monitoring alone does not replace application images. Infrastructure and raw log panels work with
 the existing images; application and structured-event panels need the new
 binary and actual traffic. The current stdio writer is an exec target, not a
 persistent metrics listener; `kubectl exec` streams are also separate from

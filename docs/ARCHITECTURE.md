@@ -7,6 +7,12 @@ The local `ostk-recall` corpus remains the workstation default.
 that must coordinate across process, host, and availability-zone boundaries;
 using OSTK is optional.
 
+For an operator's entry point, use the [documentation index](README.md) and
+[deployment profiles](reference/DEPLOYMENT_PROFILES.md). The AWS topology below
+describes the publication demo. The implemented authenticated remote plane and
+current local HTTPS deployment are documented in [REMOTE_PLANE.md](REMOTE_PLANE.md);
+the separate M4.4 AWS remote stack is planned and on hold.
+
 This document describes the serving system: the MCP server, the read-only
 HTTP demo, the memory worker, the CockroachDB schema they use, and the
 checked-in AWS topology, including the bounded PUBLIC-03 database and
@@ -33,8 +39,8 @@ into the same sink; a claim cites the items it rests on through private
 claim item links. The private
 `ostk-spec` CLI checks commits against normative spec statements, and
 `recall(discrepancies)` lists what it finds
-([ADR 0007](adr/0007-spec-conformance-chain.md)). The README's
-[not built yet](../README.md#not-built-yet) section lists what the rest of the
+([ADR 0007](adr/0007-spec-conformance-chain.md)). The status reference's
+[not built yet](reference/STATUS.md#not-built-yet) section lists what the rest of the
 design still lacks.
 
 ## Current checked-in topology
@@ -844,16 +850,18 @@ publication default is denied.
   runs the Stage-5 connectors and projectors, and `serve` answers
   `recall(kind=evidence)` over what they write, with readiness, coverage, and
   an absence verdict ([ADR 0006](adr/0006-stage5-worker-and-evidence-recall.md)).
-  Managed scheduling, publication-plane evidence recall, fusing evidence into
-  chunk recall, and the rest of ADR 0006's deferred list remain.
+  The local deployment now schedules ticks with a CronJob. Cloud scheduling,
+  publication-plane evidence recall, fusing evidence into chunk recall, and
+  the rest of ADR 0006's deferred list remain.
 - Extend the spec chain ([ADR 0007](adr/0007-spec-conformance-chain.md)): an
   observer admitted to verify absence, so a fixing commit can resolve an
   episode; episode lifecycle over MCP; `retire` and `inspect`; and other
-  finding types. The README's [not built yet](../README.md#not-built-yet)
+  finding types. The [status reference](reference/STATUS.md#not-built-yet)
   section collects every deferred item.
 - Package Fleet Recall as an optional OSTK Recall plugin/backend.
-- Add authenticated workload identity and dynamic multi-project routing
-  without trusting MCP parameters.
+- Qualify the planned cloud deployment of the implemented authenticated
+  workload identity and enrolled multi-project routing; see
+  [the remote plane](REMOTE_PLANE.md) and [M4 plan](M4_REMOTE_ACCESS_PLAN.md).
 - Add set-based bounded ingestion, changefeed-driven projections, and
   multi-region locality policies.
 - Add private AWS/CockroachDB connectivity, WAF/rate limiting, operational

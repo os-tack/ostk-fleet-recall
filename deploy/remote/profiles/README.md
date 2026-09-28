@@ -1,7 +1,9 @@
 # Remote HTTPS configuration profiles
 
 These non-secret examples describe the shared M4.1 client/discovery contract.
-They are inputs for later deployment slices, not installers or live endpoints.
+They are configuration examples, not installers. The local profile's canonical
+names are now used by the qualified [single-Mac HTTPS deployment](../../local/https/README.md).
+The cloud example remains input for the planned M4.4 stack, which is on hold.
 Select names before registration/enrollment, and set server variables in the
 server environment and client variables in the launcher/shim/shipper environment.
 No database URL, signing seed, content key, OAuth token, or provider credential
@@ -31,4 +33,6 @@ Recall shim in a sandbox.
 Load runtime secrets through the deployment's private secret store. Apply
 principal enrollment from its separate workstation environment, then use the
 existing launch commands in [REMOTE_PLANE.md](../../../docs/REMOTE_PLANE.md).
-Full local DNS/edge/Ory deployment is M4.2; the AWS remote stack is M4.4.
+For operating tasks and setting ownership, start with the
+[operator guide](../../../docs/guides/OPERATING.md) and
+[configuration reference](../../../docs/reference/CONFIGURATION.md).

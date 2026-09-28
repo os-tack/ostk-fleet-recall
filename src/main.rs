@@ -2854,18 +2854,42 @@ mod tests {
         }
     }
 
-    /// Every `"$FLEET_RECALL_BIN"` command the README runs must, at that point
+    const QUICKSTART_TUTORIALS: [(&str, &str); 3] = [
+        (
+            "LOCAL_DEVELOPMENT.md",
+            include_str!("../docs/tutorials/LOCAL_DEVELOPMENT.md"),
+        ),
+        (
+            "USING_RECALL.md",
+            include_str!("../docs/tutorials/USING_RECALL.md"),
+        ),
+        (
+            "MEMORY_PIPELINES.md",
+            include_str!("../docs/tutorials/MEMORY_PIPELINES.md"),
+        ),
+    ];
+
+    /// Every `"$FLEET_RECALL_BIN"` command the tutorials run must, at that point
     /// of the walkthrough, have a database URL for the login its identity
     /// requires, and that login must be able to authenticate. A writer
     /// command run with the migrator URL, or before the boundary helper
     /// provisions `fleet_writer`, stops the quickstart.
     #[test]
-    fn readme_runs_each_command_as_an_enabled_login_of_its_identity() {
+    fn tutorials_run_each_command_as_an_enabled_login_of_its_identity() {
         let mut shell = QuickstartShell::default();
         let mut identities_run = Vec::new();
         let mut fence: Option<&str> = None;
         let mut command = String::new();
-        for (index, line) in include_str!("../README.md").lines().enumerate() {
+        for (document, index, line) in
+            QUICKSTART_TUTORIALS
+                .into_iter()
+                .flat_map(|(name, contents)| {
+                    contents
+                        .lines()
+                        .enumerate()
+                        .map(move |(index, line)| (name, index, line))
+                })
+        {
             let line_number = index + 1;
             if let Some(info) = line.strip_prefix("```") {
                 fence = if fence.is_some() { None } else { Some(info) };
@@ -2892,7 +2916,7 @@ mod tests {
                 .split_whitespace()
                 .take_while(|word| !word.starts_with(['<', '>', '&', '|', ';', ')']));
             let cli = Cli::try_parse_from(std::iter::once("ostk-fleet-recall").chain(arguments))
-                .unwrap_or_else(|error| panic!("README line {line_number}: {error}"));
+                .unwrap_or_else(|error| panic!("{document} line {line_number}: {error}"));
             let identity = cli.command.runtime_database_identity();
             let (variable, login) = match identity {
                 RuntimeDatabaseIdentity::None => {
@@ -2913,7 +2937,7 @@ mod tests {
                     assert_eq!(
                         shell.login("FLEET_RECALL_DATABASE_URL"),
                         None,
-                        "README line {line_number}: the public demo refuses a private URL"
+                        "{document} line {line_number}: the public demo refuses a private URL"
                     );
                     (
                         "FLEET_RECALL_PUBLICATION_DATABASE_URL",
@@ -2924,7 +2948,7 @@ mod tests {
                     assert_eq!(
                         shell.login("FLEET_RECALL_DATABASE_URL"),
                         None,
-                        "README line {line_number}: the ingress refuses a private URL"
+                        "{document} line {line_number}: the ingress refuses a private URL"
                     );
                     ("FLEET_RECALL_INGRESS_DATABASE_URL", INGRESS_POSTGRES_USER)
                 }
@@ -2932,11 +2956,11 @@ mod tests {
             assert_eq!(
                 shell.login(variable).as_deref(),
                 Some(login),
-                "README line {line_number}: a {identity:?} command needs {variable} as {login}"
+                "{document} line {line_number}: a {identity:?} command needs {variable} as {login}"
             );
             assert!(
                 shell.login_is_enabled(login),
-                "README line {line_number}: {login} cannot authenticate at this step"
+                "{document} line {line_number}: {login} cannot authenticate at this step"
             );
             identities_run.push(identity);
             shell.finish();
@@ -2948,7 +2972,7 @@ mod tests {
         ] {
             assert!(
                 identities_run.contains(&identity),
-                "the README never runs a {identity:?} command"
+                "the tutorials never run a {identity:?} command"
             );
         }
     }

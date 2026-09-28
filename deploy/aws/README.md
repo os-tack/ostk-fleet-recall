@@ -1,5 +1,9 @@
 # AWS deployment runbook
 
+This is the publication-demo deployment. The separate authenticated remote
+stack planned for M4.4 is on hold; see [deployment profiles](../../docs/reference/DEPLOYMENT_PROFILES.md)
+and the [documentation index](../../docs/README.md) for the current local service.
+
 This Terraform module deploys the public, read-only Fleet Recall demo to an
 ECS/Fargate service behind an Application Load Balancer. An optional CloudFront
 distribution provides an HTTPS front door on its generated `cloudfront.net`
