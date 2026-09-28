@@ -68,6 +68,9 @@ spec:
         - name: rules
           mountPath: "/etc/prometheus/rules"
           readOnly: true
+        - name: remote-scrapes
+          mountPath: "/etc/prometheus/remote"
+          readOnly: true
         - name: tmp
           mountPath: "/tmp"
         startupProbe:
@@ -102,6 +105,9 @@ spec:
       - name: rules
         configMap:
           name: fleet-prometheus-rules
+      - name: remote-scrapes
+        configMap:
+          name: fleet-prometheus-remote-scrapes
       - name: tmp
         emptyDir:
           sizeLimit: 64Mi

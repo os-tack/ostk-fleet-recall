@@ -186,6 +186,40 @@ async fn current_thread_sync_bridge_fails_closed_without_panicking() {
 }
 
 #[tokio::test]
+#[allow(clippy::float_cmp)] // Exact fixture vector sentinel.
+async fn deferred_client_starts_without_tier_and_recovers_only_under_pinned_descriptor() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let config = RemoteConfig::new(
+        &format!("http://{address}"),
+        Duration::from_millis(25),
+        None,
+    )
+    .unwrap();
+    // The bound socket has no serving task: construction cannot depend on a
+    // descriptor response, while any attempted vector operation still fails.
+    let client = RemoteClient::deferred(config.clone(), descriptor(), "fixture".into()).unwrap();
+    assert!(client.is_degraded());
+    assert_eq!(client.embed(&["hello"]).await, Err(TierError::Unavailable));
+    let wrong = RemoteClient::deferred(
+        config,
+        Descriptor::pinned(Sha256Digest::from_bytes([8; 32])),
+        "fixture".into(),
+    )
+    .unwrap();
+    let router = server::router(Arc::new(TestEmbedder), descriptor(), None).unwrap();
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    assert_eq!(
+        wrong.embed(&["hello"]).await,
+        Err(TierError::DescriptorMismatch)
+    );
+    assert!(wrong.is_degraded());
+    assert_eq!(client.embed(&["hello"]).await.unwrap()[0][0], 1.0);
+    assert!(!client.is_degraded());
+    task.abort();
+}
+
+#[tokio::test]
 async fn every_reply_checks_all_descriptor_fields_and_dimensions() {
     for alter in 0..6 {
         let router = Router::new()

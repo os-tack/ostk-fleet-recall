@@ -46,7 +46,8 @@ async fn observe(State(component): State<&'static str>, request: Request, next: 
 fn route(path: Option<&str>) -> &'static str {
     match path {
         Some("/") => "index",
-        Some("/healthz" | "/readyz") => "health",
+        Some("/healthz") => "health",
+        Some("/readyz") => "readiness",
         Some("/api/status") => "status",
         Some("/api/recall") => "recall",
         Some("/mcp") => "mcp",
@@ -89,6 +90,8 @@ mod tests {
             "transcript"
         );
         for (path, expected) in [
+            ("/healthz", "health"),
+            ("/readyz", "readiness"),
             ("/mcp", "mcp"),
             ("/v1/embed", "embed"),
             ("/v1/descriptor", "descriptor"),

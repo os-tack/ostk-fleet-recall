@@ -32,7 +32,10 @@ pub struct RemoteClient {
 }
 
 impl RemoteClient {
-    pub async fn connect(
+    /// Validate immutable configuration without requiring the optional tier to
+    /// be reachable. Every later embedding reply still verifies its descriptor.
+    /// HTTP serving uses this to retain lexical access during tier restarts.
+    pub fn deferred(
         config: RemoteConfig,
         descriptor: Descriptor,
         model_identity: String,
@@ -45,14 +48,22 @@ impl RemoteClient {
             .no_proxy()
             .build()
             .map_err(|_| TierError::Configuration)?;
-        let result = Arc::new(Self {
+        Ok(Arc::new(Self {
             client,
             config,
             projection: descriptor.projection(),
             descriptor,
             model_identity,
             degraded: AtomicBool::new(true),
-        });
+        }))
+    }
+
+    pub async fn connect(
+        config: RemoteConfig,
+        descriptor: Descriptor,
+        model_identity: String,
+    ) -> Result<Arc<Self>, TierError> {
+        let result = Self::deferred(config, descriptor, model_identity)?;
         result.check_health().await?;
         Ok(result)
     }

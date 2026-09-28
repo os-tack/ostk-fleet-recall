@@ -56,6 +56,8 @@ Metric names and labels:
 | `fleet_recall_process_start_time_seconds` | Gauge | Unix time when the process telemetry registry initialized. |
 | `fleet_recall_process_uptime_seconds` | Gauge | Seconds since registry initialization. |
 | `fleet_recall_snapshot_time_seconds` | Gauge | Unix time the textfile snapshot was written; textfile export only. |
+| `fleet_recall_ready` | Gauge | HTTP remote runtime only: `1` after a fresh successful bounded database check, otherwise `0`, including startup, stale observations and probe failure. |
+| `fleet_recall_readiness_last_check_timestamp_seconds` | Gauge | Unix time of the last completed readiness check; zero before any check completes. No dependency URL or database identity is exported. |
 
 Histograms expose `_bucket`, `_sum`, and `_count` series. Finite buckets are
 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60,
@@ -73,7 +75,9 @@ Instrumented boundaries:
 | --- | --- | --- |
 | `process` | CLI command names, including `serve`, `demo`, `ingress`, `worker`, `collect`, `health`, `migrate`, `ingest`, `model_digest`, `enroll` | Command lifetime and exit outcome after logging initialization, including metrics configuration and listener startup failures. Both stdio and HTTP serving use `serve`. |
 | `mcp` | `recall.<action>`, `remember.<action>`, protocol categories | Dispatch, refusals, tool failures, malformed frames, and request deadlines. Tool action names are from the closed service enums. |
-| `http_mcp` | `mcp`, `resource_metadata`, `grant`, `revoke`, `auth_aws`, `health`, `other` | Remote HTTP latency/outcome and response classes, including requests rejected before MCP dispatch. Grant IDs and query strings never become labels. |
+| `http_mcp` | `mcp`, `resource_metadata`, `grant`, `revoke`, `auth_aws`, `transcript`, `health`, `readiness`, `other` | Remote HTTP latency/outcome and response classes, including requests rejected before MCP dispatch. Grant IDs, transcript identities and query strings never become labels. |
+| `runtime` | `readiness` | Bounded core database check outcome and duration. Embedding or issuer outages do not themselves remove lexical service readiness. |
+| `transcript` | `receive` | Fixed units `quota_rejected` and `io_errors`, initialized to zero at receiver startup. Quota includes file bytes, scope bytes and file count. I/O includes permission, lock and storage errors. No scope, source, path or raw error is exported. |
 | `http_demo` | `index`, `health`, `status`, `recall`, `other` | HTTP latency/outcome and `responses_1xx` through `responses_5xx` units. |
 | `http_ingress` | `ingress`, `other` | Push ingress HTTP latency/outcome and response classes. |
 | `database` | `health_check`, `serializable_transaction` | Health checks and transactions using the shared serializable retry helper. This is not a timer for every SQL statement. |
@@ -252,6 +256,86 @@ later first failure be compared with a previously scraped zero baseline.
    jobs, destination permissions, collector readability, clock agreement,
    `node_textfile_scrape_error`, and telemetry export failure events. A failed
    export can leave a previously healthy snapshot visible.
+
+### Remote HTTPS lifecycle alerts
+
+The M4 local profile adds `remote-alerts.yml` and a lifecycle section to the
+existing Overview dashboard. Enable it explicitly when installing or updating
+the HTTPS deployment's monitoring:
+
+```sh
+FLEET_OBSERVABILITY_REMOTE=true \
+KUBECONFIG=deploy/local/.state/kubeconfig \
+  deploy/observability/install-k0s.sh up
+```
+
+Use the same flag for `render` and `verify`. The default remains the base stack
+without HTTPS dependencies. Switching back to `false` removes the remote
+scrapes/rules from their ConfigMaps; it does not delete retained pod-discovery
+RoleBindings. Both profiles retain the existing dashboards and infrastructure
+alerts. Remote mode requires the `fleet-edge` and `fleet-pki` namespaces and an
+application image containing the readiness and spool instruments.
+
+| Signal | Evaluation and response |
+| --- | --- |
+| Core readiness | Failed or missing readiness for one minute; inspect bounded database checks. `/healthz` remains listener liveness. A healthy metrics scrape alone is insufficient. |
+| HTTP failures | More than 5% 5xx, at least five errors in five minutes, sustained two minutes. Separate gateway and Recall alerts locate Ory/edge versus application failures. HTTP 200 tool errors remain covered by MCP alerts. |
+| Denials | More than 20% 401/403/429 and at least twenty denials in five minutes, sustained five minutes. Expected OAuth challenges and explicit negative tests can contribute; this is operational diagnosis, not proof of attack. |
+| Worker freshness | Two missed five-minute ticks (600 seconds), plus the last measured process runtime, with a 60-second minimum and a one-minute alert hold. Legacy snapshots without duration use 900 seconds. Fresh failed runs still fire the separate last-run failure alert. Missing snapshots/collector failures remain separate. |
+| Spool refusal | Any increase in quota or I/O refusals over five minutes. Inspect configured per-file/per-scope/file-count limits separately from storage exhaustion. Counters begin at zero, and a missing quota counter has its own alert. |
+| Storage capacity | Existing node alert below 10% available bytes and a new alert below 10% free inodes, each for ten minutes. The spool's hostPath shares VM storage; the PV's declared 2 GiB is not an enforced filesystem quota. No per-tenant usage is exported. |
+| Certificate expiry | Managed leaf below fourteen days for five minutes; gateway-loaded leaf below seven days for five minutes is critical. Missing certificate metrics alert independently. Automatic renewal is configured thirty days before expiry. These gauges do not verify network trust, every SNI name, or root/intermediate lifetime. |
+| Dependency reachability | Fixed, tokenless issuer discovery/JWKS and embedding-listener checks every minute; a failed probe holds one minute. Snapshots older than three minutes or over thirty seconds in the future hold one minute; absent samples have a separate two-minute alert. Authenticated embedding client errors alert separately. |
+
+The private `remote-dependency-probe` CronJob reuses the imported sandbox image
+as a Python runtime with its entrypoint overridden. It mounts only the public
+CA ConfigMap, the fixed probe script, and the existing node-exporter textfile
+directory. It mounts no tokens or Secrets and has no Kubernetes API access.
+HTTPS requests verify the canonical issuer, host certificate and exact fixed
+JWKS URL; redirects are refused, each request has an eight-second deadline and
+responses are limited to 64 KiB. Refused/reset connections retry at one-second
+intervals within that same total deadline, covering observed transient
+connection refusals during fresh-Pod startup. TLS, HTTP status and schema
+errors are never retried.
+The embedding check expects an unauthenticated
+401 from the protected internal descriptor endpoint. This proves transport and
+the authentication guard, not descriptor agreement or successful inference;
+the separate embedding-client alert covers observed authenticated failures.
+Only the three fixed target categories, health, duration and completion time
+are exported. Failed checks still publish a fresh snapshot atomically without
+overwriting the worker snapshot. Ory Deployment readiness alone does not prove
+the canonical HTTPS path works.
+
+Worker duration and freshness budget are exposed as recording rules
+`fleet_recall_worker_last_run_duration_seconds` and
+`fleet_recall_worker_snapshot_max_age_seconds`. They read completed snapshots
+directly. The existing Workers dashboard's configurable static freshness
+threshold remains a triage view; the Overview lifecycle panel shows the actual
+duration-aware alert budget. Recalibrate the cadence constant if the CronJob
+schedule changes. An active or deliberately suspended worker does not silence
+freshness alerts automatically; use an explicit maintenance silence if a
+notification system is added.
+
+Private pod discovery adds get/list/watch **Pods only** in the edge and PKI
+namespaces. It adds no Secret access. Only fixed gateway request/certificate
+metrics and certificate-controller status/expiry/renewal metrics are ingested;
+no HTTP headers, request paths, users, prompts or transcript contents are
+metric labels. The gateway metrics port stays subject to its Prometheus-only
+ingress policy. PKI controller metrics remain private ClusterIP/pod traffic;
+the existing privileged PKI namespace is not claimed to have ingress isolation.
+See [Traefik metrics](https://doc.traefik.io/traefik/reference/install-configuration/observability/metrics/)
+and [cert-manager metrics](https://cert-manager.io/docs/devops-tips/prometheus-metrics/).
+
+Run `promtool test rules deploy/observability/remote-alerts.test.yml` alongside
+the existing rule tests. Fixtures exercise alert hold times, recovery,
+readiness/target/certificate absence, HTTP traffic floors and exact ratio
+boundaries, initial spool refusal, byte/inode pressure, and the measured worker
+duration allowance. This proves evaluation; it does not prove that an external
+receiver delivered a notification. Alertmanager/paging remains unconfigured.
+Live installer verification additionally requires healthy new scrape jobs,
+ready Recall, initialized spool counters, unexpired managed/loaded leaf
+metrics and fresh successful samples for all three fixed dependency probes
+before reporting success.
 
 The example alert thresholds are starting points, not established service
 objectives. Configure an Alertmanager/notification route in the existing

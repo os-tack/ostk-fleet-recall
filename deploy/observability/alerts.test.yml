@@ -74,8 +74,8 @@ tests:
               instance: stale:9100
               severity: warning
             exp_annotations:
-              summary: "Worker snapshot is more than 15 minutes old"
-              description: "Check scheduling, process termination, export errors, and file permissions. Tune the age limit to the schedule and maximum run duration."
+              summary: "Worker snapshot exceeded two ticks plus its duration allowance"
+              description: "The five-minute schedule allows 600 seconds plus the last measured runtime (minimum 60 seconds), then a one-minute alert hold. Legacy snapshots without duration allow 900 seconds. Check scheduling, termination, export errors and permissions."
       - eval_time: 17m
         alertname: FleetRecallWorkerFailed
         exp_alerts: []

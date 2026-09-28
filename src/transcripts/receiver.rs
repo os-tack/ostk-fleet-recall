@@ -200,6 +200,11 @@ impl TranscriptReceiver {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?);
+        // Fixed operational categories only: no scope, source, path or error text.
+        // Initialize before traffic so a first failure has a scrape baseline.
+        for unit in ["quota_rejected", "io_errors"] {
+            crate::telemetry::add_units("transcript", "receive", unit, 0);
+        }
         Ok(Self { config, root })
     }
 
@@ -225,9 +230,26 @@ impl TranscriptReceiver {
         body: Option<Vec<u8>>,
     ) -> Result<TranscriptProgress, TranscriptError> {
         let receiver = self.clone();
-        tokio::task::spawn_blocking(move || receiver.receive_sync(&auth, &upload, body.as_deref()))
-            .await
-            .map_err(|_| TranscriptError::Io(std::io::Error::other("transcript task failed")))?
+        tokio::task::spawn_blocking(move || {
+            let result = receiver.receive_sync(&auth, &upload, body.as_deref());
+            // Observe inside the blocking task: cancellation of the HTTP waiter
+            // must not hide a completed spool failure or count it twice.
+            match &result {
+                Err(TranscriptError::Quota) => {
+                    crate::telemetry::add_units("transcript", "receive", "quota_rejected", 1);
+                }
+                Err(TranscriptError::Io(_)) => {
+                    crate::telemetry::add_units("transcript", "receive", "io_errors", 1);
+                }
+                _ => {}
+            }
+            result
+        })
+        .await
+        .map_err(|_| {
+            crate::telemetry::add_units("transcript", "receive", "io_errors", 1);
+            TranscriptError::Io(std::io::Error::other("transcript task failed"))
+        })?
     }
 
     #[allow(clippy::too_many_lines)] // The authorization, lock, replay and commit order is one invariant.

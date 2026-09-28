@@ -119,13 +119,13 @@ not replace application images. Infrastructure and raw log panels work with
 the existing images; application and structured-event panels need the new
 binary and actual traffic. The current stdio writer is an exec target, not a
 persistent metrics listener; `kubectl exec` streams are also separate from
-the container's main-process log stream. The current remote MCP launcher runs
-`serve --http` on the host, outside Kubernetes discovery and pod-log collection.
+the container's main-process log stream. A host-launched remote MCP process runs
+`serve --http` outside Kubernetes discovery and pod-log collection.
 Its `http_mcp` and nested `mcp` metrics need an explicit Prometheus target
 reachable from the monitoring pod; host JSON stderr needs separate log
 shipping. See [remote-plane telemetry](../../docs/REMOTE_PLANE.md) for launcher
-configuration. If deploying that service in a pod, give it the same named
-metrics port, scrape annotation, and metrics environment as the other services.
+configuration. The M4 HTTPS profile deploys Recall in an annotated pod with the
+same named metrics port, scrape annotation and metrics environment as the other services.
 Do not put a fixed listener in shared configuration used by concurrent CLI
 processes.
 
@@ -144,6 +144,7 @@ python3 deploy/observability/validate_dashboards.py \
 promtool check rules /tmp/fleet-dashboard-rules.json
 promtool test rules deploy/observability/alerts.test.yml
 promtool test rules deploy/observability/k0s-alerts.test.yml
+promtool test rules deploy/observability/remote-alerts.test.yml
 ```
 
 For live query validation, forward the private services in separate terminals:
@@ -174,6 +175,33 @@ OOM restarts, and overdue CronJobs. Thresholds are starting points in
 **Notification delivery is not configured**. Connect Prometheus to
 an Alertmanager and configure receivers before relying on paging.
 
+For the installed M4 HTTPS profile, use `FLEET_OBSERVABILITY_REMOTE=true` with
+`install-k0s.sh render`, `up`, and `verify`. This enables the separate
+[`remote-alerts.yml`](remote-alerts.yml) pack, private Traefik and cert-manager
+scrapes, read-only Pod discovery in their existing namespaces, and a private
+once-per-minute dependency probe. The probe uses the existing public
+`fleet-oidc-ca` ConfigMap and writes its own atomic node-exporter textfile.
+It mounts no credentials. Its Python runtime defaults to the already imported
+`ostk-sandbox:m4-20260927b`; override `FLEET_OBSERVABILITY_PROBE_IMAGE` with an
+imported image containing `/usr/bin/python3` if the local release changes.
+Images are never pulled automatically. The default
+base profile does not require those namespaces. Keep using the flag on later
+updates: selecting the base profile explicitly removes remote scrapes/rules
+from the generated ConfigMaps and suspends the retained probe CronJob. It does
+not delete the retained discovery RoleBindings, probe snapshots or application
+data.
+
+Overview includes a remote lifecycle section for core readiness, probe age,
+HTTP response classes/denials, spool quota/I/O refusals, worker age versus its
+computed budget, loaded/managed leaf expiry, and backing filesystem byte/inode
+capacity. Remote verification requires the new gauges/counters and certificate
+series, all three fresh successful dependency probes, and healthy scrape jobs.
+Issuer discovery and JWKS use the canonical verified HTTPS path. The tokenless
+embedding check verifies transport and the authentication guard; observed
+authenticated descriptor/inference failures have a separate alert. Rebuild and deploy the M4.3 application
+image before enabling that verification. See the
+[thresholds and response guidance](../../docs/TELEMETRY.md#remote-https-lifecycle-alerts).
+
 Edit the dashboard JSON in Git and rerun the installer. Grafana reloads the
 files; datasource and alert-rule changes trigger a content-based rollout.
 Provisioned dashboards are read-only in the UI to prevent unnoticed drift.
@@ -200,8 +228,10 @@ do not deploy a monitoring stack or configure alert delivery on their own.
    addresses and coarse deployment/role labels. The example assumes the
    processes share one host/network namespace; container loopback points to
    that container, not the application host.
-4. Set the worker freshness threshold to the schedule interval plus the
-   longest acceptable runtime and collection delay. Tune request latency and
+4. The shared worker rule assumes a five-minute schedule: two missed ticks
+   plus the last measured runtime (minimum one minute), followed by a one-minute
+   hold. Legacy snapshots without duration use 15 minutes. Adjust the 600-second
+   cadence constant for other schedules. Tune request latency and
    error-rate thresholds with observed traffic. Connect these rules to the
    deployment's existing Alertmanager and notification routing.
 

@@ -1,4 +1,4 @@
-# No secret access. Pod discovery is bound only in Fleet and observability namespaces.
+# No Secret access. Base pod discovery is bound only in Fleet and observability namespaces.
 # GET nodes/proxy enables kubelet/cAdvisor metrics via the CA-verified Kubernetes API server.
 ---
 apiVersion: v1

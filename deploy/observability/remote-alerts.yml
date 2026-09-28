@@ -1,0 +1,219 @@
+# M4 local HTTPS profile. No notification receiver is configured by this pack.
+# Fixed environment labels prevent one healthy deployment masking another.
+groups:
+  - name: fleet-remote-runtime
+    rules:
+      - alert: FleetRemoteNotReady
+        expr: |
+          (fleet_recall_ready{job="fleet-recall", app="recall", cluster="k0s", deployment="local-k0s"} == 0)
+          or absent(fleet_recall_ready{job="fleet-recall", app="recall", cluster="k0s", deployment="local-k0s"})
+          or (
+            (up{job="fleet-recall", app="recall", cluster="k0s", deployment="local-k0s"} == 1)
+            unless on (job, instance)
+            fleet_recall_ready{job="fleet-recall", app="recall", cluster="k0s", deployment="local-k0s"}
+          )
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Remote Recall readiness is failed or unobserved"
+          description: "Inspect the bounded database readiness check and scrape health. Listener liveness and embedding availability do not establish core readiness."
+
+      - alert: FleetRemoteMetricsUnavailable
+        expr: |
+          (up{job=~"fleet-edge|fleet-cert-manager", cluster="k0s", deployment="local-k0s"} == 0)
+          or (up{job="fleet-recall", app="recall", cluster="k0s", deployment="local-k0s"} == 0)
+          or absent(up{job="fleet-edge", cluster="k0s", deployment="local-k0s"})
+          or absent(up{job="fleet-cert-manager", cluster="k0s", deployment="local-k0s"})
+          or absent(up{job="fleet-recall", app="recall", cluster="k0s", deployment="local-k0s"})
+          or absent(up{job="fleet-worker-textfile", cluster="k0s", deployment="local-k0s"})
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Remote plane metrics are unavailable for {{ $labels.job }}"
+          description: "Check the private metrics listener, pod discovery, scoped RBAC and network policy. Missing targets are not healthy zero traffic."
+
+      - alert: FleetRemoteHttpErrors
+        expr: |
+          sum by (cluster, deployment, instance, operation) (
+            rate(fleet_recall_units_total{job="fleet-recall", app="recall", cluster="k0s", deployment="local-k0s", component="http_mcp", operation=~"mcp|grant|revoke|auth_aws|transcript", unit="responses_5xx"}[5m])
+          ) / clamp_min(sum by (cluster, deployment, instance, operation) (
+            rate(fleet_recall_units_total{job="fleet-recall", app="recall", cluster="k0s", deployment="local-k0s", component="http_mcp", operation=~"mcp|grant|revoke|auth_aws|transcript", unit=~"responses_[1-5]xx"}[5m])
+          ), 0.000001) > 0.05
+          and on (cluster, deployment, instance, operation)
+          sum by (cluster, deployment, instance, operation) (
+            increase(fleet_recall_units_total{job="fleet-recall", app="recall", cluster="k0s", deployment="local-k0s", component="http_mcp", operation=~"mcp|grant|revoke|auth_aws|transcript", unit="responses_5xx"}[5m])
+          ) >= 5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Remote HTTP 5xx errors exceed 5% for {{ $labels.operation }}"
+          description: "At least five 5xx responses occurred in five minutes. Inspect readiness, database and dependency failures; this measures the HTTP boundary, not tool-level errors inside HTTP 200."
+
+      - alert: FleetRemoteDenialRate
+        expr: |
+          sum by (cluster, deployment, instance, operation) (
+            rate(fleet_recall_operations_total{job="fleet-recall", app="recall", cluster="k0s", deployment="local-k0s", component="http_mcp", operation=~"mcp|grant|revoke|auth_aws|transcript", outcome="refused"}[5m])
+          ) / clamp_min(sum by (cluster, deployment, instance, operation) (
+            rate(fleet_recall_operations_total{job="fleet-recall", app="recall", cluster="k0s", deployment="local-k0s", component="http_mcp", operation=~"mcp|grant|revoke|auth_aws|transcript"}[5m])
+          ), 0.000001) > 0.20
+          and on (cluster, deployment, instance, operation)
+          sum by (cluster, deployment, instance, operation) (
+            increase(fleet_recall_operations_total{job="fleet-recall", app="recall", cluster="k0s", deployment="local-k0s", component="http_mcp", operation=~"mcp|grant|revoke|auth_aws|transcript", outcome="refused"}[5m])
+          ) >= 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Remote HTTP denials exceed 20% for {{ $labels.operation }}"
+          description: "At least twenty 401/403/429 responses occurred in five minutes. Check client authorization, expiry and rate limits; expected OAuth challenges and negative tests can also contribute. No identity or token is a metric label."
+
+      - alert: FleetRemoteSpoolRejected
+        expr: |
+          sum by (cluster, deployment, instance, unit) (
+            increase(fleet_recall_units_total{job="fleet-recall", app="recall", cluster="k0s", deployment="local-k0s", component="transcript", operation="receive", unit=~"quota_rejected|io_errors"}[5m])
+          ) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Transcript receiver reported {{ $labels.unit }}"
+          description: "Inspect scope/file quotas, spool permissions, lock contention and backing filesystem capacity using protected operational tools. Quota refusal is not evidence of disk exhaustion. Never delete evidence merely to clear an alert."
+
+      - alert: FleetRemoteSpoolMetricsMissing
+        expr: |
+          (up{job="fleet-recall", app="recall", cluster="k0s", deployment="local-k0s"} == 1)
+          unless on (job, instance)
+          fleet_recall_units_total{job="fleet-recall", component="transcript", operation="receive", unit="quota_rejected"}
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Transcript receiver metrics are missing"
+          description: "Confirm the remote image contains spool telemetry and the transcript receiver is configured. Its counters initialize to zero before requests arrive."
+
+  - name: fleet-remote-edge
+    rules:
+      - alert: FleetRemoteEdgeErrors
+        expr: |
+          sum by (cluster, deployment, instance) (rate(traefik_entrypoint_requests_total{job="fleet-edge", cluster="k0s", deployment="local-k0s", entrypoint="websecure", code=~"5.."}[5m]))
+          / clamp_min(sum by (cluster, deployment, instance) (rate(traefik_entrypoint_requests_total{job="fleet-edge", cluster="k0s", deployment="local-k0s", entrypoint="websecure"}[5m])), 0.000001) > 0.05
+          and on (cluster, deployment, instance)
+          sum by (cluster, deployment, instance) (increase(traefik_entrypoint_requests_total{job="fleet-edge", cluster="k0s", deployment="local-k0s", entrypoint="websecure", code=~"5.."}[5m])) >= 5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "HTTPS gateway 5xx errors exceed 5%"
+          description: "At least five errors occurred in five minutes. Compare Recall HTTP errors with Ory and gateway health; this includes every canonical public service."
+
+      - alert: FleetRemoteCertificateExpiring
+        expr: |
+          certmanager_certificate_expiration_timestamp_seconds{job="fleet-cert-manager", cluster="k0s", deployment="local-k0s", namespace="fleet-edge", name="fleet-edge"} - time() < 14 * 86400
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fleet HTTPS certificate expires within fourteen days"
+          description: "Automatic renewal should begin thirty days before expiry. Inspect Certificate conditions, issuer validity and controller logs, then verify the served certificate. Preserve the pinned CA; do not disable verification."
+
+      - alert: FleetRemoteServedCertificateExpiring
+        expr: |
+          min by (cluster, deployment, instance) (traefik_tls_certs_not_after{job="fleet-edge", cluster="k0s", deployment="local-k0s"}) - time() < 7 * 86400
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A certificate loaded by the HTTPS gateway expires within seven days"
+          description: "Compare the served chain with the renewed Secret and check Gateway reload. This private gauge covers loaded certificates; verify all three canonical names with the trusted TLS probe."
+
+      - alert: FleetRemoteCertificateMetricsMissing
+        expr: |
+          absent(certmanager_certificate_expiration_timestamp_seconds{job="fleet-cert-manager", cluster="k0s", deployment="local-k0s", namespace="fleet-edge", name="fleet-edge"})
+          or absent(traefik_tls_certs_not_after{job="fleet-edge", cluster="k0s", deployment="local-k0s"})
+          or (
+            (up{job="fleet-edge", cluster="k0s", deployment="local-k0s"} == 1)
+            unless on (job, instance)
+            traefik_tls_certs_not_after{job="fleet-edge", cluster="k0s", deployment="local-k0s"}
+          )
+          or (
+            (up{job="fleet-cert-manager", cluster="k0s", deployment="local-k0s"} == 1)
+            unless on (job, instance)
+            certmanager_certificate_expiration_timestamp_seconds{job="fleet-cert-manager", cluster="k0s", deployment="local-k0s", namespace="fleet-edge", name="fleet-edge"}
+          )
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fleet HTTPS certificate expiry is unobserved"
+          description: "Check both private scrape jobs, Certificate existence and gateway certificate loading. An absent expiry series is not a valid or renewed certificate."
+
+  - name: fleet-remote-dependencies
+    rules:
+      - alert: FleetRemoteDependencyUnavailable
+        expr: fleet_dependency_probe_success{job="fleet-remote-probes", cluster="k0s", deployment="local-k0s"} == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Remote dependency probe failed: {{ $labels.target }}"
+          description: "The fixed tokenless probe failed canonical issuer discovery/JWKS validation or the protected embedding listener check. Check DNS, TLS, gateway and service health. Core Recall readiness remains independent."
+
+      - alert: FleetRemoteDependencyProbeStale
+        expr: |
+          time() - fleet_dependency_probe_completed_timestamp_seconds{job="fleet-remote-probes", cluster="k0s", deployment="local-k0s"} > 180
+          or fleet_dependency_probe_completed_timestamp_seconds{job="fleet-remote-probes", cluster="k0s", deployment="local-k0s"} > time() + 30
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dependency probe snapshot is stale: {{ $labels.target }}"
+          description: "The once-per-minute probe has not published for more than three minutes or its timestamp is over thirty seconds in the future. Inspect clock agreement, CronJob, image availability, textfile permissions and collector health; an old success is not current reachability."
+
+      - alert: FleetRemoteDependencyMetricsMissing
+        expr: |
+          (up{job="fleet-remote-probes", cluster="k0s", deployment="local-k0s"} == 0)
+          or absent(up{job="fleet-remote-probes", cluster="k0s", deployment="local-k0s"})
+          or absent(fleet_dependency_probe_success{job="fleet-remote-probes", cluster="k0s", deployment="local-k0s", target="issuer_discovery"})
+          or absent(fleet_dependency_probe_success{job="fleet-remote-probes", cluster="k0s", deployment="local-k0s", target="issuer_jwks"})
+          or absent(fleet_dependency_probe_success{job="fleet-remote-probes", cluster="k0s", deployment="local-k0s", target="embedding_transport"})
+          or (
+            fleet_dependency_probe_success{job="fleet-remote-probes", cluster="k0s", deployment="local-k0s"}
+            unless on (job, instance, target)
+            fleet_dependency_probe_completed_timestamp_seconds{job="fleet-remote-probes", cluster="k0s", deployment="local-k0s"}
+          )
+          or (node_textfile_scrape_error{job="fleet-remote-probes", cluster="k0s", deployment="local-k0s"} > 0)
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Remote dependency probe telemetry is unavailable"
+          description: "Check all three fixed target samples, the dedicated scrape job and node-exporter textfile errors. The probe publishes success/failure even when an endpoint is down."
+
+      - alert: FleetRemoteEmbeddingClientErrors
+        expr: |
+          sum by (cluster, deployment, instance, operation) (
+            increase(fleet_recall_operations_total{job="fleet-recall", app="recall", cluster="k0s", deployment="local-k0s", component="embedding", operation=~"remote_descriptor|remote_batch", outcome=~"error|timeout|cancelled"}[5m])
+          ) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Authenticated embedding client failed: {{ $labels.operation }}"
+          description: "Inspect pinned descriptor agreement and remote embedding errors. The tokenless listener probe only proves transport/auth-guard reachability, not model identity or successful inference. Lexical recall must remain available."
+
+  - name: fleet-remote-spool-capacity
+    rules:
+      # The hostPath PV's 2Gi capacity is not a filesystem quota. Reuse real
+      # node space measurements; include inode exhaustion, not just bytes.
+      - alert: FleetRemoteFilesystemInodesLow
+        expr: |
+          node_filesystem_files_free{job="node-exporter", cluster="k0s", deployment="local-k0s", fstype!~"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup.*", mountpoint!~"/var/lib/kubelet/pods/.+"}
+          / node_filesystem_files{job="node-exporter", cluster="k0s", deployment="local-k0s", fstype!~"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup.*", mountpoint!~"/var/lib/kubelet/pods/.+"} < 0.10
+          and node_filesystem_readonly{job="node-exporter", cluster="k0s", deployment="local-k0s", fstype!~"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup.*", mountpoint!~"/var/lib/kubelet/pods/.+"} == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "k0s filesystem {{ $labels.mountpoint }} has under 10% free inodes"
+          description: "Transcript spool, database, metrics and logs share VM storage. Check inode pressure alongside FleetK0sFilesystemLowAvailable; the declared hostPath PV size is not enforced capacity."

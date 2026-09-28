@@ -100,7 +100,8 @@ The second-machine check will resume when hardware is available; it does not
 block M4.3 lifecycle and recovery work on this Mac. LAN/VPN exposure requires
 a selected stable Mac address, restricted HTTPS bind
 and firewall, client DNS/CA setup, and an actual second machine with fresh OAuth
-state. The Docker test is not evidence of that journey. M4.3 restart, dependency
-failure, certificate renewal and restore rehearsals, and M4.4 cloud deployment,
-remain pending. Production ingress policies do not restrict egress or claim to
-isolate the privileged certificate-controller namespace.
+state. The Docker test is not evidence of that journey. Subsequent M4.3 restart,
+dependency failure, certificate renewal, restore and upload-durability results
+are recorded in [the lifecycle qualification](LIFECYCLE_QUALIFICATION.md).
+M4.4 cloud deployment remains pending. Production ingress policies do not
+restrict egress or claim to isolate the privileged certificate-controller namespace.

@@ -4,7 +4,7 @@
 //! scope, source identifiers, URLs, or error messages to this module. Metrics
 //! are process-local; JSON events go through tracing to stderr, never MCP stdout.
 
-use std::sync::LazyLock;
+use std::sync::{LazyLock, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use prometheus::{
@@ -66,6 +66,7 @@ pub struct Telemetry {
     duration: HistogramVec,
     in_flight: IntGaugeVec,
     units: IntCounterVec,
+    readiness: RwLock<crate::readiness::Readiness>,
     started: Instant,
     start_timestamp: f64,
 }
@@ -133,6 +134,7 @@ impl Telemetry {
             duration,
             in_flight,
             units,
+            readiness: RwLock::new(crate::readiness::Readiness::default()),
             started: Instant::now(),
             start_timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -185,8 +187,29 @@ impl Telemetry {
             self.start_timestamp,
             self.started.elapsed().as_secs_f64()
         );
+        let (ready, checked_at) = self
+            .readiness
+            .read()
+            .map_or((false, 0.0), |readiness| readiness.snapshot());
+        let _ = write!(
+            output,
+            "# HELP fleet_recall_ready Fresh successful core runtime readiness check.\n# TYPE fleet_recall_ready gauge\nfleet_recall_ready {}\n# HELP fleet_recall_readiness_last_check_timestamp_seconds Last completed core runtime readiness check, including failures.\n# TYPE fleet_recall_readiness_last_check_timestamp_seconds gauge\nfleet_recall_readiness_last_check_timestamp_seconds {checked_at}\n",
+            u8::from(ready),
+        );
         Ok(output)
     }
+
+    pub(crate) fn set_readiness(&self, readiness: crate::readiness::Readiness) {
+        if let Ok(mut state) = self.readiness.write() {
+            *state = readiness;
+        }
+    }
+}
+
+/// Bind the HTTP runtime's cached readiness to the private scrape listener.
+/// Scrapes recompute freshness even when the background task is stalled.
+pub fn set_readiness(readiness: crate::readiness::Readiness) {
+    TELEMETRY.set_readiness(readiness);
 }
 
 /// Begin an operation with finite, code-owned labels.

@@ -1,0 +1,77 @@
+scrape_configs:
+- job_name: fleet-remote-probes
+  kubernetes_sd_configs:
+  - role: pod
+    namespaces:
+      names: [fleet-observability]
+    selectors:
+    - role: pod
+      label: app.kubernetes.io/name=node-exporter
+  relabel_configs:
+  - source_labels: [__meta_kubernetes_pod_phase]
+    action: keep
+    regex: Running
+  - source_labels: [__meta_kubernetes_pod_container_port_name]
+    action: keep
+    regex: metrics
+  - source_labels: [__meta_kubernetes_pod_node_name]
+    target_label: node
+  - source_labels: [__meta_kubernetes_pod_node_name]
+    target_label: instance
+    replacement: "$1:9100"
+  - target_label: cluster
+    replacement: k0s
+  - target_label: deployment
+    replacement: local-k0s
+  metric_relabel_configs:
+  - source_labels: [__name__]
+    action: keep
+    regex: fleet_dependency_probe_success|fleet_dependency_probe_completed_timestamp_seconds|fleet_dependency_probe_duration_seconds|node_textfile_scrape_error
+# Public entrypoint/certificate metadata only. No arbitrary router labels or
+# user request headers enter this allowlisted scrape. Metrics stay pod-private.
+- job_name: fleet-edge
+  kubernetes_sd_configs:
+  - role: pod
+    namespaces:
+      names: [fleet-edge]
+    selectors:
+    - role: pod
+      label: fleet-recall.dev/component=https-edge
+  relabel_configs:
+  - source_labels: [__meta_kubernetes_pod_phase]
+    action: keep
+    regex: Running
+  - source_labels: [__meta_kubernetes_pod_container_port_name]
+    action: keep
+    regex: metrics
+  - target_label: cluster
+    replacement: k0s
+  - target_label: deployment
+    replacement: local-k0s
+  metric_relabel_configs:
+  - source_labels: [__name__]
+    action: keep
+    regex: traefik_entrypoint_requests_total|traefik_tls_certs_not_after
+- job_name: fleet-cert-manager
+  kubernetes_sd_configs:
+  - role: pod
+    namespaces:
+      names: [fleet-pki]
+    selectors:
+    - role: pod
+      label: app.kubernetes.io/name=cert-manager
+  relabel_configs:
+  - source_labels: [__meta_kubernetes_pod_phase]
+    action: keep
+    regex: Running
+  - source_labels: [__meta_kubernetes_pod_container_port_name]
+    action: keep
+    regex: http-metrics
+  - target_label: cluster
+    replacement: k0s
+  - target_label: deployment
+    replacement: local-k0s
+  metric_relabel_configs:
+  - source_labels: [__name__]
+    action: keep
+    regex: certmanager_certificate_expiration_timestamp_seconds|certmanager_certificate_renewal_timestamp_seconds|certmanager_certificate_ready_status

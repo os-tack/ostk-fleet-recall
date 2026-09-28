@@ -934,10 +934,10 @@ async fn run_http(config: FleetConfig, listen: SocketAddr) -> anyhow::Result<()>
         mcp::{http, scopes::ScopeServices},
         remote::{RemoteBackend, RemoteConfig},
     };
-    let remote = RemoteConfig::from_env()?;
-    let embedder = Arc::new(load_pinned_embedder(&config)?);
+    let mut remote = RemoteConfig::from_env()?;
+    let embedder = Arc::new(load_http_embedder(&config)?);
     let embedding_tier = embedder.remote.clone();
-    let store = connect_store(&config).await?;
+    let store = Arc::new(connect_store(&config).await?);
     store.health_check().await?;
     let pool = store.pool().clone();
     ostk_fleet_recall::auth::grant::probe_remote_plane(&pool).await?;
@@ -959,6 +959,17 @@ async fn run_http(config: FleetConfig, listen: SocketAddr) -> anyhow::Result<()>
         backend = backend.with_transcript_receiver(Arc::new(receiver));
     }
     let backend = Arc::new(backend);
+    let (readiness, _readiness_task) = ostk_fleet_recall::readiness::Readiness::start(move || {
+        let store = store.clone();
+        async move {
+            store.health_check().await.is_ok()
+                && ostk_fleet_recall::auth::grant::probe_remote_plane(store.pool())
+                    .await
+                    .is_ok()
+        }
+    });
+    telemetry::set_readiness(readiness.clone());
+    remote.http.readiness = readiness;
     let router = http::router(remote.http, backend)?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -2100,6 +2111,17 @@ impl ChunkEmbedder for LoadedEmbedder {
 }
 
 fn load_pinned_embedder(config: &impl PinnedEmbeddingConfig) -> anyhow::Result<LoadedEmbedder> {
+    load_configured_embedder(config, false)
+}
+
+fn load_http_embedder(config: &impl PinnedEmbeddingConfig) -> anyhow::Result<LoadedEmbedder> {
+    load_configured_embedder(config, true)
+}
+
+fn load_configured_embedder(
+    config: &impl PinnedEmbeddingConfig,
+    defer_remote_check: bool,
+) -> anyhow::Result<LoadedEmbedder> {
     use ostk_fleet_recall::embed_tier::{
         config::RemoteConfig,
         remote::{RemoteClient, RemoteEmbedder},
@@ -2107,7 +2129,11 @@ fn load_pinned_embedder(config: &impl PinnedEmbeddingConfig) -> anyhow::Result<L
     if let Some(remote_config) = RemoteConfig::from_env()? {
         let identity = config.pinned_model_identity();
         let descriptor = model_descriptor(&identity)?;
-        let client = RemoteClient::connect_sync(remote_config, descriptor, identity)?;
+        let client = if defer_remote_check {
+            RemoteClient::deferred(remote_config, descriptor, identity)?
+        } else {
+            RemoteClient::connect_sync(remote_config, descriptor, identity)?
+        };
         return Ok(LoadedEmbedder {
             inner: Arc::new(RemoteEmbedder::new(client.clone())),
             remote: Some(client),

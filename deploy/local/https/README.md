@@ -1,4 +1,4 @@
-# Local HTTPS deployment (M4.2)
+# Local HTTPS deployment
 
 This profile upgrades the existing M3 Lima/k0s deployment in place. It keeps
 the database, principal registry, signing keys, writer authority pins, content
@@ -18,14 +18,20 @@ Traefik watches only `fleet-edge`; public backend URLs come from its file
 provider, referenced by Gateway API routes. It cannot read the Ory, Recall or
 PKI namespace Secrets. See [gateway pins and trust](gateway/README.md),
 [Ory settings](ory/README.md), and [network policy limits](network/README.md).
+For subsequent deployments, outage/restart rehearsals and leaf renewal, use
+the [lifecycle runbook](OPERATIONS.md). The [recovery runbook](RECOVERY.md)
+covers isolated database and application restoration. See the
+[M4.3 qualification record](LIFECYCLE_QUALIFICATION.md) for measured results
+and the remaining local/cloud acceptance boundaries.
 
 ## Prerequisites and preparation
 
 Use an existing healthy M3 deployment and its original private state directory.
 The examples run from the repository root. They require Docker Desktop,
 Lima 2.2, kubectl, Helm, OpenSSL and Python 3. The encrypted checkpoint helper
-also requires the Python `cryptography` package (the qualification host uses
-3.12.0 with cryptography 46.0.3). No LocalStack dependency is introduced.
+also requires the Python `cryptography` package; lifecycle/recovery helpers
+use `PyYAML` (the qualification host uses Python 3.12.0). No LocalStack
+dependency is introduced.
 
 ```sh
 export FLEET_LOCAL_STATE="$PWD/deploy/local/.state"
@@ -58,7 +64,7 @@ backup, validates its files, copies it off the VM disk, and encrypts Ory/Kuberne
 configuration, keys and spool separately with AES-256-GCM. Its manifest binds
 the artifacts to this state directory and cluster. A local key beside the
 archive is convenient recovery material, not protection from a compromised
-Mac; off-device encrypted backup and restore rehearsal remain M4.3/M4.5 work.
+Mac. Keep an off-device copy and run the separate isolated restore rehearsal.
 
 ```sh
 python3 deploy/local/bin/backup-https-cutover.py --state "$FLEET_LOCAL_STATE"

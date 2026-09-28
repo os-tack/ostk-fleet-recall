@@ -5,6 +5,9 @@ set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 namespace=fleet-observability
 command=${1:-render}
+remote=${FLEET_OBSERVABILITY_REMOTE:-false}
+probe_image=${FLEET_OBSERVABILITY_PROBE_IMAGE:-ostk-sandbox:m4-20260927b}
+case "$remote" in true|false) ;; *) echo 'FLEET_OBSERVABILITY_REMOTE must be true or false' >&2; exit 2 ;; esac
 for tool in kubectl python3; do
   command -v "$tool" >/dev/null || { echo "missing tool: $tool" >&2; exit 1; }
 done
@@ -23,9 +26,30 @@ fi
 render() {
   kubectl kustomize "$here/k0s" --load-restrictor LoadRestrictionsNone
   printf '\n---\n'
+  rule_files=(--from-file=alerts.yml="$here/alerts.yml" --from-file=k0s-alerts.yml="$here/k0s-alerts.yml")
+  if [ "$remote" = true ]; then
+    rule_files+=(--from-file=remote-alerts.yml="$here/remote-alerts.yml")
+    cat "$here/remote-rbac.yaml"
+    printf '\n---\n'
+    python3 - "$here/remote-probe.yaml" "$probe_image" <<'PY'
+import pathlib,re,sys
+if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9./_:@-]{0,255}',sys.argv[2]):
+    raise SystemExit('invalid probe image reference')
+print(pathlib.Path(sys.argv[1]).read_text().replace('__PROBE_IMAGE__',sys.argv[2]))
+PY
+    printf '\n---\n'
+    kubectl -n fleet-recall create configmap fleet-remote-dependency-probe \
+      --from-file=remote_probe.py="$here/remote_probe.py" --dry-run=client -o yaml
+    printf '\n---\n'
+    kubectl -n "$namespace" create configmap fleet-prometheus-remote-scrapes \
+      --from-file=remote.yml="$here/remote-scrapes.yml" --dry-run=client -o yaml
+  else
+    kubectl -n "$namespace" create configmap fleet-prometheus-remote-scrapes \
+      --from-literal='remote.yml=scrape_configs: []' --dry-run=client -o yaml
+  fi
+  printf '\n---\n'
   kubectl -n "$namespace" create configmap fleet-prometheus-rules \
-    --from-file=alerts.yml="$here/alerts.yml" \
-    --from-file=k0s-alerts.yml="$here/k0s-alerts.yml" --dry-run=client -o yaml
+    "${rule_files[@]}" --dry-run=client -o yaml
   printf '\n---\n'
   kubectl -n "$namespace" create configmap fleet-grafana-dashboards \
     --from-file="$here/grafana/dashboards" --dry-run=client -o yaml
@@ -40,12 +64,21 @@ verify() {
     kubectl -n "$namespace" rollout status "$resource" --timeout=300s
   done
   kubectl -n "$namespace" get pods,services
-  python3 "$here/verify_k0s.py"
+  FLEET_OBSERVABILITY_REMOTE="$remote" python3 "$here/verify_k0s.py"
   echo 'Open Grafana with: install-k0s.sh forward'
 }
 case "$command" in
   render) render ;;
   up)
+    if [ "$remote" = true ]; then
+      kubectl --request-timeout=10s get namespace fleet-edge fleet-pki >/dev/null
+      kubectl --request-timeout=10s -n fleet-recall get configmap fleet-oidc-ca >/dev/null
+    else
+      existing_probe=$(kubectl --request-timeout=10s -n fleet-recall get cronjob remote-dependency-probe --ignore-not-found -o name)
+      if [ -n "$existing_probe" ]; then
+        kubectl --request-timeout=10s -n fleet-recall patch "$existing_probe" --type=merge -p '{"spec":{"suspend":true}}'
+      fi
+    fi
     kubectl apply --server-side --field-manager=fleet-observability -f "$here/k0s/namespace.yaml"
     if ! kubectl -n "$namespace" get secret fleet-grafana-admin >/dev/null 2>&1; then
       # Keep the generated credential out of argv, logs, and checked-in files.
@@ -56,11 +89,13 @@ case "$command" in
     # Rules and datasource provisioning are loaded at startup. Roll only when
     # their contents change; dashboard JSON itself is refreshed by Grafana.
     for component in prometheus grafana; do
-      digest=$(python3 - "$here" "$component" <<'PY'
+      digest=$(python3 - "$here" "$component" "$remote" <<'PY'
 import hashlib,pathlib,sys
 root=pathlib.Path(sys.argv[1])
 paths=[root/'alerts.yml',root/'k0s-alerts.yml'] if sys.argv[2]=='prometheus' else sorted((root/'grafana/provisioning').glob('*/*.yaml'))
-print(hashlib.sha256(b'\0'.join(p.read_bytes() for p in paths)).hexdigest())
+if sys.argv[2]=='prometheus' and sys.argv[3]=='true':
+    paths.extend([root/'remote-alerts.yml',root/'remote-scrapes.yml'])
+print(hashlib.sha256(sys.argv[3].encode()+b'\0'+b'\0'.join(p.read_bytes() for p in paths)).hexdigest())
 PY
 )
       kubectl -n "$namespace" patch deployment "$component" --type=merge \

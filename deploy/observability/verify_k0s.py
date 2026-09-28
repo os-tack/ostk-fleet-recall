@@ -22,6 +22,7 @@ NAMESPACE = "fleet-observability"
 DASHBOARDS = ("overview", "mcp", "workers", "dependencies", "kubernetes", "logs")
 JOBS = ("kubernetes-nodes", "kubernetes-cadvisor", "kube-state-metrics", "node-exporter",
         "kubernetes-apiserver", "fleet-worker-textfile", "prometheus", "loki", "alloy", "grafana")
+REMOTE_JOBS = ("fleet-edge", "fleet-cert-manager", "fleet-remote-probes")
 SERVICES = {"grafana": 3000, "prometheus": 9090, "loki": 3100}
 
 
@@ -31,6 +32,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def verify():
+    remote = os.environ.get("FLEET_OBSERVABILITY_REMOTE", "false") == "true"
     kubeconfig = os.environ.get("KUBECONFIG")
     if not kubeconfig:
         print("Set KUBECONFIG explicitly before verifying the local k0s stack.", file=sys.stderr)
@@ -120,13 +122,55 @@ def verify():
                     if health.get("status") != "OK":
                         raise ValueError()
                 stage = "required Prometheus scrape jobs"
-                expression = 'up{cluster="k0s",deployment="local-k0s",job=~"' + "|".join(JOBS) + '"}'
+                required_jobs = JOBS + REMOTE_JOBS if remote else JOBS
+                expression = 'up{cluster="k0s",deployment="local-k0s",job=~"' + "|".join(required_jobs) + '"}'
                 samples = query(urls["prometheus"], "/api/v1/query", expression)
-                jobs = {job: [] for job in JOBS}
+                jobs = {job: [] for job in required_jobs}
                 for sample in samples:
                     jobs[sample["metric"]["job"]].append(float(sample["value"][1]))
                 if not all(values and all(value == 1 for value in values) for values in jobs.values()):
                     raise ValueError()
+                if remote:
+                    stage = "remote readiness and certificate coverage"
+                    recall_scope = 'job="fleet-recall",app="recall",cluster="k0s",deployment="local-k0s"'
+                    # All discovered instances must agree. Filtering to only
+                    # successful samples would let one healthy pod hide another.
+                    for metric in ("up", "fleet_recall_ready"):
+                        values = query(urls["prometheus"], "/api/v1/query", metric + "{" + recall_scope + "}")
+                        if not values or not all(float(value["value"][1]) == 1 for value in values):
+                            raise ValueError()
+                    for instrument in (
+                        "fleet_recall_ready{" + recall_scope + "}",
+                        "fleet_recall_units_total{" + recall_scope + ',component="transcript",operation="receive",unit="quota_rejected"}',
+                    ):
+                        missing = "up{" + recall_scope + "} unless on (job,instance) " + instrument
+                        if query(urls["prometheus"], "/api/v1/query", missing):
+                            raise ValueError()
+                    for job, instrument in (
+                        ("fleet-edge", 'traefik_tls_certs_not_after{job="fleet-edge",cluster="k0s",deployment="local-k0s"}'),
+                        ("fleet-cert-manager", 'certmanager_certificate_expiration_timestamp_seconds{job="fleet-cert-manager",cluster="k0s",deployment="local-k0s",namespace="fleet-edge",name="fleet-edge"}'),
+                    ):
+                        missing = 'up{job="' + job + '",cluster="k0s",deployment="local-k0s"} unless on (job,instance) ' + instrument
+                        if query(urls["prometheus"], "/api/v1/query", missing):
+                            raise ValueError()
+                    checks = (
+                        'min(certmanager_certificate_expiration_timestamp_seconds{job="fleet-cert-manager",cluster="k0s",deployment="local-k0s",namespace="fleet-edge",name="fleet-edge"}) > time()',
+                        'min(traefik_tls_certs_not_after{job="fleet-edge",cluster="k0s",deployment="local-k0s"}) > time()',
+                    )
+                    if not all(query(urls["prometheus"], "/api/v1/query", check) for check in checks):
+                        raise ValueError()
+                    stage = "fresh healthy dependency probes"
+                    probe_scope = 'job="fleet-remote-probes",cluster="k0s",deployment="local-k0s"'
+                    expected_targets = {"issuer_discovery", "issuer_jwks", "embedding_transport"}
+                    for metric, valid in (
+                        ("fleet_dependency_probe_success", lambda value: value == 1),
+                        ("fleet_dependency_probe_completed_timestamp_seconds", lambda value: 0 <= time.time() - value < 180),
+                    ):
+                        values = query(urls["prometheus"], "/api/v1/query", metric + "{" + probe_scope + "}")
+                        if {value["metric"].get("target") for value in values} != expected_targets:
+                            raise ValueError()
+                        if not all(valid(float(value["value"][1])) for value in values):
+                            raise ValueError()
                 counts = {}
                 for name in ("kubernetes-pods", "kubernetes-events"):
                     stage = name + " ingestion"

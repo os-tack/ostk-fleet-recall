@@ -818,7 +818,7 @@ async fn role_refusals_preserve_rpc_receipt_and_http_forbidden_status() {
     assert_eq!(body["error"]["data"]["outcome"], "not_applied");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn deadlines_preserve_unknown_mutation_outcome_and_limit_inflight_work() {
     let memory = Arc::new(Memory {
         writes: AtomicUsize::new(0),
@@ -835,15 +835,72 @@ async fn deadlines_preserve_unknown_mutation_outcome_and_limit_inflight_work() {
     while backend.authentications.load(Ordering::SeqCst) == 0 {
         tokio::task::yield_now().await;
     }
-    let overloaded = app.oneshot(request("/mcp", &body)).await.unwrap();
+    let overloaded = app.clone().oneshot(request("/mcp", &body)).await.unwrap();
     assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(json_body(overloaded).await["error"], "server_busy");
+    for (path, status) in [
+        ("/healthz", StatusCode::OK),
+        ("/readyz", StatusCode::SERVICE_UNAVAILABLE),
+    ] {
+        let probe = app
+            .clone()
+            .oneshot(HttpRequest::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(probe.status(), status);
+        assert_eq!(probe.headers()["cache-control"], "no-store");
+        assert_ne!(json_body(probe).await["error"], "server_busy");
+    }
     let response = first.await.unwrap().unwrap();
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let response = json_body(response).await;
     assert_eq!(response["id"], 17);
     assert_eq!(response["error"]["data"]["outcome"], "unknown");
     assert_eq!(memory.writes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn readiness_tracks_background_failures_without_affecting_liveness() {
+    use std::sync::atomic::AtomicBool;
+
+    let available = Arc::new(AtomicBool::new(true));
+    let state = available.clone();
+    let (readiness, task) = crate::readiness::Readiness::start(move || {
+        let ready = state.load(Ordering::SeqCst);
+        async move { ready }
+    });
+    let mut settings = config();
+    settings.readiness = readiness;
+    let backend = Backend::new(Arc::new(Memory::default()));
+    let app = router(settings, backend.clone()).unwrap();
+    let probe = |path| {
+        app.clone()
+            .oneshot(HttpRequest::get(path).body(Body::empty()).unwrap())
+    };
+    let initial = probe("/readyz").await.unwrap();
+    assert_eq!(initial.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json_body(initial).await,
+        json!({"error":"runtime_not_ready"})
+    );
+    tokio::task::yield_now().await;
+    let ready = probe("/readyz").await.unwrap();
+    assert_eq!(ready.status(), StatusCode::OK);
+    assert_eq!(json_body(ready).await, json!({"status":"ready"}));
+    available.store(false, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        probe("/readyz").await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(probe("/healthz").await.unwrap().status(), StatusCode::OK);
+    assert_eq!(backend.authentications.load(Ordering::SeqCst), 0);
+    drop(task);
+    assert_eq!(
+        probe("/readyz").await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
 }
 
 #[test]

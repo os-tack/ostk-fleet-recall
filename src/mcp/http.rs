@@ -71,6 +71,8 @@ pub trait HttpBackend: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
+    /// A background runtime check, fail closed until configured and successful.
+    pub readiness: crate::readiness::Readiness,
     pub resource_url: String,
     /// Human OAuth discovery only; identity verification may accept more issuers.
     pub authorization_servers: Vec<String>,
@@ -87,6 +89,7 @@ impl HttpConfig {
     #[must_use]
     pub fn new(resource_url: String, authorization_servers: Vec<String>) -> Self {
         Self {
+            readiness: crate::readiness::Readiness::default(),
             resource_url,
             authorization_servers,
             scopes_supported: vec!["fleet-recall".into()],
@@ -206,6 +209,7 @@ pub fn router(mut config: HttpConfig, backend: Arc<dyn HttpBackend>) -> Result<R
             get(transcript).put(transcript),
         )
         .route("/healthz", get(health))
+        .route("/readyz", get(ready))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state);
     // Observe outside the origin/concurrency guard and authentication paths,
@@ -355,6 +359,11 @@ async fn guard(State(state): State<HttpState>, request: Request, next: Next) -> 
 }
 
 async fn guarded_request(state: &HttpState, request: Request, next: Next) -> Response {
+    // Dependency probes inspect cached state and must not compete for MCP
+    // capacity. In particular, a database outage must not restart a live server.
+    if matches!(request.uri().path(), "/healthz" | "/readyz") {
+        return next.run(request).await;
+    }
     let Ok(_permit) = state.inflight.try_acquire() else {
         let mut response = error_json(StatusCode::SERVICE_UNAVAILABLE, "server_busy");
         response
@@ -367,6 +376,14 @@ async fn guarded_request(state: &HttpState, request: Request, next: Next) -> Res
 
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+async fn ready(State(state): State<HttpState>) -> Response {
+    if state.config.readiness.is_ready() {
+        Json(json!({ "status": "ready" })).into_response()
+    } else {
+        error_json(StatusCode::SERVICE_UNAVAILABLE, "runtime_not_ready")
+    }
 }
 
 async fn metadata(State(state): State<HttpState>) -> Json<Value> {

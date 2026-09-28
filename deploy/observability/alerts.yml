@@ -79,14 +79,31 @@ groups:
           summary: "The last published worker run failed on {{ $labels.instance }}"
           description: "Inspect process/worker completion and the protected worker stdout report for the failed step or startup check."
 
+      - record: fleet_recall_worker_last_run_duration_seconds
+        expr: |
+          max by (job, instance, cluster, deployment) (
+            fleet_recall_operation_duration_seconds_sum{job="fleet-worker-textfile", component="process", operation="worker"}
+            / fleet_recall_operation_duration_seconds_count{job="fleet-worker-textfile", component="process", operation="worker"}
+          )
+
+      # Two missed five-minute ticks, plus measured last-run duration (at least
+      # one minute). Legacy snapshots without a duration retain a 15m budget.
+      - record: fleet_recall_worker_snapshot_max_age_seconds
+        expr: |
+          (600 + clamp_min(fleet_recall_worker_last_run_duration_seconds, 60))
+          or on (job, instance, cluster, deployment)
+          (0 * fleet_recall_snapshot_time_seconds{job="fleet-worker-textfile"} + 900)
+
       - alert: FleetRecallWorkerSnapshotStale
-        expr: time() - fleet_recall_snapshot_time_seconds{job="fleet-worker-textfile"} > 900
+        expr: |
+          time() - fleet_recall_snapshot_time_seconds{job="fleet-worker-textfile"}
+          > on (job, instance, cluster, deployment) fleet_recall_worker_snapshot_max_age_seconds
         for: 1m
         labels:
           severity: warning
         annotations:
-          summary: "Worker snapshot is more than 15 minutes old"
-          description: "Check scheduling, process termination, export errors, and file permissions. Tune the age limit to the schedule and maximum run duration."
+          summary: "Worker snapshot exceeded two ticks plus its duration allowance"
+          description: "The five-minute schedule allows 600 seconds plus the last measured runtime (minimum 60 seconds), then a one-minute alert hold. Legacy snapshots without duration allow 900 seconds. Check scheduling, termination, export errors and permissions."
 
       - alert: FleetRecallWorkerSnapshotMissing
         expr: |

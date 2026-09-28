@@ -59,7 +59,10 @@ spec:
             - {name: mcp, containerPort: 8080}
             - {name: metrics, containerPort: 9100}
           readinessProbe:
-            httpGet: {path: /healthz, port: mcp}
+            httpGet: {path: /readyz, port: mcp}
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 1
           livenessProbe:
             httpGet: {path: /healthz, port: mcp}
             initialDelaySeconds: 30

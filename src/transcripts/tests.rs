@@ -205,6 +205,21 @@ async fn traversal_symlink_partial_and_quota_are_refused() {
         Err(TranscriptError::Quota)
     ));
     assert_eq!(std::fs::metadata(target.path()).unwrap().len(), 0);
+    let metrics = crate::telemetry::render().unwrap();
+    for unit in ["quota_rejected", "io_errors"] {
+        let prefix = format!(
+            "fleet_recall_units_total{{component=\"transcript\",operation=\"receive\",unit=\"{unit}\"}} "
+        );
+        let value = metrics
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(value >= 1, "the real refused receive must be observable");
+    }
+    assert!(!metrics.contains("sessions/nested/session.jsonl"));
+    assert!(!metrics.contains("sandbox-test"));
 }
 
 struct Backend {

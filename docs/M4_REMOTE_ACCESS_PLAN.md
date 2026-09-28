@@ -4,8 +4,8 @@ Status: implementation in progress, 2026-09-27. M4.1 is implemented. M4.2's
 single-Mac HTTPS services, native Codex CLI and container paths are deployed
 and tested, including macOS certificate trust and the restarted Codex harness.
 The second-machine LAN/VPN check is deferred because no second machine is
-currently available. It remains unqualified; local M4.3 work can proceed.
-M4.3–M4.5 remain pending. The original baseline was
+currently available. It remains unqualified. M4.3 is implemented and locally
+qualified; M4.4–M4.5 remain pending. The original baseline was
 `ea6d43d` on `main`, including M3 and merged Prometheus/Grafana telemetry.
 The original remote plan ended at M3. M4 is the follow-on described here.
 
@@ -57,10 +57,41 @@ does not close the entire M4.2 acceptance row: LAN/VPN exposure still needs a
 selected stable address and a second machine. After the user installed trust
 and restarted the harness, macOS certificate verification, system curl without
 a CA override, and native Recall status/get calls from that harness passed.
-Cloud deployment and lifecycle/restore rehearsals remain later milestones.
+The subsequent lifecycle/restore checkpoint is recorded below. Cloud deployment
+remains a later milestone.
 The user confirmed on 2026-09-27 that a second machine is unavailable. Defer
 that check until hardware is available; retain it as an outstanding acceptance
 requirement rather than treating same-host container tests as its replacement.
+
+## M4.3 lifecycle checkpoint
+
+The local HTTP runtime now separates cached database/capability readiness from
+process liveness. Live database, embedding and issuer failures demonstrated
+endpoint withdrawal, retained lexical reads and bounded cached-key behavior.
+Recall/Ory restarts, a full Lima VM restart, previous-image rollback and leaf
+renewal preserved authority, keys and durable content. Scheduled worker
+exclusion was exercised across two scheduling opportunities, then its original
+schedule resumed. Docker and Kubernetes each passed interrupted receiver-upload
+recovery, duplicate-window replay and grant teardown.
+
+An encrypted checkpoint was restored into an isolated, network-disabled SQL
+and application stack. Exact schema/authority checks, fresh OAuth, pre-backup
+claim decryption, scope denial and pending-transcript replay passed; all owned
+containers stopped, including during an explicit SIGTERM cleanup test. Private
+dashboards and alerts cover core readiness, dependency reachability, edge
+errors, spool pressure, worker freshness and leaf expiry. The dependency probe
+uses no credentials and has a fixed total timeout, including bounded retries
+for initial pod connection failures.
+
+See the [lifecycle qualification record](../deploy/local/https/LIFECYCLE_QUALIFICATION.md),
+[operations runbook](../deploy/local/https/OPERATIONS.md) and
+[isolated recovery runbook](../deploy/local/https/RECOVERY.md) for evidence,
+automated checks, scanner triage and exact limits. This checkpoint does not
+establish off-device backup retrieval, a consistent 24-hour RPO, an alert
+notification receiver, root/application-key rotation, Mac HA or autostart.
+The next implementation slice is M4.4; its live AWS rollout must still pass
+the storage and credential-isolation gates below. M4.5 retains second-machine
+acceptance and the monitored 24-hour soak.
 
 ## Outcome and scope
 

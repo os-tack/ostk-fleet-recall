@@ -13,6 +13,7 @@ import base64
 import copy
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -25,8 +26,9 @@ import sys
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import (
     HTTPRedirectHandler,
@@ -160,27 +162,54 @@ class Smoke:
     def object(self, kind, name):
         return json.loads(self.kubectl("get", kind, name, "-o", "json")[1])
 
-    def http(self, token, *, path=None, headers=None, message=None):
+    def http(self, token, *, path=None, headers=None, message=None, body=None, method=None, timeout=40):
         request_headers = {"Authorization": "Bearer " + token, **(headers or {})}
-        body = None
+        require(message is None or body is None, "HTTP message and raw body are mutually exclusive")
         if message is not None:
             request_headers["Content-Type"] = "application/json"
             body = json.dumps(message).encode()
+        elif body is not None:
+            request_headers["Content-Type"] = "application/octet-stream"
         endpoint = self.args.url
         if path is not None:
             parsed = urlsplit(endpoint)
             endpoint = urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
-        request = Request(endpoint, data=body, headers=request_headers)
+        request = Request(endpoint, data=body, headers=request_headers, method=method)
         try:
-            response = self.opener.open(request, timeout=40)
+            response = self.opener.open(request, timeout=timeout)
         except HTTPError as error:
             response = error
         with response:
             raw = response.read(2 * 1024 * 1024 + 1)
             require(len(raw) <= 2 * 1024 * 1024, "HTTP response exceeds bound")
-            value = json.loads(raw) if raw else None
+            try:
+                value = json.loads(raw) if raw else None
+            except json.JSONDecodeError:
+                # A restarting upstream may produce a gateway text/HTML error.
+                # Successful protocol responses must always remain valid JSON.
+                require(response.status >= 500, "HTTP success or rejection response is not JSON")
+                value = None
             private_json(self.artifact("http.json"), {"status": response.status, "body": value})
             return response.status, value
+
+    def receiver_progress_after_restart(self, token, path, headers):
+        """Wait only for bounded transient transport/gateway recovery."""
+        deadline = time.monotonic() + 60
+        while True:
+            remaining = deadline - time.monotonic()
+            require(remaining > 0, "receiver did not recover through the edge after restart")
+            try:
+                status, progress = self.http(token, path=path, headers=headers, timeout=min(5, remaining))
+            except (URLError, OSError, http.client.HTTPException):
+                status, progress = 503, None
+            if status == 200:
+                require(isinstance(progress, dict) and isinstance(progress.get("length"), int),
+                        "recovered receiver returned invalid progress")
+                return status, progress
+            require(status in (502, 503, 504), "recovered receiver rejected progress request")
+            remaining = deadline - time.monotonic()
+            require(remaining > 0, "receiver did not recover through the edge after restart")
+            time.sleep(min(1, remaining))
 
     def tool(self, token, arguments, *, check=True):
         status, body = self.http(token, message={"jsonrpc": "2.0", "id": self.count + 1,
@@ -331,6 +360,114 @@ done'''
                    "x-transcript-format": manifest["format"], "x-transcript-first-line-sha256": manifest["first_line_sha256"]}
         return path, headers
 
+    def spool_bytes(self, manifest):
+        receiver, _ = self.receiver_request(manifest)
+        filename = receiver.split("?", 1)[0].rsplit("/", 1)[1]
+        require(re.fullmatch(r"[0-9a-f]{64}\.jsonl", filename)
+                and manifest["format"] in {"claude-code", "codex"}, "invalid durability spool coordinate")
+        path = f"{self.args.spool}/{self.args.tenant}/{self.args.project}/{manifest['format']}/{filename}"
+        _, data = self.kubectl("exec", "deployment/" + self.args.receiver, "-c", "recall", "--", "/bin/sh", "-c",
+                              '[ -f "$1" ] && [ ! -L "$1" ] && head -c 1048577 "$1"', "durability-proof", path)
+        require(len(data) <= 1024 * 1024, "durability spool exceeds proof bound")
+        return data
+
+    def restart_receiver(self):
+        before = self.object("deployment", self.args.receiver)
+        require(before["spec"].get("replicas") == 1 and before["spec"].get("strategy", {}).get("type") == "Recreate",
+                "receiver durability proof requires exactly one Recreate receiver")
+        require(self.object("cronjob", self.args.worker)["spec"].get("suspend") is True,
+                "worker must remain suspended during receiver restart")
+        selector = before["spec"]["selector"].get("matchLabels", {})
+        require(selector and not before["spec"]["selector"].get("matchExpressions"), "unsupported receiver pod selector")
+        labels = ",".join(key + "=" + value for key, value in sorted(selector.items()))
+        pods = json.loads(self.kubectl("get", "pods", "-l", labels, "-o", "json")[1])["items"]
+        require(len(pods) == 1 and not pods[0]["metadata"].get("deletionTimestamp"), "receiver pod set is not a stable singleton")
+        previous_uid = pods[0]["metadata"]["uid"]
+        private_json(self.artifact("receiver-before.json"), before)
+        annotations = dict(before["spec"]["template"]["metadata"].get("annotations", {}))
+        annotations["fleet-recall.dev/durability-restart"] = secrets.token_hex(8)
+        patch = [{"op": "test", "path": "/metadata/resourceVersion", "value": before["metadata"]["resourceVersion"]},
+                 {"op": "add", "path": "/spec/template/metadata/annotations", "value": annotations}]
+        self.kubectl("patch", "deployment", self.args.receiver, "--type=json", "-p", json.dumps(patch))
+        self.kubectl("rollout", "status", "deployment/" + self.args.receiver, "--timeout=180s", timeout=190)
+        after = self.object("deployment", self.args.receiver)
+        require(after["metadata"]["uid"] == before["metadata"]["uid"] and after["spec"].get("replicas") == 1
+                and after["spec"].get("strategy", {}).get("type") == "Recreate", "receiver deployment changed during restart")
+        pods = json.loads(self.kubectl("get", "pods", "-l", labels, "-o", "json")[1])["items"]
+        require(len(pods) == 1 and pods[0]["metadata"]["uid"] != previous_uid
+                and any(item.get("type") == "Ready" and item.get("status") == "True" for item in pods[0].get("status", {}).get("conditions", [])),
+                "receiver did not become one new Ready pod")
+        private_json(self.artifact("receiver-after.json"), after)
+        return {"before_pod_uid": previous_uid, "after_pod_uid": pods[0]["metadata"]["uid"]}
+
+    def interrupted_upload(self, token, path, headers, body):
+        """Hold an incomplete, verified TLS request across one receiver restart."""
+        endpoint = urlsplit(self.args.url)
+        connection = (http.client.HTTPSConnection(endpoint.hostname, endpoint.port or 443, timeout=4,
+                                                  context=client_tls(self.args.ca_path))
+                      if endpoint.scheme == "https" else
+                      http.client.HTTPConnection(endpoint.hostname, endpoint.port or 80, timeout=4))
+        try:
+            connection.putrequest("PUT", path, skip_accept_encoding=True)
+            connection.putheader("Authorization", "Bearer " + token)
+            connection.putheader("Content-Type", "application/octet-stream")
+            connection.putheader("Content-Length", str(len(body)))
+            for name, value in headers.items():
+                connection.putheader(name, value)
+            require(len(body) > 1, "partial upload needs a nonempty remaining byte")
+            connection.endheaders(body[:-1])
+            restarted = self.restart_receiver()
+            try:
+                response = connection.getresponse()
+                require(not 200 <= response.status < 300, "incomplete upload unexpectedly received a success acknowledgement")
+                restarted["partial_response_status"] = response.status
+                response.close()
+            except (OSError, http.client.HTTPException) as error:
+                # Some gateways retain the incomplete client body until their
+                # read timeout. Closing here ends the unacknowledged request;
+                # the next GET/byte comparison is the durability assertion.
+                restarted["partial_transport_outcome"] = type(error).__name__
+            return restarted
+        finally:
+            connection.close()
+
+    def receiver_durability(self, tokens, original_manifest, original_transcript):
+        """Use a separate synthetic file so the native shipper never conflicts."""
+        marker = "durability-" + secrets.token_hex(12)
+        session = str(uuid.uuid4())
+
+        def turn(role, text):
+            return (json.dumps({"type": role, "sessionId": session, "uuid": str(uuid.uuid4()),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "message": {"role": role, "content": [{"type": "text", "text": text}]}}) + "\n").encode()
+
+        prefix = turn("user", "Synthetic receiver durability prefix " + marker)
+        expected = "Synthetic pending receiver durability completion " + marker
+        append = turn("assistant", expected)
+        manifest = dict(original_manifest, source="lifecycle/" + marker + ".jsonl",
+                        first_line_sha256=hashlib.sha256(prefix).hexdigest())
+        path, headers = self.receiver_request(manifest)
+        status, progress = self.http(tokens["shipper"], path=path, headers=headers, body=prefix, method="PUT")
+        require(status == 200 and progress == {"length": len(prefix), "replayed": False}, "durability prefix was not acknowledged")
+        require(self.spool_bytes(manifest) == prefix, "acknowledged durability prefix differs from spool")
+        append_path = path.removesuffix("offset=0") + "offset=" + str(len(prefix))
+        restarted = self.interrupted_upload(tokens["shipper"], append_path, headers, append)
+        status, progress = self.receiver_progress_after_restart(tokens["shipper"], path, headers)
+        require(status == 200 and progress["length"] == len(prefix), "incomplete upload changed acknowledged offset")
+        require(self.spool_bytes(manifest) == prefix and self.spool_bytes(original_manifest) == original_transcript,
+                "receiver restart changed previously acknowledged transcript bytes")
+        status, progress = self.http(tokens["shipper"], path=append_path, headers=headers, body=append, method="PUT")
+        require(status == 200 and progress == {"length": len(prefix + append), "replayed": False}, "pending upload retry did not commit exactly once")
+        for retry_path, retry in ((append_path, append), (path, prefix)):
+            status, progress = self.http(tokens["shipper"], path=retry_path, headers=headers, body=retry, method="PUT")
+            require(status == 200 and progress == {"length": len(prefix + append), "replayed": True}, "acknowledged upload window was not idempotently replayed")
+        require(self.spool_bytes(manifest) == prefix + append, "retried upload bytes differ from durable spool")
+        result = dict(restarted, marker=marker, acknowledged_prefix_bytes=len(prefix), final_bytes=len(prefix + append),
+                      prefix_sha256=hashlib.sha256(prefix).hexdigest(), final_sha256=hashlib.sha256(prefix + append).hexdigest(),
+                      incomplete_upload_unacknowledged=True, duplicate_windows_replayed=True)
+        private_json(self.artifact("receiver-durability.json"), result)
+        return result, manifest, expected
+
     def worker_tick(self, backend):
         cron = self.object("cronjob", self.args.worker)
         require(cron["spec"].get("suspend") is True, "worker schedule resumed during smoke")
@@ -441,10 +578,21 @@ done'''
             self.tool(tokens["agent"], {"action": "status"})
             recalled = self.tool(tokens["agent"], {"action": "get", "kind": "claim", "id": claim})
             require(recalled["data"]["claim"]["id"] == claim, "synthetic recorded claim did not round trip")
+            durability = self.receiver_durability(tokens, manifest, transcript) if self.args.restart_receiver else None
             job = self.worker_tick(backend)
             evidence = self.evidence(tokens["agent"], instance, expected)
             result = {"backend": backend, "instance": instance, "agent": agent,
                       "claim_id": claim, "evidence_id": evidence, "spool_bytes": len(transcript), "worker_job": job}
+            if durability:
+                proof, pending_manifest, pending_expected = durability
+                first_evidence = self.evidence(tokens["agent"], proof["marker"], pending_expected)
+                replay_job = self.worker_tick(backend)
+                require(self.evidence(tokens["agent"], proof["marker"], pending_expected) == first_evidence,
+                        "second worker tick changed pending transcript evidence identity")
+                require(hashlib.sha256(self.spool_bytes(pending_manifest)).hexdigest() == proof["final_sha256"],
+                        "worker replay changed durable transcript bytes")
+                proof.update(evidence_id=first_evidence, replay_worker_job=replay_job, worker_ticks=2)
+                result["durability"] = proof
         finally:
             with cleanup_signals():
                 self.cleanup_launch(launch_dir, tokens, receiver)
@@ -478,6 +626,8 @@ def arguments(argv=None):
     parser.add_argument("--runtime-class")
     parser.add_argument("--worker", default="worker")
     parser.add_argument("--receiver", default="recall")
+    parser.add_argument("--restart-receiver", action="store_true",
+                        help="rehearse a controlled receiver restart, incomplete upload, exact byte replay and two worker ticks")
     parser.add_argument("--spool", default="/var/lib/recall/transcripts")
     parser.add_argument("--scope", default="0198a849-f6ae-7d61-9800-000000000001/local-k0s")
     parser.add_argument("--timeout", type=int, default=300)

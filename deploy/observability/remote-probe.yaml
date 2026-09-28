@@ -1,0 +1,74 @@
+# Local profile: reuse the imported sandbox image only as a Python runtime.
+# No provider is started, no ServiceAccount token or Secret is mounted.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: remote-dependency-probe
+  namespace: fleet-recall
+spec:
+  schedule: "* * * * *"
+  suspend: false
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 40
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 45
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: remote-dependency-probe
+        spec:
+          enableServiceLinks: false
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: probe
+              image: __PROBE_IMAGE__
+              imagePullPolicy: Never
+              command: [/usr/bin/python3, -B, /probe/remote_probe.py]
+              args: [--ca-file, /ca/ca.pem, --output-directory, /metrics]
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+              resources:
+                requests: {cpu: 10m, memory: 24Mi}
+                limits: {cpu: 100m, memory: 96Mi}
+              volumeMounts:
+                - {name: script, mountPath: /probe, readOnly: true}
+                - {name: ca, mountPath: /ca, readOnly: true}
+                - {name: metrics, mountPath: /metrics}
+          volumes:
+            - name: script
+              configMap: {name: fleet-remote-dependency-probe}
+            - name: ca
+              configMap: {name: fleet-oidc-ca}
+            - name: metrics
+              hostPath:
+                path: /var/lib/fleet-recall/observability/worker
+                type: Directory
+---
+# Reach only the credential-protected listener; 401 is expected without a token.
+# This grants no access to Recall, SQL, Ory administration, or tier credentials.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: https-embedding-from-dependency-probe
+  namespace: fleet-recall
+spec:
+  podSelector:
+    matchLabels: {app: embed}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: remote-dependency-probe}
+      ports: [{port: 8090, protocol: TCP}]
